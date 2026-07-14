@@ -131,9 +131,12 @@ Important events:
 {"type":"voice_state","likelyVoiceUIActive":true,"keywordHits":["识别"]}
 {"type":"audio_level","rmsDBFS":-18.2,"peakDBFS":-6.3,"bytes":129600}
 {"type":"focus_state","focusedElement":{"ax":{"role":"AXTextArea","value":"..."}}}
+{"type":"partial","text":"..."}
 {"type":"text","text":"...","delta":"..."}
 {"type":"final","text":"..."}
 ```
+
+While Doubao is recognizing speech, the bridge sends revisable `partial` snapshots at up to 10 updates per second. Interactive clients redraw one terminal line for these previews. Committed `text` and `final` events remain stable output.
 
 Manual diagnostic commands:
 

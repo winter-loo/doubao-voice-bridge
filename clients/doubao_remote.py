@@ -23,6 +23,7 @@ class BridgeClient:
         self.sock = None
         self.final_text = ""
         self.latest_text = ""
+        self.partial_text = ""
         self.phase = "idle"
         self.activation_failed = False
         self.recording_ready = threading.Event()
@@ -66,11 +67,19 @@ class BridgeClient:
     def handle_event(self, event):
         event_type = event.get("type")
         if event_type == "text":
+            self.clear_partial_preview()
             self.latest_text = event.get("text", "")
             delta = event.get("delta", "")
             if delta:
                 print(delta, end="", flush=True)
+        elif event_type == "partial":
+            self.partial_text = event.get("text", "")
+            if sys.stdout.isatty():
+                print(f"\r\033[2K[partial] {self.partial_text}", end="", flush=True)
+            else:
+                print(f"[partial] {self.partial_text}", flush=True)
         elif event_type == "final":
+            self.clear_partial_preview()
             self.final_text = event.get("text", "")
             print("\n[final]")
             print(self.final_text)
@@ -128,6 +137,13 @@ class BridgeClient:
             print(f"[{event_type}] {event}", file=sys.stderr)
         else:
             print(f"[event] {event}", file=sys.stderr)
+
+    def clear_partial_preview(self):
+        if not self.partial_text:
+            return
+        if sys.stdout.isatty():
+            print("\r\033[2K", end="", flush=True)
+        self.partial_text = ""
 
     def close(self):
         self._stop.set()

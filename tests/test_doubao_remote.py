@@ -1,4 +1,5 @@
 import json
+import io
 from pathlib import Path
 import signal
 import socket
@@ -7,8 +8,14 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 from clients import doubao_remote
+
+
+class TTYBuffer(io.StringIO):
+    def isatty(self):
+        return True
 
 
 class RecordArgumentsTests(unittest.TestCase):
@@ -21,6 +28,36 @@ class RecordArgumentsTests(unittest.TestCase):
         args = doubao_remote.parse_args(["record", "--seconds", "12.5"])
 
         self.assertEqual(args.seconds, 12.5)
+
+
+class BridgeClientEventTests(unittest.TestCase):
+    def test_partial_text_replaces_the_terminal_preview(self):
+        client = doubao_remote.BridgeClient("127.0.0.1:4387")
+        output = TTYBuffer()
+
+        with mock.patch("sys.stdout", output):
+            client.handle_event({"type": "partial", "text": "hello"})
+            client.handle_event({"type": "partial", "text": "hello world"})
+
+        self.assertEqual(client.partial_text, "hello world")
+        self.assertEqual(
+            output.getvalue(),
+            "\r\x1b[2K[partial] hello\r\x1b[2K[partial] hello world",
+        )
+
+    def test_committed_text_clears_the_partial_preview(self):
+        client = doubao_remote.BridgeClient("127.0.0.1:4387")
+        output = TTYBuffer()
+
+        with mock.patch("sys.stdout", output):
+            client.handle_event({"type": "partial", "text": "hel"})
+            client.handle_event({"type": "text", "text": "hello", "delta": "hello"})
+
+        self.assertEqual(client.partial_text, "")
+        self.assertEqual(
+            output.getvalue(),
+            "\r\x1b[2K[partial] hel\r\x1b[2Khello",
+        )
 
 
 class RecordCommandTests(unittest.TestCase):

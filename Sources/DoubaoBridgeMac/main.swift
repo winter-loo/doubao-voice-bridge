@@ -184,11 +184,26 @@ let keyCodeMap: [String: CGKeyCode] = [
     "fn": 0x3F, "function": 0x3F
 ]
 
+final class CaptureTextView: NSTextView {
+    var onMarkedTextChange: (() -> Void)?
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        DispatchQueue.main.async { [weak self] in
+            self?.onMarkedTextChange?()
+        }
+    }
+}
+
 final class TextCaptureWindow: NSObject, NSTextViewDelegate {
     private let window: NSWindow
-    private let textView: NSTextView
+    private let textView: CaptureTextView
+    private var partialObservationTimer: Timer?
     private var lastText = ""
+    private var lastPartialText = ""
+    private var lastPartialEmitTime = Date.distantPast
     var onChange: ((String, String) -> Void)?
+    var onPartial: ((String) -> Void)?
 
     init(showWindow: Bool) {
         let rect = showWindow
@@ -209,7 +224,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
         scrollView.hasVerticalScroller = true
         scrollView.autoresizingMask = [.width, .height]
 
-        textView = NSTextView(frame: scrollView.bounds)
+        textView = CaptureTextView(frame: scrollView.bounds)
         textView.autoresizingMask = [.width, .height]
         textView.font = NSFont.systemFont(ofSize: 18)
         textView.isRichText = false
@@ -222,7 +237,19 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
 
         super.init()
         textView.delegate = self
+        textView.onMarkedTextChange = { [weak self] in
+            self?.emitPartialIfChanged()
+        }
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.emitPartialIfChanged()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        partialObservationTimer = timer
         window.makeKeyAndOrderFront(nil)
+    }
+
+    deinit {
+        partialObservationTimer?.invalidate()
     }
 
     func focus() {
@@ -253,6 +280,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
 
     func clear() {
         lastText = ""
+        lastPartialText = ""
         textView.string = ""
         onChange?("", "")
     }
@@ -263,6 +291,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
 
     func textDidChange(_ notification: Notification) {
         let text = textView.string
+        lastPartialText = ""
         let delta: String
         if text.hasPrefix(lastText) {
             delta = String(text.dropFirst(lastText.count))
@@ -272,6 +301,27 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
         lastText = text
         print("[capture] textDidChange textLength=\(text.count) deltaLength=\(delta.count) deltaPreview=\(String(delta.prefix(80)))")
         onChange?(text, delta)
+    }
+
+    private func emitPartialIfChanged() {
+        guard textView.hasMarkedText() else {
+            lastPartialText = ""
+            return
+        }
+
+        let text = textView.string
+        guard text != lastPartialText else {
+            return
+        }
+        let now = Date()
+        guard now.timeIntervalSince(lastPartialEmitTime) >= 0.1 else {
+            return
+        }
+
+        lastPartialText = text
+        lastPartialEmitTime = now
+        print("[capture] partial textLength=\(text.count) preview=\(String(text.prefix(80)))")
+        onPartial?(text)
     }
 }
 
@@ -1736,6 +1786,9 @@ do {
     }
     captureWindow.onChange = { text, delta in
         server.broadcast(["type": "text", "text": text, "delta": delta])
+    }
+    captureWindow.onPartial = { text in
+        server.broadcast(["type": "partial", "text": text])
     }
 
     server.start()
