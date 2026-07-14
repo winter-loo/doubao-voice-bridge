@@ -252,11 +252,36 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
         partialObservationTimer?.invalidate()
     }
 
-    func focus() {
+    func ensureVoiceInputUIActive(reason: String) {
+        guard !isVoiceInputUIActive else {
+            return
+        }
+
+        activateVoiceInputUI(reason: reason)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self, !self.isVoiceInputUIActive else {
+                return
+            }
+            self.activateVoiceInputUI(reason: "\(reason) retry")
+        }
+    }
+
+    private var isVoiceInputUIActive: Bool {
+        NSRunningApplication.current.isActive
+            && window.isKeyWindow
+            && window.firstResponder === textView
+    }
+
+    private func activateVoiceInputUI(reason: String) {
+        print("[voice-ui] activating reason=\(reason)")
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
         NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         NSApp.activate(ignoringOtherApps: true)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
+        window.makeMain()
         window.makeFirstResponder(textView)
     }
 
@@ -1259,6 +1284,7 @@ final class Bridge {
     private var voiceActivationGeneration = 0
     private var voiceActivationAttempt = 0
     private var audioLevelGeneration = 0
+    private var appActivationObserver: NSObjectProtocol?
     private(set) var isRecording = false
     var emit: (([String: Any]) -> Void)?
 
@@ -1278,6 +1304,22 @@ final class Bridge {
         self.focusStateDetector = focusStateDetector
         self.audioReceiver = audioReceiver
         self.audioDeviceManager = audioDeviceManager
+        appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.isRecording else {
+                return
+            }
+            self.captureWindow.ensureVoiceInputUIActive(reason: "foreground app changed during recording")
+        }
+    }
+
+    deinit {
+        if let appActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
+        }
     }
 
     func startSession() {
@@ -1290,7 +1332,7 @@ final class Bridge {
             try audioReceiver.start()
             audioReceiver.resetAudioLevel()
             captureWindow.clear()
-            captureWindow.focus()
+            captureWindow.ensureVoiceInputUIActive(reason: "client session started")
             logDiagnostics("after initial focus")
             try controller.switchToDoubao()
             logDiagnostics("after switchToDoubao")
@@ -1372,7 +1414,7 @@ final class Bridge {
     func testHotkey() {
         do {
             print("[test-hotkey] requested")
-            captureWindow.focus()
+            captureWindow.ensureVoiceInputUIActive(reason: "test hotkey")
             logDiagnostics("test-hotkey after focus")
             try controller.switchToDoubao()
             logDiagnostics("test-hotkey after switchToDoubao")
@@ -1446,7 +1488,7 @@ final class Bridge {
             return
         }
 
-        captureWindow.focus()
+        captureWindow.ensureVoiceInputUIActive(reason: "voice activation")
         logDiagnostics("before voice shortcut")
         emitVoiceState("before voice shortcut")
         if config.voiceShortcutMode == "hold" {
@@ -1471,6 +1513,7 @@ final class Bridge {
 
         let snapshot = emitVoiceState("voice activation check attempt \(voiceActivationAttempt + 1)")
         if snapshot["likelyVoiceUIActive"] as? Bool == true {
+            captureWindow.ensureVoiceInputUIActive(reason: "recording confirmed")
             emit?(["type": "status", "recording": true, "phase": "recording"])
             startAudioLevelReporting(generation: generation)
             return
@@ -1534,6 +1577,7 @@ final class Bridge {
             else {
                 return
             }
+            self.captureWindow.ensureVoiceInputUIActive(reason: "recording watchdog")
             self.emitAudioLevel(label: "recording interval", reset: true)
             self.scheduleAudioLevelReport(voiceGeneration: voiceGeneration, levelGeneration: levelGeneration)
         }

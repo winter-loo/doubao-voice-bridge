@@ -66,6 +66,8 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
 
 With `--remote-input-device`, the bridge temporarily switches macOS default input to Soundflower when a session starts, then restores the previous input device after stop.
 
+During an active remote recording, the bridge brings its Voice Input capture window to the foreground and keeps its text view as the first responder. If another application takes focus, the bridge immediately reactivates the capture window so Doubao does not insert recognized text into the wrong application. This focus enforcement stops when recording ends.
+
 ## Run Linux Client
 
 Linux PulseAudio/PipeWire default microphone:
