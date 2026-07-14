@@ -77,14 +77,21 @@ python3 clients/doubao_remote.py \
   --udp-port 5004 \
   --audio-transport tcp \
   record \
-  --seconds 22 \
   --audio-start-delay 0.2 \
   --audio-stop-delay 0.5 \
   --recording-timeout 15 \
   --final-timeout 8
 ```
 
-The client starts streaming audio early, but the spoken recording timer waits for the Mac bridge to emit `phase=recording`. That phase is only emitted after the Mac confirms Doubao's voice UI is active.
+Without `--seconds`, the client records until you press `Ctrl+C`. To stop automatically after a fixed duration, add `--seconds 22`.
+
+The client starts streaming audio early, but recording begins after the Mac bridge emits `phase=recording`. That phase is only emitted after the Mac confirms Doubao's voice UI is active. Pressing `Ctrl+C` stops the remote microphone, releases the Doubao voice shortcut, and waits for the final committed text.
+
+When launching the client as a one-shot SSH command, allocate a pseudo-terminal so `Ctrl+C` reaches the remote Python process:
+
+```bash
+ssh -t USER@CLIENT_HOST 'cd ~/doubao-voice-bridge && python3 clients/doubao_remote.py ... record'
+```
 
 ## Fixture Replay
 

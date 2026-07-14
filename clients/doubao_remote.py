@@ -384,7 +384,12 @@ def command_record(args):
                 raise RuntimeError(f"Timed out waiting for recording phase after {args.recording_timeout}s")
             if client.activation_failed:
                 raise RuntimeError("Doubao voice activation failed")
-        time.sleep(args.seconds)
+        if args.seconds is None:
+            print("[recording] Press Ctrl+C to stop.", file=sys.stderr)
+            while True:
+                time.sleep(1)
+        else:
+            time.sleep(args.seconds)
     except KeyboardInterrupt:
         pass
     except RuntimeError as exc:
@@ -422,7 +427,7 @@ def command_send(args):
     client.close()
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description="Remote client for doubao-bridge-mac")
     parser.add_argument("--server", default="127.0.0.1:4387", help="Mac bridge TCP host:port")
     parser.add_argument("--token", help="Optional bridge auth token")
@@ -436,8 +441,12 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
-    record = subparsers.add_parser("record", help="Record for a fixed duration")
-    record.add_argument("--seconds", type=float, default=5.0)
+    record = subparsers.add_parser("record", help="Record until Ctrl+C or for a fixed duration")
+    record.add_argument(
+        "--seconds",
+        type=float,
+        help="Stop after this many seconds. Omit to record until Ctrl+C.",
+    )
     record.add_argument("--final-timeout", type=float, default=4.0)
     record.add_argument("--audio-start-delay", type=float, default=1.0)
     record.add_argument("--audio-connect-timeout", type=float, default=5.0)
@@ -456,7 +465,15 @@ def main():
     send.add_argument("command", choices=["start", "stop", "toggle", "clear", "status", "diagnose", "voice-state", "focus-state", "test-hotkey", "settings"])
     send.set_defaults(func=command_send)
 
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
+
+
+def main():
+    args = parse_args()
     args.func(args)
 
 
