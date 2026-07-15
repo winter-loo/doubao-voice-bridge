@@ -60,7 +60,61 @@ class BridgeClientEventTests(unittest.TestCase):
         )
 
 
+class WindowsInputDeviceTests(unittest.TestCase):
+    def test_cli_accepts_an_input_device_name(self):
+        args = doubao_remote.parse_args(["--input-device", "USB Headset", "record"])
+
+        self.assertEqual(args.input_device, "USB Headset")
+
+    def test_parses_only_directshow_audio_device_names(self):
+        output = """
+[in#0 @ 000001] "HP HD Camera" (video)
+[in#0 @ 000001]   Alternative name "@device_pnp_camera"
+[in#0 @ 000001] "Microphone Array" (audio)
+[in#0 @ 000001]   Alternative name "@device_cm_microphone"
+[in#0 @ 000001] "USB Headset" (audio)
+"""
+
+        self.assertEqual(
+            doubao_remote.parse_dshow_audio_devices(output),
+            ["Microphone Array", "USB Headset"],
+        )
+
+    def test_multiple_devices_without_selection_lists_every_name(self):
+        with self.assertRaises(SystemExit) as raised:
+            doubao_remote.windows_input_args(["Desk Microphone", "USB Headset"], None)
+
+        message = str(raised.exception)
+        self.assertIn("Desk Microphone", message)
+        self.assertIn("USB Headset", message)
+        self.assertIn("--input-device", message)
+
+    def test_single_device_is_selected_automatically(self):
+        self.assertEqual(
+            doubao_remote.windows_input_args(["Microphone Array"], None),
+            ["-f", "dshow", "-i", "audio=Microphone Array"],
+        )
+
+    def test_requested_device_is_selected_by_name(self):
+        self.assertEqual(
+            doubao_remote.windows_input_args(["Desk Microphone", "USB Headset"], "usb headset"),
+            ["-f", "dshow", "-i", "audio=USB Headset"],
+        )
+
+
 class RecordCommandTests(unittest.TestCase):
+    def test_input_device_errors_happen_before_connecting_to_the_bridge(self):
+        args = doubao_remote.parse_args(["record"])
+
+        with (
+            mock.patch.object(doubao_remote, "resolved_input_args", side_effect=SystemExit("choose a device")),
+            mock.patch.object(doubao_remote, "BridgeClient") as bridge_client,
+            self.assertRaisesRegex(SystemExit, "choose a device"),
+        ):
+            doubao_remote.command_record(args)
+
+        bridge_client.assert_not_called()
+
     def test_record_without_seconds_stops_cleanly_on_sigint(self):
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))

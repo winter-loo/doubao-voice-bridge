@@ -5,6 +5,7 @@ import collections
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -154,24 +155,91 @@ class BridgeClient:
                 pass
 
 
-def default_input_args():
+def format_input_devices(device_names):
+    return "\n".join(f"  - {name}" for name in device_names)
+
+
+def parse_dshow_audio_devices(output):
+    devices = []
+    for line in output.splitlines():
+        match = re.search(r'\]\s+"(.*)"\s+\(audio\)\s*$', line)
+        if match and match.group(1) not in devices:
+            devices.append(match.group(1))
+    return devices
+
+
+def list_windows_audio_devices(ffmpeg):
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        raise SystemExit(f"Could not enumerate Windows audio input devices with {ffmpeg}: {exc}") from exc
+
+    return parse_dshow_audio_devices(f"{result.stdout}\n{result.stderr}")
+
+
+def windows_input_args(device_names, requested_device):
+    if not device_names:
+        raise SystemExit("No Windows DirectShow audio input devices were found.")
+
+    if requested_device:
+        matches = [name for name in device_names if name.casefold() == requested_device.casefold()]
+        if not matches:
+            raise SystemExit(
+                f"Windows audio input device not found: {requested_device}\n"
+                f"Available audio input devices:\n{format_input_devices(device_names)}"
+            )
+        selected = matches[0]
+    elif len(device_names) == 1:
+        selected = device_names[0]
+    else:
+        raise SystemExit(
+            "Multiple Windows audio input devices were found. "
+            "Select one with --input-device NAME:\n"
+            f"{format_input_devices(device_names)}"
+        )
+
+    return ["-f", "dshow", "-i", f"audio={selected}"]
+
+
+def default_input_args(ffmpeg="ffmpeg", input_device=None):
     system = platform.system().lower()
     if system == "linux":
+        if input_device:
+            raise SystemExit("--input-device currently supports Windows only; use --input-args on Linux")
         return ["-f", "pulse", "-i", "default"]
     if system == "darwin":
+        if input_device:
+            raise SystemExit("--input-device currently supports Windows only; use --input-args on macOS")
         return ["-f", "avfoundation", "-i", ":0"]
     if system == "windows":
-        raise SystemExit("Windows requires --input-args, for example: -f dshow -i audio=\"Microphone (...)\"")
+        return windows_input_args(list_windows_audio_devices(ffmpeg), input_device)
     raise SystemExit(f"Unsupported platform for default microphone args: {platform.system()}")
 
 
 def resolved_input_args(args):
-    if args.input_args and args.input_file:
-        raise SystemExit("--input-args and --input-file cannot be used together")
+    configured_sources = [
+        option
+        for option, value in (
+            ("--input-args", args.input_args),
+            ("--input-device", args.input_device),
+            ("--input-file", args.input_file),
+        )
+        if value
+    ]
+    if len(configured_sources) > 1:
+        raise SystemExit(f"{', '.join(configured_sources)} cannot be used together")
     if args.input_file:
         loop_args = ["-stream_loop", "-1"] if args.loop_input else []
         return ["-re", *loop_args, "-i", args.input_file]
-    return shlex.split(args.input_args) if args.input_args else default_input_args()
+    if args.input_args:
+        return shlex.split(args.input_args)
+    return default_input_args(ffmpeg=args.ffmpeg, input_device=args.input_device)
 
 
 class DirectFFmpegAudioStream:
@@ -326,8 +394,7 @@ def ffmpeg_capture_cmd(args, input_args, output_url):
     ]
 
 
-def start_audio_stream(args, udp_host, udp_port):
-    input_args = resolved_input_args(args)
+def start_audio_stream(args, udp_host, udp_port, input_args):
     if args.audio_transport == "udp":
         output_url = f"udp://{udp_host}:{udp_port}?pkt_size=960"
         return DirectFFmpegAudioStream.start(args, output_url, input_args)
@@ -383,6 +450,7 @@ def paste_text(text):
 
 def command_record(args):
     udp_host = args.udp_host or args.server.rsplit(":", 1)[0]
+    input_args = resolved_input_args(args)
     client = BridgeClient(args.server, token=args.token)
     client.connect()
 
@@ -392,7 +460,7 @@ def command_record(args):
     client.send("start")
     if args.audio_start_delay > 0:
         time.sleep(args.audio_start_delay)
-    audio = start_audio_stream(args, udp_host, args.udp_port)
+    audio = start_audio_stream(args, udp_host, args.udp_port, input_args)
 
     try:
         if args.wait_recording:
@@ -452,6 +520,7 @@ def build_parser():
     parser.add_argument("--udp-port", type=int, default=5004, help="Mac UDP audio port")
     parser.add_argument("--audio-transport", choices=["udp", "tcp"], default="udp", help="Raw PCM audio transport")
     parser.add_argument("--input-args", help="ffmpeg input args for the local microphone")
+    parser.add_argument("--input-device", help="Windows DirectShow audio input device name")
     parser.add_argument("--input-file", help="Use a local audio file instead of the microphone")
     parser.add_argument("--loop-input", action=argparse.BooleanOptionalAction, default=True, help="Loop --input-file while recording")
 

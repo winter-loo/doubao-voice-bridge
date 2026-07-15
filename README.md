@@ -95,6 +95,32 @@ When launching the client as a one-shot SSH command, allocate a pseudo-terminal 
 ssh -t USER@CLIENT_HOST 'cd ~/doubao-voice-bridge && python3 clients/doubao_remote.py ... record'
 ```
 
+## Run Windows Client
+
+On Windows, the client discovers DirectShow audio input devices automatically. If exactly one device is available, no input option is required:
+
+```powershell
+py -3 clients/doubao_remote.py `
+  --server MAC_IP:4387 `
+  --udp-host MAC_IP `
+  --udp-port 5004 `
+  --audio-transport tcp `
+  record
+```
+
+If multiple devices are available, the client prints every device name and exits. Run it again with the desired name:
+
+```powershell
+py -3 clients/doubao_remote.py `
+  --server MAC_IP:4387 `
+  --udp-host MAC_IP `
+  --audio-transport tcp `
+  --input-device "Microphone Array" `
+  record
+```
+
+Use `--input-args` only when a custom FFmpeg input configuration is needed. It cannot be combined with `--input-device` or `--input-file`.
+
 ## Fixture Replay
 
 For reproducible tests, use a fixed WAV file instead of live microphone input:
