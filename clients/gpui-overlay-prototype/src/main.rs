@@ -17,17 +17,17 @@ use gpui::{
 const OVERLAY_WIDTH: f32 = 266.0;
 const OVERLAY_HEIGHT: f32 = 48.0;
 const BOTTOM_MARGIN: f32 = 30.0;
-const WAVEFORM_WIDTH: f32 = 88.0;
 const WAVEFORM_HEIGHT: f32 = 22.0;
 const BAR_WIDTH: f32 = 2.0;
 const BAR_GAP: f32 = 2.0;
 const BAR_COUNT: usize = 20;
+const WAVEFORM_BARS_WIDTH: f32 = BAR_COUNT as f32 * BAR_WIDTH + (BAR_COUNT - 1) as f32 * BAR_GAP;
+const LISTENING_CAPSULE_WIDTH: f32 = WAVEFORM_BARS_WIDTH + 4.0 * BAR_WIDTH;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum OverlayPhase {
     Hidden,
-    Hint,
     Listening,
     Optimizing,
 }
@@ -37,9 +37,8 @@ static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn overlay_phase() -> OverlayPhase {
     match OVERLAY_PHASE.load(Ordering::Acquire) {
-        1 => OverlayPhase::Hint,
-        2 => OverlayPhase::Listening,
-        3 => OverlayPhase::Optimizing,
+        1 => OverlayPhase::Listening,
+        2 => OverlayPhase::Optimizing,
         _ => OverlayPhase::Hidden,
     }
 }
@@ -75,8 +74,7 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
         |_, _, _| {},
         move |bounds, _, window, _| {
             let phase = delta * std::f32::consts::TAU;
-            let bars_width = BAR_COUNT as f32 * BAR_WIDTH + (BAR_COUNT - 1) as f32 * BAR_GAP;
-            let start_x = bounds.origin.x + (bounds.size.width - px(bars_width)) / 2.0;
+            let start_x = bounds.origin.x + (bounds.size.width - px(WAVEFORM_BARS_WIDTH)) / 2.0;
             let center_y = bounds.origin.y + bounds.size.height / 2.0;
 
             for (index, amplitude) in AMPLITUDES.iter().enumerate() {
@@ -98,34 +96,8 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
             }
         },
     )
-    .w(px(WAVEFORM_WIDTH))
+    .w(px(LISTENING_CAPSULE_WIDTH))
     .h(px(WAVEFORM_HEIGHT))
-}
-
-fn hint_bars(color: u32, reverse: bool) -> impl IntoElement {
-    canvas(
-        |_, _, _| {},
-        move |bounds, _, window, _| {
-            let heights = [9.0, 8.0, 7.0, 5.0];
-            let bars_width = 4.0 * BAR_WIDTH + 3.0 * BAR_GAP;
-            let start_x = bounds.origin.x + (bounds.size.width - px(bars_width)) / 2.0;
-            let center_y = bounds.origin.y + bounds.size.height / 2.0;
-
-            for index in 0..4 {
-                let height = heights[if reverse { 3 - index } else { index }];
-                let bar = Bounds::new(
-                    point(
-                        start_x + px(index as f32 * (BAR_WIDTH + BAR_GAP)),
-                        center_y - px(height / 2.0),
-                    ),
-                    size(px(BAR_WIDTH), px(height)),
-                );
-                window.paint_quad(fill(bar, rgb(color)).corner_radii(px(BAR_WIDTH / 2.0)));
-            }
-        },
-    )
-    .w(px(32.0))
-    .h(px(16.0))
 }
 
 fn capsule_base() -> gpui::Div {
@@ -144,24 +116,11 @@ fn capsule_base() -> gpui::Div {
 fn listening_capsule(delta: f32) -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
-        .w(px(188.0))
+        .w(px(LISTENING_CAPSULE_WIDTH))
         .h(px(34.0))
         .cursor_pointer()
         .on_click(|_, window, _| platform::finish_input(window))
         .child(waveform_canvas(delta))
-}
-
-fn hint_capsule() -> impl IntoElement {
-    capsule_base()
-        .id("voice-capsule")
-        .gap_2()
-        .w(px(250.0))
-        .h(px(34.0))
-        .cursor_pointer()
-        .on_click(|_, window, _| platform::finish_input(window))
-        .child(hint_bars(0x43ded2, false))
-        .child(div().text_sm().child("单击 右 option 结束"))
-        .child(hint_bars(0x648dff, true))
 }
 
 fn optimizing_capsule() -> impl IntoElement {
@@ -188,7 +147,6 @@ impl Render for VoiceOverlay {
                 |root, delta| {
                     let content = match overlay_phase() {
                         OverlayPhase::Hidden => div().into_any_element(),
-                        OverlayPhase::Hint => hint_capsule().into_any_element(),
                         OverlayPhase::Listening => listening_capsule(delta).into_any_element(),
                         OverlayPhase::Optimizing => optimizing_capsule().into_any_element(),
                     };
@@ -261,7 +219,6 @@ mod platform {
 
     const HOTKEY_ID: i32 = 0xDB01;
     const HOLD_THRESHOLD: Duration = Duration::from_millis(420);
-    const HINT_DURATION: Duration = Duration::from_millis(900);
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
 
     pub fn configure_overlay(window: &Window) {
@@ -321,16 +278,8 @@ mod platform {
     }
 
     fn begin_input(hwnd: HWND) {
-        let generation = next_overlay_generation();
-        show_phase(hwnd, OverlayPhase::Hint);
-        let hwnd_value = hwnd.0 as isize;
-        thread::spawn(move || {
-            thread::sleep(HINT_DURATION);
-            if overlay_generation() == generation && overlay_phase() == OverlayPhase::Hint {
-                let hwnd = HWND(hwnd_value as *mut c_void);
-                show_phase(hwnd, OverlayPhase::Listening);
-            }
-        });
+        next_overlay_generation();
+        show_phase(hwnd, OverlayPhase::Listening);
     }
 
     fn finish_input_hwnd(hwnd: HWND) {
@@ -340,7 +289,7 @@ mod platform {
                 hide_overlay(hwnd);
                 return;
             }
-            OverlayPhase::Hint | OverlayPhase::Listening => {}
+            OverlayPhase::Listening => {}
         }
 
         let generation = overlay_generation();

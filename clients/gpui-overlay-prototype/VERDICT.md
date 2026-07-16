@@ -57,9 +57,9 @@ The foreground HWND was identical before and after the hold and global-hotkey
 tests. This validates the critical `WS_EX_NOACTIVATE` behavior.
 
 A macOS-side RustDesk capture of the live Windows console session confirmed that
-all three phases render with no clipping or overlap. The final UI follows the four
-supplied Doubao references: a dark bottom-center capsule, 20 cyan-to-blue waveform
-bars, the `单击 右 option 结束` hint, and a shorter `优化识别中` capsule.
+the listening and optimizing phases render with no clipping or overlap. The final
+UI follows the supplied Doubao references: a compact dark bottom-center capsule,
+20 cyan-to-blue waveform bars, and a shorter `优化识别中` capsule.
 
 ## Footprint
 
@@ -89,7 +89,7 @@ the authoritative result for this prototype.
 ## Decision
 
 GPUI is technically suitable for the Windows voice-input overlay. Keep the native
-Win32 layer for window styles and global hotkeys. The three-state, single-Canvas
-overlay is fast enough for this prototype, and all visible states passed direct
-RustDesk review. Production should drive `Optimizing` from recognition events
-instead of the prototype's fixed timeout.
+Win32 layer for window styles and global hotkeys. The hidden/listening/optimizing
+state machine and single-Canvas overlay are fast enough for this prototype, and
+all visible states passed direct RustDesk review. Production should drive
+`Optimizing` from recognition events instead of the prototype's fixed timeout.
