@@ -4,18 +4,14 @@
 )]
 
 use std::{
-    sync::{
-        Arc, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU8, AtomicU64, Ordering},
     time::Duration,
 };
 
 use gpui::{
     Animation, AnimationExt as _, App, Application, Bounds, ColorSpace, Context, FontWeight,
-    RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
-    canvas, div, fill, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba,
-    size,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill,
+    linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
 };
 
 const BOTTOM_MARGIN: f32 = 22.0;
@@ -39,8 +35,6 @@ enum OverlayPhase {
 
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
-static GLASS_BACKDROP: OnceLock<RwLock<Option<Arc<RenderImage>>>> = OnceLock::new();
-static GLASS_BACKDROP_IS_DARK: AtomicBool = AtomicBool::new(false);
 
 fn overlay_phase() -> OverlayPhase {
     match OVERLAY_PHASE.load(Ordering::Acquire) {
@@ -60,29 +54,6 @@ fn next_overlay_generation() -> u64 {
 
 fn overlay_generation() -> u64 {
     OVERLAY_GENERATION.load(Ordering::Acquire)
-}
-
-fn glass_backdrop() -> Option<Arc<RenderImage>> {
-    GLASS_BACKDROP
-        .get_or_init(|| RwLock::new(None))
-        .read()
-        .expect("glass backdrop lock poisoned")
-        .clone()
-}
-
-fn set_glass_backdrop(backdrop: Option<Arc<RenderImage>>) {
-    *GLASS_BACKDROP
-        .get_or_init(|| RwLock::new(None))
-        .write()
-        .expect("glass backdrop lock poisoned") = backdrop;
-}
-
-fn glass_backdrop_is_dark() -> bool {
-    GLASS_BACKDROP_IS_DARK.load(Ordering::Acquire)
-}
-
-fn set_glass_backdrop_is_dark(is_dark: bool) {
-    GLASS_BACKDROP_IS_DARK.store(is_dark, Ordering::Release);
 }
 
 fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
@@ -253,12 +224,6 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
 }
 
 fn capsule_base() -> gpui::Div {
-    let border_color = if glass_backdrop_is_dark() {
-        rgba(0xffffffb8)
-    } else {
-        rgba(0x526a806b)
-    };
-
     div()
         .relative()
         .flex()
@@ -273,27 +238,9 @@ fn capsule_base() -> gpui::Div {
         )
         .color_space(ColorSpace::Oklab))
         .border_1()
-        .border_color(border_color)
+        .border_color(rgba(0xffffff9c))
         .shadow_lg()
         .text_color(rgba(0x07131ff5))
-}
-
-fn backdrop_element() -> gpui::AnyElement {
-    match glass_backdrop() {
-        Some(backdrop) => img(backdrop)
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .into_any_element(),
-        None => div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .bg(rgba(0xffffff2e))
-            .into_any_element(),
-    }
 }
 
 fn listening_capsule(delta: f32) -> impl IntoElement {
@@ -303,7 +250,6 @@ fn listening_capsule(delta: f32) -> impl IntoElement {
         .h(px(LISTENING_CAPSULE_HEIGHT))
         .cursor_pointer()
         .on_click(|_, window, _| platform::finish_input(window))
-        .child(backdrop_element())
         .child(glass_canvas(delta, true).relative())
 }
 
@@ -313,7 +259,6 @@ fn optimizing_capsule(delta: f32) -> impl IntoElement {
         .relative()
         .w(px(LISTENING_CAPSULE_WIDTH))
         .h(px(LISTENING_CAPSULE_HEIGHT))
-        .child(backdrop_element())
         .child(glass_canvas(delta, false).absolute().top_0().left_0())
         .child(
             div()
@@ -390,37 +335,44 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod platform {
     use std::ffi::c_void;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicIsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
         OverlayPhase, next_overlay_generation, overlay_generation, overlay_phase,
-        set_glass_backdrop, set_glass_backdrop_is_dark, set_overlay_phase,
+        set_overlay_phase,
     };
-    use gpui::{RenderImage, Window};
-    use image::{Frame, RgbaImage, imageops};
+    use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+    use windows::Win32::Graphics::Dwm::{
+        DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
+        DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DwmRegisterThumbnail,
+        DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+    };
     use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, HGDIOBJ,
-        MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
+        CreateRoundRectRgn, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+        MonitorFromWindow, SetWindowRgn,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_RCONTROL, VK_SPACE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST,
-        IsWindowVisible, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER,
-        WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+        CreateWindowExW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindow,
+        GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE,
+        SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER, WS_DISABLED,
+        WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+        WS_THICKFRAME,
     };
+    use windows::core::{BOOL, w};
 
     const HOTKEY_ID: i32 = 0xDB01;
     const HOLD_THRESHOLD: Duration = Duration::from_millis(420);
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
+    static BACKDROP_HWND: AtomicIsize = AtomicIsize::new(0);
 
     pub fn configure_overlay(window: &Window) {
         let hwnd = hwnd(window);
@@ -447,10 +399,39 @@ mod platform {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
+        let backdrop = create_backdrop_window(hwnd);
+        BACKDROP_HWND.store(backdrop.0 as isize, Ordering::Release);
         hide_overlay(hwnd);
-        capture_glass_backdrop(hwnd);
+        hide_backdrop(backdrop);
+        start_backdrop_thread(hwnd.0 as isize, backdrop.0 as isize);
         start_hotkey_thread(hwnd.0 as isize);
         start_hold_key_thread(hwnd.0 as isize);
+    }
+
+    fn create_backdrop_window(overlay: HWND) -> HWND {
+        let capsule = capsule_screen_rect(overlay).expect("missing overlay bounds");
+        let width = capsule.right - capsule.left;
+        let height = capsule.bottom - capsule.top;
+        unsafe {
+            let backdrop = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP | WS_DISABLED,
+                capsule.left,
+                capsule.top,
+                width,
+                height,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("failed to create DWM backdrop window");
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
+            let _ = SetWindowRgn(backdrop, Some(region), false);
+            backdrop
+        }
     }
 
     fn position_above_work_area(hwnd: HWND) {
@@ -484,6 +465,8 @@ mod platform {
     fn show_phase(hwnd: HWND, phase: OverlayPhase) {
         set_overlay_phase(phase);
         unsafe {
+            let backdrop = backdrop_hwnd(hwnd);
+            hide_backdrop(backdrop);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(
                 hwnd,
@@ -501,136 +484,199 @@ mod platform {
         set_overlay_phase(OverlayPhase::Hidden);
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
+            hide_backdrop(backdrop_hwnd(hwnd));
         }
     }
 
     fn begin_input(hwnd: HWND) {
         next_overlay_generation();
-        capture_glass_backdrop(hwnd);
         show_phase(hwnd, OverlayPhase::Listening);
     }
 
-    fn capture_glass_backdrop(hwnd: HWND) {
-        let mut window_rect = Default::default();
-        if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
-            set_glass_backdrop_is_dark(false);
-            set_glass_backdrop(None);
-            return;
+    fn capsule_screen_rect(hwnd: HWND) -> Option<RECT> {
+        let mut window = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut window) }.is_err() {
+            return None;
         }
-
-        let window_width = window_rect.right - window_rect.left;
-        let window_height = window_rect.bottom - window_rect.top;
-        if window_width <= 0 || window_height <= 0 {
-            set_glass_backdrop_is_dark(false);
-            set_glass_backdrop(None);
-            return;
-        }
-
+        let window_width = window.right - window.left;
+        let window_height = window.bottom - window.top;
         let scale_x = window_width as f32 / OVERLAY_WIDTH;
         let scale_y = window_height as f32 / OVERLAY_HEIGHT;
-        let capsule_width = (LISTENING_CAPSULE_WIDTH * scale_x).round() as i32;
-        let capsule_height = (LISTENING_CAPSULE_HEIGHT * scale_y).round() as i32;
-
-        // Sample slightly inside the capsule footprint, then stretch it back out.
-        // The small magnification is the refraction cue; blur alone reads as Acrylic.
-        let source_width = (capsule_width - (6.0 * scale_x).round() as i32).max(1);
-        let source_height = (capsule_height - (4.0 * scale_y).round() as i32).max(1);
-        let source_x = window_rect.left + (window_width - source_width) / 2;
-        let source_y = window_rect.top + (window_height - source_height) / 2;
-
-        let backdrop = capture_screen_region(source_x, source_y, source_width, source_height);
-        if backdrop.is_none() {
-            set_glass_backdrop_is_dark(false);
-        }
-        set_glass_backdrop(backdrop);
+        let width = (LISTENING_CAPSULE_WIDTH * scale_x).round() as i32;
+        let height = (LISTENING_CAPSULE_HEIGHT * scale_y).round() as i32;
+        let left = window.left + (window_width - width) / 2;
+        let top = window.top + (window_height - height) / 2;
+        Some(RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        })
     }
 
-    fn capture_screen_region(x: i32, y: i32, width: i32, height: i32) -> Option<Arc<RenderImage>> {
+    fn backdrop_hwnd(_overlay: HWND) -> HWND {
+        HWND(BACKDROP_HWND.load(Ordering::Acquire) as *mut c_void)
+    }
+
+    fn hide_backdrop(backdrop: HWND) {
         unsafe {
-            let screen_dc = GetDC(None);
-            if screen_dc.is_invalid() {
-                return None;
-            }
+            let _ = ShowWindow(backdrop, SW_HIDE);
+        }
+    }
 
-            let memory_dc = CreateCompatibleDC(Some(screen_dc));
-            if memory_dc.is_invalid() {
-                let _ = ReleaseDC(None, screen_dc);
-                return None;
-            }
-
-            let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
-            if bitmap.is_invalid() {
-                let _ = DeleteDC(memory_dc);
-                let _ = ReleaseDC(None, screen_dc);
-                return None;
-            }
-
-            let previous = SelectObject(memory_dc, HGDIOBJ(bitmap.0));
-            let copied = BitBlt(
-                memory_dc,
+    fn show_backdrop_below_overlay(backdrop: HWND, overlay: HWND) {
+        unsafe {
+            let _ = ShowWindow(backdrop, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                backdrop,
+                Some(HWND_TOPMOST),
                 0,
                 0,
-                width,
-                height,
-                Some(screen_dc),
-                x,
-                y,
-                SRCCOPY,
-            )
-            .is_ok();
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                overlay,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
 
-            let mut bitmap_info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width,
-                    biHeight: -height,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
+    fn start_backdrop_thread(overlay_value: isize, backdrop_value: isize) {
+        thread::spawn(move || unsafe {
+            let overlay = HWND(overlay_value as *mut c_void);
+            let backdrop = HWND(backdrop_value as *mut c_void);
+            let mut source = HWND::default();
+            let mut thumbnail = None;
+
+            loop {
+                if IsWindowVisible(overlay).as_bool() {
+                    let window_below = window_beneath_capsule(overlay, backdrop);
+                    let binding_is_current = thumbnail
+                        .is_some_and(|handle| update_live_backdrop(handle, backdrop, source));
+                    if window_below != source || !binding_is_current {
+                        hide_backdrop(backdrop);
+                        if let Some(handle) = thumbnail.take() {
+                            let _ = DwmUnregisterThumbnail(handle);
+                        }
+                        thumbnail = register_live_backdrop(backdrop, window_below);
+                        source = if thumbnail.is_some() {
+                            window_below
+                        } else {
+                            HWND::default()
+                        };
+                    }
+                    if thumbnail.is_some() && !IsWindowVisible(backdrop).as_bool() {
+                        show_backdrop_below_overlay(backdrop, overlay);
+                    }
+                } else if IsWindowVisible(backdrop).as_bool() {
+                    hide_backdrop(backdrop);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+
+    fn window_beneath_capsule(overlay: HWND, backdrop: HWND) -> HWND {
+        unsafe {
+            let mut capsule = RECT::default();
+            if GetWindowRect(backdrop, &mut capsule).is_err() {
+                return HWND::default();
+            }
+            let center_x = (capsule.left + capsule.right) / 2;
+            let center_y = (capsule.top + capsule.bottom) / 2;
+            let mut candidate = GetWindow(overlay, GW_HWNDNEXT).unwrap_or_default();
+
+            while !candidate.is_invalid() {
+                if candidate != overlay
+                    && candidate != backdrop
+                    && IsWindowVisible(candidate).as_bool()
+                {
+                    let mut bounds = RECT::default();
+                    if GetWindowRect(candidate, &mut bounds).is_ok()
+                        && center_x >= bounds.left
+                        && center_x < bounds.right
+                        && center_y >= bounds.top
+                        && center_y < bounds.bottom
+                    {
+                        return candidate;
+                    }
+                }
+                candidate = GetWindow(candidate, GW_HWNDNEXT).unwrap_or_default();
+            }
+            HWND::default()
+        }
+    }
+
+    fn register_live_backdrop(backdrop: HWND, source: HWND) -> Option<isize> {
+        unsafe {
+            if source.is_invalid() {
+                return None;
+            }
+
+            let thumbnail = DwmRegisterThumbnail(backdrop, source).ok()?;
+            if !update_live_backdrop(thumbnail, backdrop, source) {
+                let _ = DwmUnregisterThumbnail(thumbnail);
+                return None;
+            }
+            Some(thumbnail)
+        }
+    }
+
+    fn update_live_backdrop(thumbnail: isize, backdrop: HWND, source: HWND) -> bool {
+        unsafe {
+            let mut source_window = RECT::default();
+            let mut backdrop_window = RECT::default();
+            if GetWindowRect(source, &mut source_window).is_err()
+                || GetWindowRect(backdrop, &mut backdrop_window).is_err()
+            {
+                return false;
+            }
+
+            if backdrop_window.left < source_window.left
+                || backdrop_window.top < source_window.top
+                || backdrop_window.right > source_window.right
+                || backdrop_window.bottom > source_window.bottom
+            {
+                return false;
+            }
+
+            let destination_width = backdrop_window.right - backdrop_window.left;
+            let destination_height = backdrop_window.bottom - backdrop_window.top;
+            let inset_x = (destination_width / 28).max(2);
+            let inset_y = (destination_height / 8).max(1);
+            let source_left = backdrop_window.left - source_window.left + inset_x;
+            let source_top = backdrop_window.top - source_window.top + inset_y;
+
+            let properties = DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: DWM_TNP_RECTDESTINATION
+                    | DWM_TNP_RECTSOURCE
+                    | DWM_TNP_OPACITY
+                    | DWM_TNP_VISIBLE
+                    | DWM_TNP_SOURCECLIENTAREAONLY,
+                rcDestination: RECT {
+                    left: 0,
+                    top: 0,
+                    right: destination_width,
+                    bottom: destination_height,
                 },
-                ..Default::default()
+                rcSource: RECT {
+                    left: source_left,
+                    top: source_top,
+                    right: source_left + destination_width - inset_x * 2,
+                    bottom: source_top + destination_height - inset_y * 2,
+                },
+                opacity: 236,
+                fVisible: BOOL(1),
+                fSourceClientAreaOnly: BOOL(0),
             };
-            let mut pixels = vec![0u8; (width * height * 4) as usize];
-            let scan_lines = if copied {
-                GetDIBits(
-                    memory_dc,
-                    bitmap,
-                    0,
-                    height as u32,
-                    Some(pixels.as_mut_ptr().cast()),
-                    &mut bitmap_info,
-                    DIB_RGB_COLORS,
-                )
-            } else {
-                0
-            };
-
-            let _ = SelectObject(memory_dc, previous);
-            let _ = DeleteObject(bitmap.into());
-            let _ = DeleteDC(memory_dc);
-            let _ = ReleaseDC(None, screen_dc);
-
-            if scan_lines == 0 {
-                return None;
-            }
-
-            let mut luma_sum = 0u64;
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-                luma_sum +=
-                    (pixel[0] as u64 * 54 + pixel[1] as u64 * 183 + pixel[2] as u64 * 19) >> 8;
-                pixel[0] = ((pixel[0] as u16 * 91 + 255 * 9) / 100) as u8;
-                pixel[1] = ((pixel[1] as u16 * 91 + 255 * 9) / 100) as u8;
-                pixel[2] = ((pixel[2] as u16 * 91 + 255 * 9) / 100) as u8;
-                pixel[3] = 255;
-            }
-            let pixel_count = (width as u64 * height as u64).max(1);
-            set_glass_backdrop_is_dark(luma_sum / pixel_count < 144);
-
-            let image = RgbaImage::from_raw(width as u32, height as u32, pixels)?;
-            let blurred = imageops::blur(&image, 4.5);
-            Some(Arc::new(RenderImage::new(vec![Frame::new(blurred)])))
+            DwmUpdateThumbnailProperties(thumbnail, &properties).is_ok()
         }
     }
 
