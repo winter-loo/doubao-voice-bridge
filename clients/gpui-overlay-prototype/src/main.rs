@@ -1,44 +1,68 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, Context, ElementId, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, ease_in_out, point,
+    Animation, AnimationExt as _, App, Application, Bounds, Context, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill, point,
     prelude::*, px, rgb, size,
 };
 
-const OVERLAY_WIDTH: f32 = 420.0;
-const OVERLAY_HEIGHT: f32 = 88.0;
+const OVERLAY_WIDTH: f32 = 432.0;
+const OVERLAY_HEIGHT: f32 = 92.0;
 const BOTTOM_MARGIN: f32 = 56.0;
+const WAVEFORM_WIDTH: f32 = 88.0;
+const WAVEFORM_HEIGHT: f32 = 40.0;
+const BAR_WIDTH: f32 = 3.0;
+const BAR_GAP: f32 = 4.0;
+const BAR_COUNT: usize = 11;
+
+fn waveform_canvas(delta: f32) -> impl IntoElement {
+    const AMPLITUDES: [f32; BAR_COUNT] = [
+        0.42, 0.62, 0.82, 0.68, 0.94, 0.76, 1.0, 0.72, 0.86, 0.58, 0.38,
+    ];
+
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let phase = delta * std::f32::consts::TAU;
+            let bars_width = BAR_COUNT as f32 * BAR_WIDTH + (BAR_COUNT - 1) as f32 * BAR_GAP;
+            let start_x = bounds.origin.x + (bounds.size.width - px(bars_width)) / 2.0;
+            let center_y = bounds.origin.y + bounds.size.height / 2.0;
+
+            for (index, amplitude) in AMPLITUDES.iter().enumerate() {
+                let offset = index as f32 * 0.68;
+                let primary = ((phase + offset).sin() + 1.0) * 0.5;
+                let secondary = ((phase * 2.0 - offset * 0.8).sin() + 1.0) * 0.5;
+                let energy = 0.64 * primary + 0.36 * secondary;
+                let height = 7.0 + 25.0 * amplitude * (0.28 + 0.72 * energy);
+                let bar_bounds = Bounds::new(
+                    point(
+                        start_x + px(index as f32 * (BAR_WIDTH + BAR_GAP)),
+                        center_y - px(height / 2.0),
+                    ),
+                    size(px(BAR_WIDTH), px(height)),
+                );
+
+                window
+                    .paint_quad(fill(bar_bounds, rgb(0x2f6bff)).corner_radii(px(BAR_WIDTH / 2.0)));
+            }
+        },
+    )
+    .w(px(WAVEFORM_WIDTH))
+    .h(px(WAVEFORM_HEIGHT))
+}
 
 struct VoiceOverlay;
 
 impl Render for VoiceOverlay {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let waveform = div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .w(px(92.0))
-            .h(px(44.0))
-            .children((0..11).map(|index| {
-                let amplitude = 10.0 + ((index * 7) % 19) as f32;
-                let duration = Duration::from_millis(540 + (index as u64 * 43));
-
-                div()
-                    .w(px(3.0))
-                    .h(px(12.0))
-                    .rounded_full()
-                    .bg(rgb(0x2f6bff))
-                    .with_animation(
-                        ElementId::named_usize("wave", index),
-                        Animation::new(duration).repeat().with_easing(ease_in_out),
-                        move |bar, delta| {
-                            let pulse = 1.0 - (2.0 * delta - 1.0).abs();
-                            bar.h(px(8.0 + amplitude * pulse))
-                        },
-                    )
-            }));
+            .w(px(WAVEFORM_WIDTH))
+            .h(px(WAVEFORM_HEIGHT))
+            .with_animation(
+                "waveform",
+                Animation::new(Duration::from_millis(1_180)).repeat(),
+                |surface, delta| surface.child(waveform_canvas(delta)),
+            );
 
         div()
             .size_full()
@@ -50,9 +74,9 @@ impl Render for VoiceOverlay {
                     .id("voice-capsule")
                     .flex()
                     .items_center()
-                    .gap_4()
-                    .w(px(396.0))
-                    .h(px(72.0))
+                    .justify_between()
+                    .w(px(404.0))
+                    .h(px(74.0))
                     .px_5()
                     .rounded_full()
                     .bg(rgb(0xf8f9fc))
@@ -81,13 +105,13 @@ impl Render for VoiceOverlay {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .w(px(154.0))
-                            .child(div().text_base().child("Listening..."))
+                            .w(px(132.0))
+                            .child(div().text_base().child("Listening"))
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x747b87))
-                                    .child("Ctrl+Alt+Space"),
+                                    .child("Remote microphone"),
                             ),
                     )
                     .child(waveform)
