@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, Context, Window,
+    Animation, AnimationExt as _, App, Application, Bounds, Context, PathBuilder, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill, point,
     prelude::*, px, rgb, size,
 };
@@ -51,6 +51,39 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
     .h(px(WAVEFORM_HEIGHT))
 }
 
+fn microphone_icon() -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        |bounds, _, window, _| {
+            let center_x = bounds.origin.x + bounds.size.width / 2.0;
+            let center_y = bounds.origin.y + bounds.size.height / 2.0;
+            let blue = rgb(0x2f6bff);
+            let body = Bounds::new(
+                point(center_x - px(5.0), center_y - px(11.0)),
+                size(px(10.0), px(17.0)),
+            );
+            window.paint_quad(fill(body, blue).corner_radii(px(5.0)));
+
+            let mut outline = PathBuilder::stroke(px(2.0));
+            outline.move_to(point(center_x - px(8.0), center_y - px(1.0)));
+            outline.cubic_bezier_to(
+                point(center_x + px(8.0), center_y - px(1.0)),
+                point(center_x - px(8.0), center_y + px(8.0)),
+                point(center_x + px(8.0), center_y + px(8.0)),
+            );
+            outline.move_to(point(center_x, center_y + px(7.0)));
+            outline.line_to(point(center_x, center_y + px(11.0)));
+            outline.move_to(point(center_x - px(5.0), center_y + px(11.0)));
+            outline.line_to(point(center_x + px(5.0), center_y + px(11.0)));
+
+            if let Ok(path) = outline.build() {
+                window.paint_path(path, blue);
+            }
+        },
+    )
+    .size(px(24.0))
+}
+
 struct VoiceOverlay;
 
 impl Render for VoiceOverlay {
@@ -92,13 +125,7 @@ impl Render for VoiceOverlay {
                             .size(px(40.0))
                             .rounded_full()
                             .bg(rgb(0xe9efff))
-                            .child(
-                                div()
-                                    .w(px(12.0))
-                                    .h(px(20.0))
-                                    .rounded_full()
-                                    .bg(rgb(0x2f6bff)),
-                            ),
+                            .child(microphone_icon()),
                     )
                     .child(
                         div()
@@ -111,7 +138,7 @@ impl Render for VoiceOverlay {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x747b87))
-                                    .child("Remote microphone"),
+                                    .child("Remote audio"),
                             ),
                     )
                     .child(waveform)
@@ -183,9 +210,10 @@ mod platform {
         MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_SPACE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetMessageW, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE,
-        SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, MSG,
+        SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER, WS_DLGFRAME,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
     };
 
     const HOTKEY_ID: i32 = 0xDB01;
@@ -193,6 +221,11 @@ mod platform {
     pub fn configure_overlay(window: &Window) {
         let hwnd = hwnd(window);
         unsafe {
+            let styles = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let frame_styles =
+                WS_BORDER.0 as isize | WS_DLGFRAME.0 as isize | WS_THICKFRAME.0 as isize;
+            SetWindowLongPtrW(hwnd, GWL_STYLE, styles & !frame_styles);
+
             let styles = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             SetWindowLongPtrW(
                 hwnd,
