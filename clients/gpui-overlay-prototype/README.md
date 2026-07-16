@@ -18,10 +18,10 @@ display. Its 20 cyan-to-blue waveform bars are drawn in one Canvas from one
 animation clock. Activation immediately shows the animated listening waveform,
 followed by `优化识别中` after input ends.
 
-The listening capsule is intentionally compact at 86 x 34 logical px: its width
-is the exact 20-bar waveform width plus four bar widths of total horizontal
-padding. The optimizing capsule is 108 x 30 logical px. Windows display scaling
-can make these appear larger in screenshots.
+The listening capsule is intentionally compact at 102 x 34 logical px: its width
+is the exact 20-bar waveform width plus 24 logical px of total horizontal padding
+(12 px per side). The optimizing capsule is 108 x 30 logical px. Windows display
+scaling can make these appear larger in screenshots.
 
 On Windows, hold right `Ctrl` for 420 ms to activate and release it to finish.
 `Ctrl+Alt+Space` starts or finishes a session for remote testing, and clicking the
