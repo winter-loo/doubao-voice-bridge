@@ -31,6 +31,10 @@ Runtime diagnostics reported:
 }
 ```
 
+The release PE header reports subsystem `2` (`Windows GUI`). A before/after
+RustDesk review confirmed that launching the executable from the same interactive
+scheduled task no longer creates a Command Prompt or Windows Terminal window.
+
 Automated input exercised `Ctrl+Alt+Space` twice and clicked the stop control. All
 operations passed:
 

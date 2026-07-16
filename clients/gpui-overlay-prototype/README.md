@@ -10,6 +10,9 @@ Run from this directory:
 cargo run --release
 ```
 
+The Windows release binary uses the GUI subsystem and does not create a console
+window when launched directly. Debug builds retain their console for diagnostics.
+
 The prototype opens a transparent voice capsule near the bottom of the primary
 display. Its 11 waveform bars are drawn in one Canvas from one animation clock.
 Press `Ctrl+Alt+Space` to hide or show it. Clicking the stop symbol also hides it.
