@@ -388,6 +388,12 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod platform {
     use std::ffi::c_void;
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    use std::os::windows::process::CommandExt as _;
+    use std::path::PathBuf;
+    use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -424,6 +430,7 @@ mod platform {
     use windows::core::{BOOL, w};
 
     const HOTKEY_ID: i32 = 0xDB01;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const HOLD_THRESHOLD: Duration = Duration::from_millis(420);
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
     const BACKDROP_SAMPLES: [(i32, i32, u8); 5] = [
@@ -434,6 +441,12 @@ mod platform {
         (0, 1, 14),
     ];
     static BACKDROP_HWND: AtomicIsize = AtomicIsize::new(0);
+    static VOICE_CLIENT: Mutex<Option<VoiceClientProcess>> = Mutex::new(None);
+
+    struct VoiceClientProcess {
+        child: Child,
+        stdin: ChildStdin,
+    }
 
     pub fn configure_overlay(window: &Window) {
         let hwnd = hwnd(window);
@@ -601,6 +614,119 @@ mod platform {
         next_overlay_generation();
         set_dark_background(sample_dark_background(hwnd));
         show_phase(hwnd, OverlayPhase::Listening);
+        if let Err(error) = start_voice_client() {
+            append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
+        }
+    }
+
+    fn project_root() -> Option<PathBuf> {
+        let executable = std::env::current_exe().ok()?;
+        let mut directory = executable.parent()?.to_path_buf();
+        for _ in 0..4 {
+            if !directory.pop() {
+                return None;
+            }
+        }
+        Some(directory)
+    }
+
+    fn voice_client_log_path() -> PathBuf {
+        std::env::temp_dir().join("doubao-gpui-voice-client.log")
+    }
+
+    fn append_voice_client_log(message: &str) {
+        if let Ok(mut log) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(voice_client_log_path())
+        {
+            let _ = log.write_all(message.as_bytes());
+        }
+    }
+
+    fn start_voice_client() -> Result<(), String> {
+        let mut active = VOICE_CLIENT
+            .lock()
+            .map_err(|_| "voice client lock is poisoned".to_string())?;
+        if let Some(process) = active.as_mut() {
+            match process.child.try_wait() {
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) => {}
+                Err(error) => return Err(format!("could not inspect previous client: {error}")),
+            }
+        }
+        active.take();
+
+        let root = project_root().ok_or_else(|| "could not locate project root".to_string())?;
+        let script = root.join("clients").join("doubao_remote.py");
+        if !script.is_file() {
+            return Err(format!("missing client script: {}", script.display()));
+        }
+
+        let server = std::env::var("DOUBAO_BRIDGE_SERVER")
+            .unwrap_or_else(|_| "100.116.241.81:4387".to_string());
+        let audio_host = server
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| format!("invalid DOUBAO_BRIDGE_SERVER: {server}"))?;
+
+        let log = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(voice_client_log_path())
+            .map_err(|error| format!("could not open voice client log: {error}"))?;
+        let error_log = log
+            .try_clone()
+            .map_err(|error| format!("could not clone voice client log: {error}"))?;
+
+        let mut child = Command::new("py");
+        child
+            .arg("-3")
+            .arg(script)
+            .arg("--server")
+            .arg(&server)
+            .arg("--udp-host")
+            .arg(audio_host)
+            .arg("--udp-port")
+            .arg("5004")
+            .arg("--audio-transport")
+            .arg("tcp")
+            .arg("record")
+            .arg("--audio-start-delay")
+            .arg("0.2")
+            .arg("--audio-stop-delay")
+            .arg("0.5")
+            .arg("--recording-timeout")
+            .arg("15")
+            .arg("--final-timeout")
+            .arg("8")
+            .arg("--stdin-stop")
+            .arg("--paste")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(error_log))
+            .creation_flags(CREATE_NO_WINDOW);
+
+        let mut child = child
+            .spawn()
+            .map_err(|error| format!("could not launch Python client: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Python client stdin was not piped".to_string())?;
+        *active = Some(VoiceClientProcess { child, stdin });
+        Ok(())
+    }
+
+    fn stop_voice_client() -> Option<Child> {
+        let mut active = VOICE_CLIENT.lock().ok()?;
+        let mut process = active.take()?;
+        let _ = process.stdin.write_all(b"stop\n");
+        let _ = process.stdin.flush();
+        drop(process.stdin);
+        Some(process.child)
     }
 
     fn sample_dark_background(hwnd: HWND) -> bool {
@@ -895,12 +1021,23 @@ mod platform {
         let generation = overlay_generation();
         show_phase(hwnd, OverlayPhase::Optimizing);
         let hwnd_value = hwnd.0 as isize;
-        thread::spawn(move || {
-            thread::sleep(OPTIMIZING_DURATION);
-            if overlay_generation() == generation && overlay_phase() == OverlayPhase::Optimizing {
-                hide_overlay(HWND(hwnd_value as *mut c_void));
-            }
-        });
+        if let Some(mut client) = stop_voice_client() {
+            thread::spawn(move || {
+                let _ = client.wait();
+                if overlay_generation() == generation && overlay_phase() == OverlayPhase::Optimizing
+                {
+                    hide_overlay(HWND(hwnd_value as *mut c_void));
+                }
+            });
+        } else {
+            thread::spawn(move || {
+                thread::sleep(OPTIMIZING_DURATION);
+                if overlay_generation() == generation && overlay_phase() == OverlayPhase::Optimizing
+                {
+                    hide_overlay(HWND(hwnd_value as *mut c_void));
+                }
+            });
+        }
     }
 
     fn hwnd(window: &Window) -> HWND {
