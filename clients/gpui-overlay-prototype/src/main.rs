@@ -128,9 +128,9 @@ fn listening_capsule(delta: f32) -> impl IntoElement {
 fn optimizing_capsule() -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
-        .w(px(108.0))
-        .h(px(30.0))
-        .text_sm()
+        .w(px(LISTENING_CAPSULE_WIDTH))
+        .h(px(LISTENING_CAPSULE_HEIGHT))
+        .text_xs()
         .child("优化识别中")
 }
 
