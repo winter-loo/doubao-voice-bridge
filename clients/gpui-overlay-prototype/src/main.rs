@@ -4,8 +4,11 @@
 )]
 
 use std::{
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-    time::Duration,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use gpui::{
@@ -24,6 +27,10 @@ const LISTENING_CAPSULE_WIDTH: f32 = WAVEFORM_BARS_WIDTH + LISTENING_HORIZONTAL_
 const LISTENING_CAPSULE_HEIGHT: f32 = 26.0;
 const OVERLAY_WIDTH: f32 = 128.0;
 const OVERLAY_HEIGHT: f32 = 42.0;
+const BAR_AMPLITUDES: [f32; BAR_COUNT] = [
+    0.24, 0.32, 0.44, 0.58, 0.42, 0.64, 0.88, 1.0, 0.78, 0.56, 0.92, 0.74, 0.58, 0.68, 0.49, 0.42,
+    0.35, 0.3, 0.25, 0.2,
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -36,6 +43,15 @@ enum OverlayPhase {
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
+static VOICE_ACTIVITY: AtomicU32 = AtomicU32::new(0);
+static VOICE_ACTIVITY_UPDATED_AT: AtomicU64 = AtomicU64::new(0);
+static SPEECH_ACTIVITY_UNTIL: AtomicU64 = AtomicU64::new(0);
+static FORCE_WAVEFORM_ACTIVITY: OnceLock<bool> = OnceLock::new();
+
+const VOICE_RMS_GATE_DBFS: f32 = -58.0;
+const VOICE_PEAK_GATE_DBFS: f32 = -45.0;
+const VOICE_ACTIVITY_STALE_AFTER_MS: u64 = 300;
+const SPEECH_ACTIVITY_HOLD_MS: u64 = 500;
 
 fn overlay_phase() -> OverlayPhase {
     match OVERLAY_PHASE.load(Ordering::Acquire) {
@@ -65,6 +81,97 @@ fn set_dark_background(dark: bool) {
     DARK_BACKGROUND.store(dark, Ordering::Release);
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn set_voice_activity(level: f32) {
+    let quantized = (level.clamp(0.0, 1.0) * 1_000.0).round() as u32;
+    VOICE_ACTIVITY.store(quantized, Ordering::Release);
+    VOICE_ACTIVITY_UPDATED_AT.store(now_millis(), Ordering::Release);
+}
+
+fn mark_speech_activity() {
+    SPEECH_ACTIVITY_UNTIL.store(
+        now_millis().saturating_add(SPEECH_ACTIVITY_HOLD_MS),
+        Ordering::Release,
+    );
+}
+
+fn clear_voice_activity() {
+    set_voice_activity(0.0);
+    SPEECH_ACTIVITY_UNTIL.store(0, Ordering::Release);
+}
+
+fn decoded_voice_activity(level: u32, updated_at: u64, speech_until: u64, now: u64) -> f32 {
+    if level == 0
+        || now > speech_until
+        || now.saturating_sub(updated_at) > VOICE_ACTIVITY_STALE_AFTER_MS
+    {
+        return 0.0;
+    }
+    level as f32 / 1_000.0
+}
+
+fn voice_activity() -> f32 {
+    let speech_until = if *FORCE_WAVEFORM_ACTIVITY
+        .get_or_init(|| std::env::var_os("DOUBAO_WAVEFORM_FORCE_ACTIVITY").is_some())
+    {
+        u64::MAX
+    } else {
+        SPEECH_ACTIVITY_UNTIL.load(Ordering::Acquire)
+    };
+    decoded_voice_activity(
+        VOICE_ACTIVITY.load(Ordering::Acquire),
+        VOICE_ACTIVITY_UPDATED_AT.load(Ordering::Acquire),
+        speech_until,
+        now_millis(),
+    )
+}
+
+fn parse_dbfs(line: &str, label: &str) -> Option<f32> {
+    let value = line.split_once(label)?.1.split_once("dBFS")?.0.trim();
+    value.parse().ok()
+}
+
+fn voice_activity_from_audio_line(line: &str) -> Option<f32> {
+    if !line.starts_with("[local_audio_level]") {
+        return None;
+    }
+    let rms = parse_dbfs(line, "rms=")?;
+    let peak = parse_dbfs(line, "peak=")?;
+    if rms < VOICE_RMS_GATE_DBFS || peak < VOICE_PEAK_GATE_DBFS {
+        return Some(0.0);
+    }
+
+    let rms_strength = ((rms - VOICE_RMS_GATE_DBFS) / -VOICE_RMS_GATE_DBFS).clamp(0.0, 1.0);
+    let peak_strength = ((peak - VOICE_PEAK_GATE_DBFS) / -VOICE_PEAK_GATE_DBFS).clamp(0.0, 1.0);
+    Some((0.75 * rms_strength + 0.25 * peak_strength).clamp(0.12, 1.0))
+}
+
+fn is_partial_speech_line(line: &str) -> bool {
+    line.strip_prefix("[partial]")
+        .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn waveform_bar_height(index: usize, delta: f32, voice_level: f32) -> f32 {
+    if voice_level == 0.0 {
+        return 3.0;
+    }
+
+    let phase = delta * std::f32::consts::TAU;
+    let offset = index as f32 * 0.53;
+    let random_phase = ((index * 73 + 19) % 101) as f32 / 101.0 * std::f32::consts::TAU;
+    let primary =
+        ((phase * (0.82 + index as f32 * 0.013) + offset + random_phase).sin() + 1.0) * 0.5;
+    let secondary = ((phase * 2.17 - offset * 0.71 + random_phase * 0.37).sin() + 1.0) * 0.5;
+    let movement = 0.62 * primary + 0.38 * secondary;
+    3.0 + 13.0 * BAR_AMPLITUDES[index] * voice_level.sqrt() * (0.24 + 0.76 * movement)
+}
+
 fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
     let channel = |shift: u32| {
         let from = ((start >> shift) & 0xffu32) as f32;
@@ -75,15 +182,9 @@ fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
 }
 
 fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
-    const AMPLITUDES: [f32; BAR_COUNT] = [
-        0.24, 0.32, 0.44, 0.58, 0.42, 0.64, 0.88, 1.0, 0.78, 0.56, 0.92, 0.74, 0.58, 0.68, 0.49,
-        0.42, 0.35, 0.3, 0.25, 0.2,
-    ];
-
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            let phase = delta * std::f32::consts::TAU;
             let radius = bounds.size.height / 2.0;
             let dark = dark_background();
             let (glass_top, glass_bottom) = if dark {
@@ -238,13 +339,10 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
 
             let start_x = bounds.origin.x + (bounds.size.width - px(WAVEFORM_BARS_WIDTH)) / 2.0;
             let center_y = bounds.origin.y + bounds.size.height / 2.0;
+            let voice_level = voice_activity();
 
-            for (index, amplitude) in AMPLITUDES.iter().enumerate() {
-                let offset = index as f32 * 0.53;
-                let primary = ((phase + offset).sin() + 1.0) * 0.5;
-                let secondary = ((phase * 2.0 - offset * 0.8).sin() + 1.0) * 0.5;
-                let energy = 0.7 * primary + 0.3 * secondary;
-                let height = 3.0 + 13.0 * amplitude * (0.12 + 0.88 * energy);
+            for index in 0..BAR_COUNT {
+                let height = waveform_bar_height(index, delta, voice_level);
                 let bar_bounds = Bounds::new(
                     point(
                         start_x + px(index as f32 * (BAR_WIDTH + BAR_GAP)),
@@ -389,7 +487,7 @@ fn main() {
 mod platform {
     use std::ffi::c_void;
     use std::fs::OpenOptions;
-    use std::io::Write as _;
+    use std::io::{BufRead as _, BufReader, Read, Write as _};
     use std::os::windows::process::CommandExt as _;
     use std::path::PathBuf;
     use std::process::{Child, ChildStdin, Command, Stdio};
@@ -400,8 +498,9 @@ mod platform {
 
     use super::{
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
-        OverlayPhase, dark_background, next_overlay_generation, overlay_generation, overlay_phase,
-        set_dark_background, set_overlay_phase,
+        OverlayPhase, clear_voice_activity, dark_background, is_partial_speech_line,
+        mark_speech_activity, next_overlay_generation, overlay_generation, overlay_phase,
+        set_dark_background, set_overlay_phase, set_voice_activity, voice_activity_from_audio_line,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -603,6 +702,7 @@ mod platform {
     }
 
     fn hide_overlay(hwnd: HWND) {
+        clear_voice_activity();
         set_overlay_phase(OverlayPhase::Hidden);
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -612,6 +712,7 @@ mod platform {
 
     fn begin_input(hwnd: HWND) {
         next_overlay_generation();
+        clear_voice_activity();
         set_dark_background(sample_dark_background(hwnd));
         show_phase(hwnd, OverlayPhase::Listening);
         if let Err(error) = start_voice_client() {
@@ -644,6 +745,53 @@ mod platform {
         }
     }
 
+    fn start_voice_client_output_thread<R>(
+        stream: R,
+        parse_audio_levels: bool,
+        parse_speech_activity: bool,
+    ) where
+        R: Read + Send + 'static,
+    {
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            let mut log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(voice_client_log_path())
+                .ok();
+
+            loop {
+                let mut buffer = Vec::new();
+                match reader.read_until(b'\n', &mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if parse_audio_levels {
+                    let line = String::from_utf8_lossy(&buffer);
+                    if let Some(level) = voice_activity_from_audio_line(line.trim()) {
+                        set_voice_activity(level);
+                    }
+                }
+                if parse_speech_activity {
+                    let line = String::from_utf8_lossy(&buffer);
+                    if is_partial_speech_line(line.trim()) {
+                        mark_speech_activity();
+                    }
+                }
+                if let Some(log) = log.as_mut() {
+                    let _ = log.write_all(&buffer);
+                }
+            }
+
+            if parse_audio_levels {
+                set_voice_activity(0.0);
+            }
+            if parse_speech_activity {
+                clear_voice_activity();
+            }
+        });
+    }
+
     fn start_voice_client() -> Result<(), String> {
         let mut active = VOICE_CLIENT
             .lock()
@@ -670,19 +818,18 @@ mod platform {
             .map(|(host, _)| host)
             .filter(|host| !host.is_empty())
             .ok_or_else(|| format!("invalid DOUBAO_BRIDGE_SERVER: {server}"))?;
+        let input_file = std::env::var_os("DOUBAO_VOICE_INPUT_FILE").map(PathBuf::from);
 
-        let log = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(voice_client_log_path())
             .map_err(|error| format!("could not open voice client log: {error}"))?;
-        let error_log = log
-            .try_clone()
-            .map_err(|error| format!("could not clone voice client log: {error}"))?;
 
         let mut child = Command::new("py");
         child
+            .env("PYTHONUNBUFFERED", "1")
             .arg("-3")
             .arg(script)
             .arg("--server")
@@ -692,7 +839,14 @@ mod platform {
             .arg("--udp-port")
             .arg("5004")
             .arg("--audio-transport")
-            .arg("tcp")
+            .arg("tcp");
+        if let Some(input_file) = input_file {
+            child
+                .arg("--input-file")
+                .arg(input_file)
+                .arg("--no-loop-input");
+        }
+        child
             .arg("record")
             .arg("--audio-start-delay")
             .arg("0.2")
@@ -703,10 +857,11 @@ mod platform {
             .arg("--final-timeout")
             .arg("8")
             .arg("--stdin-stop")
+            .arg("--python-tcp-audio")
             .arg("--paste")
             .stdin(Stdio::piped())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(error_log))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW);
 
         let mut child = child
@@ -716,6 +871,16 @@ mod platform {
             .stdin
             .take()
             .ok_or_else(|| "Python client stdin was not piped".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Python client stdout was not piped".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Python client stderr was not piped".to_string())?;
+        start_voice_client_output_thread(stdout, false, true);
+        start_voice_client_output_thread(stderr, true, false);
         *active = Some(VoiceClientProcess { child, stdin });
         Ok(())
     }
@@ -1019,6 +1184,7 @@ mod platform {
         }
 
         let generation = overlay_generation();
+        clear_voice_activity();
         show_phase(hwnd, OverlayPhase::Optimizing);
         let hwnd_value = hwnd.0 as isize;
         if let Some(mut client) = stop_voice_client() {
@@ -1097,6 +1263,68 @@ mod platform {
                 thread::sleep(Duration::from_millis(16));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BAR_COUNT, decoded_voice_activity, is_partial_speech_line, voice_activity_from_audio_line,
+        waveform_bar_height,
+    };
+
+    #[test]
+    fn silence_is_hard_gated_to_zero() {
+        let level =
+            voice_activity_from_audio_line("[local_audio_level] rms=-92.4dBFS peak=-80.8dBFS");
+
+        assert_eq!(level, Some(0.0));
+    }
+
+    #[test]
+    fn speech_level_crosses_the_activity_gate() {
+        let level =
+            voice_activity_from_audio_line("[local_audio_level] rms=-46.6dBFS peak=-36.4dBFS")
+                .expect("audio level should parse");
+
+        assert!(level > 0.12);
+        assert!(level < 1.0);
+    }
+
+    #[test]
+    fn stale_activity_is_forced_to_zero() {
+        assert!(decoded_voice_activity(650, 1_000, 2_000, 1_200) > 0.0);
+        assert_eq!(decoded_voice_activity(650, 1_000, 2_000, 1_301), 0.0);
+    }
+
+    #[test]
+    fn energy_does_not_move_without_recognized_speech() {
+        assert_eq!(decoded_voice_activity(650, 1_000, 0, 1_100), 0.0);
+        assert!(is_partial_speech_line("[partial] 你好"));
+        assert!(!is_partial_speech_line("[partial]   "));
+    }
+
+    #[test]
+    fn silent_waveform_is_identical_at_every_animation_time() {
+        for index in 0..BAR_COUNT {
+            assert_eq!(
+                waveform_bar_height(index, 0.1, 0.0),
+                waveform_bar_height(index, 0.9, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn active_waveform_changes_with_animation_time() {
+        let changed_bars = (0..BAR_COUNT)
+            .filter(|index| {
+                (waveform_bar_height(*index, 0.1, 0.7) - waveform_bar_height(*index, 0.4, 0.7))
+                    .abs()
+                    > 0.25
+            })
+            .count();
+
+        assert!(changed_bars > BAR_COUNT / 2);
     }
 }
 
