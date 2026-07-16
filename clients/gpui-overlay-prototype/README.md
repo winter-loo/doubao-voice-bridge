@@ -20,8 +20,9 @@ followed by `优化识别中` after input ends.
 
 The listening capsule is intentionally compact at 108 x 26 logical px: its width
 is the exact 20-bar waveform width plus 30 logical px of total horizontal padding
-(15 px per side). The optimizing capsule is 108 x 30 logical px. Windows display
-scaling can make these appear larger in screenshots.
+(15 px per side). The optimizing phase reuses the same 108 x 26 logical px shell
+with smaller text, so ending a recording does not resize the capsule. Windows
+display scaling can make these appear larger in screenshots.
 
 On Windows, hold right `Ctrl` for 420 ms to activate and release it to finish.
 `Ctrl+Alt+Space` starts or finishes a session for remote testing, and clicking the
