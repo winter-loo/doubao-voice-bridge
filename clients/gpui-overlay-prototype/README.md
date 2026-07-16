@@ -11,8 +11,9 @@ cargo run --release
 ```
 
 The prototype opens a transparent voice capsule near the bottom of the primary
-display. Press `Ctrl+Alt+Space` to hide or show it. Clicking the stop symbol also
-hides it. The previously focused application should retain keyboard focus.
+display. Its 11 waveform bars are drawn in one Canvas from one animation clock.
+Press `Ctrl+Alt+Space` to hide or show it. Clicking the stop symbol also hides it.
+The previously focused application should retain keyboard focus.
 
 Useful verification command while the prototype is running:
 

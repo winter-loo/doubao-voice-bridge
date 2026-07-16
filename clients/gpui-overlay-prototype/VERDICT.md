@@ -16,7 +16,7 @@ application receiving dictated text?
 
 ## Result
 
-**Pass, with a waveform performance caveat.**
+**Pass.**
 
 The release executable compiled and ran in the logged-in Windows console session.
 Runtime diagnostics reported:
@@ -48,15 +48,19 @@ This validates the critical `WS_EX_NOACTIVATE` behavior.
 
 ## Footprint
 
-- Release executable: 10,793,984 bytes
-- Working set during animation: about 41 MB
-- Private memory: about 19 MB
+- Release executable: 10,812,416 bytes
+- Working set during animation: 38,969,344-40,857,600 bytes (about 37-39 MB)
+- Private memory: 18,194,432-18,321,408 bytes (about 17.4-17.5 MB)
 - Process remained responsive
 
-The current 11 independent repeating GPUI animations consumed roughly 1.58 CPU
+The original 11 independent repeating GPUI animations consumed roughly 1.58 CPU
 seconds over a 7.7-second observation window on this host, or about 20% of one CPU
-core. Production should use one animation clock and draw all waveform bars in one
-Canvas pass.
+core. After moving all 11 bars to one animation clock and one Canvas paint pass,
+the release build consumed 0.3438 and 0.3594 CPU seconds in two independent
+10-second observation windows, or about 3.5% of one CPU core.
+
+The tuned layout also passed a second automated interaction run after anchoring
+the stop control to the capsule's right inset with space-between layout.
 
 ## Capture Limitation
 
@@ -73,6 +77,6 @@ the authoritative result for this prototype.
 ## Decision
 
 GPUI is technically suitable for the Windows voice-input overlay. Keep the native
-Win32 layer for window styles and global hotkeys. Before integrating the voice
-protocol, replace the prototype waveform with one Canvas animation and verify its
-appearance directly on the Windows desktop.
+Win32 layer for window styles and global hotkeys. The single-Canvas waveform is
+fast enough for this prototype. Its final styling still needs direct review on the
+Windows desktop before integrating the voice protocol.
