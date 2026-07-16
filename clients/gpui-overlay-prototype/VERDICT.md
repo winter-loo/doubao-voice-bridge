@@ -46,9 +46,14 @@ operations passed:
 The foreground HWND was identical before and after both keyboard and mouse tests.
 This validates the critical `WS_EX_NOACTIVATE` behavior.
 
+A macOS-side RustDesk capture of the live Windows console session confirmed that
+the capsule is fully rendered with no clipping or overlap. A visual tuning pass
+removed the native rectangular window frame, kept the secondary status on one
+line, and replaced the placeholder pill with a recognizable microphone icon.
+
 ## Footprint
 
-- Release executable: 10,812,416 bytes
+- Release executable: 10,947,072 bytes
 - Working set during animation: 38,969,344-40,857,600 bytes (about 37-39 MB)
 - Private memory: 18,194,432-18,321,408 bytes (about 17.4-17.5 MB)
 - Process remained responsive
@@ -67,8 +72,8 @@ the stop control to the capsule's right inset with space-between layout.
 Both GDI `CopyFromScreen` and FFmpeg Desktop Duplication captures returned black
 frames from the interactive scheduled-task environment. The HWND, visibility,
 styles, input behavior, process responsiveness, and animation CPU activity were
-still observable, but automated visual pixel verification remains inconclusive.
-A direct console or RDP visual review is required before adopting the styling.
+still observable. Capturing the same live desktop through the macOS RustDesk
+window produced the expected pixels and was used for final visual verification.
 
 Local macOS compilation was also not used as evidence because GPUI requires the
 optional Xcode Metal Toolchain, which is not installed. The target Windows build is
@@ -78,5 +83,4 @@ the authoritative result for this prototype.
 
 GPUI is technically suitable for the Windows voice-input overlay. Keep the native
 Win32 layer for window styles and global hotkeys. The single-Canvas waveform is
-fast enough for this prototype. Its final styling still needs direct review on the
-Windows desktop before integrating the voice protocol.
+fast enough for this prototype, and the tuned styling passed direct RustDesk review.
