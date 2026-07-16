@@ -17,13 +17,14 @@ use gpui::{
 const OVERLAY_WIDTH: f32 = 266.0;
 const OVERLAY_HEIGHT: f32 = 48.0;
 const BOTTOM_MARGIN: f32 = 30.0;
-const WAVEFORM_HEIGHT: f32 = 22.0;
+const WAVEFORM_HEIGHT: f32 = 16.0;
 const BAR_WIDTH: f32 = 2.0;
 const BAR_GAP: f32 = 2.0;
 const BAR_COUNT: usize = 20;
 const WAVEFORM_BARS_WIDTH: f32 = BAR_COUNT as f32 * BAR_WIDTH + (BAR_COUNT - 1) as f32 * BAR_GAP;
-const LISTENING_HORIZONTAL_PADDING: f32 = 24.0;
+const LISTENING_HORIZONTAL_PADDING: f32 = 30.0;
 const LISTENING_CAPSULE_WIDTH: f32 = WAVEFORM_BARS_WIDTH + LISTENING_HORIZONTAL_PADDING;
+const LISTENING_CAPSULE_HEIGHT: f32 = 26.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -83,7 +84,7 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
                 let primary = ((phase + offset).sin() + 1.0) * 0.5;
                 let secondary = ((phase * 2.0 - offset * 0.8).sin() + 1.0) * 0.5;
                 let energy = 0.7 * primary + 0.3 * secondary;
-                let height = 4.0 + 18.0 * amplitude * (0.12 + 0.88 * energy);
+                let height = 3.0 + 13.0 * amplitude * (0.12 + 0.88 * energy);
                 let bar_bounds = Bounds::new(
                     point(
                         start_x + px(index as f32 * (BAR_WIDTH + BAR_GAP)),
@@ -118,7 +119,7 @@ fn listening_capsule(delta: f32) -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
         .w(px(LISTENING_CAPSULE_WIDTH))
-        .h(px(34.0))
+        .h(px(LISTENING_CAPSULE_HEIGHT))
         .cursor_pointer()
         .on_click(|_, window, _| platform::finish_input(window))
         .child(waveform_canvas(delta))
