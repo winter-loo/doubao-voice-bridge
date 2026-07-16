@@ -74,6 +74,11 @@ function Send-OverlayHotkey {
     Start-Sleep -Milliseconds 400
 }
 
+function Set-RightControl([bool]$Down) {
+    $flags = if ($Down) { 0 } else { 2 }
+    [OverlayExercise]::keybd_event(0xA3, 0, $flags, [UIntPtr]::Zero)
+}
+
 $process = Get-Process gpui-overlay-prototype -ErrorAction Stop
 $hwnd = Find-ProcessWindow $process.Id
 if ($hwnd -eq [IntPtr]::Zero) {
@@ -83,45 +88,53 @@ if ($hwnd -eq [IntPtr]::Zero) {
 $foregroundBefore = [OverlayExercise]::GetForegroundWindow()
 $initiallyVisible = [OverlayExercise]::IsWindowVisible($hwnd)
 
+if ($initiallyVisible) {
+    Send-OverlayHotkey
+    Start-Sleep -Milliseconds 2500
+}
+
+Set-RightControl $true
+Start-Sleep -Milliseconds 250
+$visibleBeforeHoldThreshold = [OverlayExercise]::IsWindowVisible($hwnd)
+Start-Sleep -Milliseconds 350
+$visibleAfterHoldThreshold = [OverlayExercise]::IsWindowVisible($hwnd)
+Start-Sleep -Milliseconds 1000
+$visibleWhileListening = [OverlayExercise]::IsWindowVisible($hwnd)
+Set-RightControl $false
+Start-Sleep -Milliseconds 250
+$visibleWhileOptimizing = [OverlayExercise]::IsWindowVisible($hwnd)
+Start-Sleep -Milliseconds 2500
+$hiddenAfterOptimizing = -not [OverlayExercise]::IsWindowVisible($hwnd)
+$foregroundAfterHold = [OverlayExercise]::GetForegroundWindow()
+
 Send-OverlayHotkey
-$visibleAfterFirstHotkey = [OverlayExercise]::IsWindowVisible($hwnd)
+Start-Sleep -Milliseconds 1100
+$visibleAfterHotkeyStart = [OverlayExercise]::IsWindowVisible($hwnd)
 Send-OverlayHotkey
-$visibleAfterSecondHotkey = [OverlayExercise]::IsWindowVisible($hwnd)
+$visibleAfterHotkeyFinish = [OverlayExercise]::IsWindowVisible($hwnd)
+Start-Sleep -Milliseconds 2500
+$hiddenAfterHotkeyOptimizing = -not [OverlayExercise]::IsWindowVisible($hwnd)
 $foregroundAfterHotkeys = [OverlayExercise]::GetForegroundWindow()
 
-if (-not $visibleAfterSecondHotkey) {
-    Send-OverlayHotkey
-}
-
-$rect = New-Object OverlayExercise+RECT
-$cursor = New-Object OverlayExercise+POINT
-[void][OverlayExercise]::GetWindowRect($hwnd, [ref]$rect)
-[void][OverlayExercise]::GetCursorPos([ref]$cursor)
-[void][OverlayExercise]::SetCursorPos($rect.Right - 58, [int](($rect.Top + $rect.Bottom) / 2))
-[OverlayExercise]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
-[OverlayExercise]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
-Start-Sleep -Milliseconds 400
-$visibleAfterStopClick = [OverlayExercise]::IsWindowVisible($hwnd)
-$foregroundAfterStopClick = [OverlayExercise]::GetForegroundWindow()
-[void][OverlayExercise]::SetCursorPos($cursor.X, $cursor.Y)
-
-if (-not $visibleAfterStopClick) {
-    Send-OverlayHotkey
-}
+Send-OverlayHotkey
+Start-Sleep -Milliseconds 1100
 
 $result = [ordered]@{
     windowHandle = $hwnd.ToInt64()
     initiallyVisible = $initiallyVisible
-    visibleAfterFirstHotkey = $visibleAfterFirstHotkey
-    visibleAfterSecondHotkey = $visibleAfterSecondHotkey
-    hotkeyToggledTwice = $initiallyVisible -eq $visibleAfterSecondHotkey -and $initiallyVisible -ne $visibleAfterFirstHotkey
-    visibleAfterStopClick = $visibleAfterStopClick
-    stopClickHidWindow = -not $visibleAfterStopClick
+    shortPressStayedHidden = -not $visibleBeforeHoldThreshold
+    longHoldActivated = $visibleAfterHoldThreshold
+    visibleWhileListening = $visibleWhileListening
+    visibleWhileOptimizing = $visibleWhileOptimizing
+    hiddenAfterOptimizing = $hiddenAfterOptimizing
+    hotkeyStarted = $visibleAfterHotkeyStart
+    hotkeyShowedOptimizing = $visibleAfterHotkeyFinish
+    hiddenAfterHotkeyOptimizing = $hiddenAfterHotkeyOptimizing
     foregroundBefore = $foregroundBefore.ToInt64()
+    foregroundAfterHold = $foregroundAfterHold.ToInt64()
     foregroundAfterHotkeys = $foregroundAfterHotkeys.ToInt64()
-    foregroundAfterStopClick = $foregroundAfterStopClick.ToInt64()
+    holdPreservedFocus = $foregroundBefore -eq $foregroundAfterHold
     hotkeysPreservedFocus = $foregroundBefore -eq $foregroundAfterHotkeys
-    stopClickPreservedFocus = $foregroundBefore -eq $foregroundAfterStopClick
 }
 
 $outputDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path

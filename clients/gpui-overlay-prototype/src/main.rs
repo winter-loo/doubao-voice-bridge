@@ -3,26 +3,72 @@
     windows_subsystem = "windows"
 )]
 
-use std::time::Duration;
-
-use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, Context, PathBuilder, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill, point,
-    prelude::*, px, rgb, size,
+use std::{
+    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    time::Duration,
 };
 
-const OVERLAY_WIDTH: f32 = 432.0;
-const OVERLAY_HEIGHT: f32 = 92.0;
-const BOTTOM_MARGIN: f32 = 56.0;
-const WAVEFORM_WIDTH: f32 = 88.0;
-const WAVEFORM_HEIGHT: f32 = 40.0;
-const BAR_WIDTH: f32 = 3.0;
-const BAR_GAP: f32 = 4.0;
-const BAR_COUNT: usize = 11;
+use gpui::{
+    Animation, AnimationExt as _, App, Application, Bounds, Context, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill, point,
+    prelude::*, px, rgb, rgba, size,
+};
+
+const OVERLAY_WIDTH: f32 = 420.0;
+const OVERLAY_HEIGHT: f32 = 78.0;
+const BOTTOM_MARGIN: f32 = 38.0;
+const WAVEFORM_WIDTH: f32 = 238.0;
+const WAVEFORM_HEIGHT: f32 = 44.0;
+const BAR_WIDTH: f32 = 4.0;
+const BAR_GAP: f32 = 5.0;
+const BAR_COUNT: usize = 20;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum OverlayPhase {
+    Hidden,
+    Hint,
+    Listening,
+    Optimizing,
+}
+
+static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
+static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn overlay_phase() -> OverlayPhase {
+    match OVERLAY_PHASE.load(Ordering::Acquire) {
+        1 => OverlayPhase::Hint,
+        2 => OverlayPhase::Listening,
+        3 => OverlayPhase::Optimizing,
+        _ => OverlayPhase::Hidden,
+    }
+}
+
+fn set_overlay_phase(phase: OverlayPhase) {
+    OVERLAY_PHASE.store(phase as u8, Ordering::Release);
+}
+
+fn next_overlay_generation() -> u64 {
+    OVERLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+fn overlay_generation() -> u64 {
+    OVERLAY_GENERATION.load(Ordering::Acquire)
+}
+
+fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
+    let channel = |shift: u32| {
+        let from = ((start >> shift) & 0xffu32) as f32;
+        let to = ((end >> shift) & 0xffu32) as f32;
+        (from + (to - from) * t).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
 
 fn waveform_canvas(delta: f32) -> impl IntoElement {
     const AMPLITUDES: [f32; BAR_COUNT] = [
-        0.42, 0.62, 0.82, 0.68, 0.94, 0.76, 1.0, 0.72, 0.86, 0.58, 0.38,
+        0.24, 0.32, 0.44, 0.58, 0.42, 0.64, 0.88, 1.0, 0.78, 0.56, 0.92, 0.74, 0.58, 0.68, 0.49,
+        0.42, 0.35, 0.3, 0.25, 0.2,
     ];
 
     canvas(
@@ -34,11 +80,11 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
             let center_y = bounds.origin.y + bounds.size.height / 2.0;
 
             for (index, amplitude) in AMPLITUDES.iter().enumerate() {
-                let offset = index as f32 * 0.68;
+                let offset = index as f32 * 0.53;
                 let primary = ((phase + offset).sin() + 1.0) * 0.5;
                 let secondary = ((phase * 2.0 - offset * 0.8).sin() + 1.0) * 0.5;
-                let energy = 0.64 * primary + 0.36 * secondary;
-                let height = 7.0 + 25.0 * amplitude * (0.28 + 0.72 * energy);
+                let energy = 0.7 * primary + 0.3 * secondary;
+                let height = 7.0 + 36.0 * amplitude * (0.12 + 0.88 * energy);
                 let bar_bounds = Bounds::new(
                     point(
                         start_x + px(index as f32 * (BAR_WIDTH + BAR_GAP)),
@@ -47,8 +93,8 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
                     size(px(BAR_WIDTH), px(height)),
                 );
 
-                window
-                    .paint_quad(fill(bar_bounds, rgb(0x2f6bff)).corner_radii(px(BAR_WIDTH / 2.0)));
+                let color = lerp_rgb(0x43ded2, 0x648dff, index as f32 / (BAR_COUNT - 1) as f32);
+                window.paint_quad(fill(bar_bounds, rgb(color)).corner_radii(px(BAR_WIDTH / 2.0)));
             }
         },
     )
@@ -56,110 +102,98 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
     .h(px(WAVEFORM_HEIGHT))
 }
 
-fn microphone_icon() -> impl IntoElement {
+fn hint_bars(color: u32, reverse: bool) -> impl IntoElement {
     canvas(
         |_, _, _| {},
-        |bounds, _, window, _| {
-            let center_x = bounds.origin.x + bounds.size.width / 2.0;
+        move |bounds, _, window, _| {
+            let heights = [14.0, 12.0, 10.0, 8.0];
+            let bars_width = 4.0 * BAR_WIDTH + 3.0 * BAR_GAP;
+            let start_x = bounds.origin.x + (bounds.size.width - px(bars_width)) / 2.0;
             let center_y = bounds.origin.y + bounds.size.height / 2.0;
-            let blue = rgb(0x2f6bff);
-            let body = Bounds::new(
-                point(center_x - px(5.0), center_y - px(11.0)),
-                size(px(10.0), px(17.0)),
-            );
-            window.paint_quad(fill(body, blue).corner_radii(px(5.0)));
 
-            let mut outline = PathBuilder::stroke(px(2.0));
-            outline.move_to(point(center_x - px(8.0), center_y - px(1.0)));
-            outline.cubic_bezier_to(
-                point(center_x + px(8.0), center_y - px(1.0)),
-                point(center_x - px(8.0), center_y + px(8.0)),
-                point(center_x + px(8.0), center_y + px(8.0)),
-            );
-            outline.move_to(point(center_x, center_y + px(7.0)));
-            outline.line_to(point(center_x, center_y + px(11.0)));
-            outline.move_to(point(center_x - px(5.0), center_y + px(11.0)));
-            outline.line_to(point(center_x + px(5.0), center_y + px(11.0)));
-
-            if let Ok(path) = outline.build() {
-                window.paint_path(path, blue);
+            for index in 0..4 {
+                let height = heights[if reverse { 3 - index } else { index }];
+                let bar = Bounds::new(
+                    point(
+                        start_x + px(index as f32 * (BAR_WIDTH + BAR_GAP)),
+                        center_y - px(height / 2.0),
+                    ),
+                    size(px(BAR_WIDTH), px(height)),
+                );
+                window.paint_quad(fill(bar, rgb(color)).corner_radii(px(BAR_WIDTH / 2.0)));
             }
         },
     )
-    .size(px(24.0))
+    .w(px(54.0))
+    .h(px(22.0))
+}
+
+fn capsule_base() -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(rgba(0x111318f2))
+        .border_1()
+        .border_color(rgba(0xffffff24))
+        .shadow_lg()
+        .text_color(rgb(0xf7f8fb))
+}
+
+fn listening_capsule(delta: f32) -> impl IntoElement {
+    capsule_base()
+        .id("voice-capsule")
+        .w(px(390.0))
+        .h(px(58.0))
+        .cursor_pointer()
+        .on_click(|_, window, _| platform::finish_input(window))
+        .child(waveform_canvas(delta))
+}
+
+fn hint_capsule() -> impl IntoElement {
+    capsule_base()
+        .id("voice-capsule")
+        .gap_3()
+        .w(px(390.0))
+        .h(px(58.0))
+        .cursor_pointer()
+        .on_click(|_, window, _| platform::finish_input(window))
+        .child(hint_bars(0x43ded2, false))
+        .child(div().text_lg().child("单击 右 option 结束"))
+        .child(hint_bars(0x648dff, true))
+}
+
+fn optimizing_capsule() -> impl IntoElement {
+    capsule_base()
+        .id("voice-capsule")
+        .w(px(168.0))
+        .h(px(46.0))
+        .text_base()
+        .child("优化识别中")
 }
 
 struct VoiceOverlay;
 
 impl Render for VoiceOverlay {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let waveform = div()
-            .w(px(WAVEFORM_WIDTH))
-            .h(px(WAVEFORM_HEIGHT))
-            .with_animation(
-                "waveform",
-                Animation::new(Duration::from_millis(1_180)).repeat(),
-                |surface, delta| surface.child(waveform_canvas(delta)),
-            );
-
         div()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .child(
-                div()
-                    .id("voice-capsule")
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .w(px(404.0))
-                    .h(px(74.0))
-                    .px_5()
-                    .rounded_full()
-                    .bg(rgb(0xf8f9fc))
-                    .border_1()
-                    .border_color(rgb(0xdfe3ea))
-                    .shadow_lg()
-                    .text_color(rgb(0x20242c))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(40.0))
-                            .rounded_full()
-                            .bg(rgb(0xe9efff))
-                            .child(microphone_icon()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .w(px(132.0))
-                            .child(div().text_base().child("Listening"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x747b87))
-                                    .child("Remote audio"),
-                            ),
-                    )
-                    .child(waveform)
-                    .child(
-                        div()
-                            .id("stop")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(40.0))
-                            .rounded_full()
-                            .bg(rgb(0x17191e))
-                            .cursor_pointer()
-                            .on_click(|_, window, _| platform::hide_overlay(window))
-                            .child(div().size(px(12.0)).rounded_sm().bg(rgb(0xffffff))),
-                    ),
+            .with_animation(
+                "overlay-clock",
+                Animation::new(Duration::from_millis(1_120)).repeat(),
+                |root, delta| {
+                    let content = match overlay_phase() {
+                        OverlayPhase::Hidden => div().into_any_element(),
+                        OverlayPhase::Hint => hint_capsule().into_any_element(),
+                        OverlayPhase::Listening => listening_capsule(delta).into_any_element(),
+                        OverlayPhase::Optimizing => optimizing_capsule().into_any_element(),
+                    };
+                    root.child(content)
+                },
             )
     }
 }
@@ -207,12 +241,16 @@ fn main() {
 mod platform {
     use std::ffi::c_void;
     use std::thread;
+    use std::time::{Duration, Instant};
 
+    use super::{
+        OverlayPhase, next_overlay_generation, overlay_generation, overlay_phase, set_overlay_phase,
+    };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_SPACE,
+        GetAsyncKeyState, MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_RCONTROL, VK_SPACE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, MSG,
@@ -222,6 +260,9 @@ mod platform {
     };
 
     const HOTKEY_ID: i32 = 0xDB01;
+    const HOLD_THRESHOLD: Duration = Duration::from_millis(420);
+    const HINT_DURATION: Duration = Duration::from_millis(900);
+    const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
 
     pub fn configure_overlay(window: &Window) {
         let hwnd = hwnd(window);
@@ -247,13 +288,70 @@ mod platform {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
+        hide_overlay(hwnd);
         start_hotkey_thread(hwnd.0 as isize);
+        start_hold_key_thread(hwnd.0 as isize);
     }
 
-    pub fn hide_overlay(window: &Window) {
+    pub fn finish_input(window: &Window) {
+        finish_input_hwnd(hwnd(window));
+    }
+
+    fn show_phase(hwnd: HWND, phase: OverlayPhase) {
+        set_overlay_phase(phase);
         unsafe {
-            let _ = ShowWindow(hwnd(window), SW_HIDE);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
+    }
+
+    fn hide_overlay(hwnd: HWND) {
+        set_overlay_phase(OverlayPhase::Hidden);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
+    fn begin_input(hwnd: HWND) {
+        let generation = next_overlay_generation();
+        show_phase(hwnd, OverlayPhase::Hint);
+        let hwnd_value = hwnd.0 as isize;
+        thread::spawn(move || {
+            thread::sleep(HINT_DURATION);
+            if overlay_generation() == generation && overlay_phase() == OverlayPhase::Hint {
+                let hwnd = HWND(hwnd_value as *mut c_void);
+                show_phase(hwnd, OverlayPhase::Listening);
+            }
+        });
+    }
+
+    fn finish_input_hwnd(hwnd: HWND) {
+        match overlay_phase() {
+            OverlayPhase::Hidden => return,
+            OverlayPhase::Optimizing => {
+                hide_overlay(hwnd);
+                return;
+            }
+            OverlayPhase::Hint | OverlayPhase::Listening => {}
+        }
+
+        let generation = overlay_generation();
+        show_phase(hwnd, OverlayPhase::Optimizing);
+        let hwnd_value = hwnd.0 as isize;
+        thread::spawn(move || {
+            thread::sleep(OPTIMIZING_DURATION);
+            if overlay_generation() == generation && overlay_phase() == OverlayPhase::Optimizing {
+                hide_overlay(HWND(hwnd_value as *mut c_void));
+            }
+        });
     }
 
     fn hwnd(window: &Window) -> HWND {
@@ -279,20 +377,38 @@ mod platform {
                     && message.lParam != LPARAM(0)
                 {
                     if IsWindowVisible(hwnd).as_bool() {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        finish_input_hwnd(hwnd);
                     } else {
-                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                        let _ = SetWindowPos(
-                            hwnd,
-                            Some(HWND_TOPMOST),
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
+                        begin_input(hwnd);
                     }
                 }
+            }
+        });
+    }
+
+    fn start_hold_key_thread(hwnd_value: isize) {
+        thread::spawn(move || {
+            let hwnd = HWND(hwnd_value as *mut c_void);
+            let mut pressed_at = None;
+            let mut activated = false;
+
+            loop {
+                let is_down = unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0 };
+
+                if is_down {
+                    let started = pressed_at.get_or_insert_with(Instant::now);
+                    if !activated && started.elapsed() >= HOLD_THRESHOLD {
+                        activated = true;
+                        begin_input(hwnd);
+                    }
+                } else if pressed_at.take().is_some() {
+                    if activated {
+                        finish_input_hwnd(hwnd);
+                    }
+                    activated = false;
+                }
+
+                thread::sleep(Duration::from_millis(16));
             }
         });
     }
@@ -302,9 +418,13 @@ mod platform {
 mod platform {
     use gpui::Window;
 
-    pub fn configure_overlay(_window: &Window) {}
+    use super::{OverlayPhase, set_overlay_phase};
 
-    pub fn hide_overlay(window: &Window) {
+    pub fn configure_overlay(_window: &Window) {
+        set_overlay_phase(OverlayPhase::Listening);
+    }
+
+    pub fn finish_input(window: &Window) {
         window.remove_window();
     }
 }
