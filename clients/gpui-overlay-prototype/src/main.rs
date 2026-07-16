@@ -14,13 +14,13 @@ use gpui::{
     prelude::*, px, rgb, rgba, size,
 };
 
-const OVERLAY_WIDTH: f32 = 420.0;
-const OVERLAY_HEIGHT: f32 = 78.0;
-const BOTTOM_MARGIN: f32 = 38.0;
-const WAVEFORM_WIDTH: f32 = 238.0;
-const WAVEFORM_HEIGHT: f32 = 44.0;
-const BAR_WIDTH: f32 = 4.0;
-const BAR_GAP: f32 = 5.0;
+const OVERLAY_WIDTH: f32 = 266.0;
+const OVERLAY_HEIGHT: f32 = 48.0;
+const BOTTOM_MARGIN: f32 = 30.0;
+const WAVEFORM_WIDTH: f32 = 88.0;
+const WAVEFORM_HEIGHT: f32 = 22.0;
+const BAR_WIDTH: f32 = 2.0;
+const BAR_GAP: f32 = 2.0;
 const BAR_COUNT: usize = 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,7 +84,7 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
                 let primary = ((phase + offset).sin() + 1.0) * 0.5;
                 let secondary = ((phase * 2.0 - offset * 0.8).sin() + 1.0) * 0.5;
                 let energy = 0.7 * primary + 0.3 * secondary;
-                let height = 7.0 + 36.0 * amplitude * (0.12 + 0.88 * energy);
+                let height = 4.0 + 18.0 * amplitude * (0.12 + 0.88 * energy);
                 let bar_bounds = Bounds::new(
                     point(
                         start_x + px(index as f32 * (BAR_WIDTH + BAR_GAP)),
@@ -106,7 +106,7 @@ fn hint_bars(color: u32, reverse: bool) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            let heights = [14.0, 12.0, 10.0, 8.0];
+            let heights = [9.0, 8.0, 7.0, 5.0];
             let bars_width = 4.0 * BAR_WIDTH + 3.0 * BAR_GAP;
             let start_x = bounds.origin.x + (bounds.size.width - px(bars_width)) / 2.0;
             let center_y = bounds.origin.y + bounds.size.height / 2.0;
@@ -124,8 +124,8 @@ fn hint_bars(color: u32, reverse: bool) -> impl IntoElement {
             }
         },
     )
-    .w(px(54.0))
-    .h(px(22.0))
+    .w(px(32.0))
+    .h(px(16.0))
 }
 
 fn capsule_base() -> gpui::Div {
@@ -144,8 +144,8 @@ fn capsule_base() -> gpui::Div {
 fn listening_capsule(delta: f32) -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
-        .w(px(390.0))
-        .h(px(58.0))
+        .w(px(188.0))
+        .h(px(34.0))
         .cursor_pointer()
         .on_click(|_, window, _| platform::finish_input(window))
         .child(waveform_canvas(delta))
@@ -154,22 +154,22 @@ fn listening_capsule(delta: f32) -> impl IntoElement {
 fn hint_capsule() -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
-        .gap_3()
-        .w(px(390.0))
-        .h(px(58.0))
+        .gap_2()
+        .w(px(250.0))
+        .h(px(34.0))
         .cursor_pointer()
         .on_click(|_, window, _| platform::finish_input(window))
         .child(hint_bars(0x43ded2, false))
-        .child(div().text_lg().child("单击 右 option 结束"))
+        .child(div().text_sm().child("单击 右 option 结束"))
         .child(hint_bars(0x648dff, true))
 }
 
 fn optimizing_capsule() -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
-        .w(px(168.0))
-        .h(px(46.0))
-        .text_base()
+        .w(px(108.0))
+        .h(px(30.0))
+        .text_sm()
         .child("优化识别中")
 }
 
