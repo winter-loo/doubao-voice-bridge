@@ -24,6 +24,11 @@ is the exact 20-bar waveform width plus 30 logical px of total horizontal paddin
 with smaller text, so ending a recording does not resize the capsule. Windows
 display scaling can make these appear larger in screenshots.
 
+The shell uses a translucent Oklab gradient on a transparent Windows host. A
+single GPUI Canvas adds a moving specular band, top lens highlight, cyan-blue
+lower reflection, and soft waveform glow to approximate a compact Liquid Glass
+control without exposing the rectangular Acrylic surface around a tiny window.
+
 On Windows, hold right `Ctrl` for 420 ms to activate and release it to finish.
 `Ctrl+Alt+Space` starts or finishes a session for remote testing, and clicking the
 capsule also finishes. The previously focused application should retain keyboard
