@@ -50,13 +50,20 @@ public static class OverlayExercise {
 
 function Find-ProcessWindow([uint32]$ProcessId) {
     $script:foundWindow = [IntPtr]::Zero
+    $script:foundWindowArea = 0
     $callback = [OverlayExercise+EnumWindowsProc]{
         param([IntPtr]$hwnd, [IntPtr]$parameter)
         $windowProcessId = 0
         [void][OverlayExercise]::GetWindowThreadProcessId($hwnd, [ref]$windowProcessId)
         if ($windowProcessId -eq $ProcessId) {
-            $script:foundWindow = $hwnd
-            return $false
+            $rect = New-Object OverlayExercise+RECT
+            if ([OverlayExercise]::GetWindowRect($hwnd, [ref]$rect)) {
+                $area = ($rect.Right - $rect.Left) * ($rect.Bottom - $rect.Top)
+                if ($area -gt $script:foundWindowArea) {
+                    $script:foundWindow = $hwnd
+                    $script:foundWindowArea = $area
+                }
+            }
         }
         return $true
     }

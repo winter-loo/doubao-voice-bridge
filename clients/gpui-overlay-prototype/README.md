@@ -24,14 +24,13 @@ is the exact 20-bar waveform width plus 30 logical px of total horizontal paddin
 with smaller text, so ending a recording does not resize the capsule. Windows
 display scaling can make these appear larger in screenshots.
 
-The Windows shell captures the desktop directly beneath the capsule while the
-overlay is hidden, softly blurs and brightens it, and stretches a slightly
-smaller sample into the capsule to create a subtle refraction cue. A transparent
-Oklab tint and GPUI Canvas add the moving specular band, edge caustics, lower
-reflection, and waveform glow. The rim switches between a bright and a muted
-blue-gray treatment based on sampled backdrop luminance. If backdrop capture
-fails, the control falls back to clear white glass rather than an opaque dark
-shell.
+The Windows shell places a rounded native backdrop window below the transparent
+GPUI overlay. DWM maintains a live thumbnail relationship with the window beneath
+the capsule, so scrolling, animation, and color changes continue to update while
+the voice UI is visible. Switching applications rebinds the thumbnail instead of
+retaining captured pixels. A slightly smaller source rectangle is stretched into
+the capsule for a refraction cue; the GPUI canvas adds the translucent tint,
+moving specular band, edge caustics, lower reflection, and waveform glow.
 
 On Windows, hold right `Ctrl` for 420 ms to activate and release it to finish.
 `Ctrl+Alt+Space` starts or finishes a session for remote testing, and clicking the

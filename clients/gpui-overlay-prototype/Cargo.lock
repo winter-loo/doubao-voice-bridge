@@ -1718,7 +1718,6 @@ name = "gpui-overlay-prototype"
 version = "0.1.0"
 dependencies = [
  "gpui",
- "image",
  "raw-window-handle",
  "windows",
 ]
