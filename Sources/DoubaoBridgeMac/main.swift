@@ -9,7 +9,7 @@ struct Config {
     var port: UInt16 = 4387
     var udpPort: UInt16 = 5004
     var audioTransport = "udp"
-    var audioDeviceIndex: Int = 4
+    var audioDeviceIndex: Int = 3
     var ffmpegPath = "ffmpeg"
     var token: String?
     var voiceShortcut = "cmd+shift+d"
@@ -110,7 +110,7 @@ func printUsage() {
       --port <port>                  TCP control port. Default: 4387
       --udp-port <port>              UDP raw PCM audio port. Default: 5004
       --audio-transport <udp|tcp>    Raw PCM push transport. Default: udp
-      --audio-device-index <index>   AudioToolbox output index for the virtual device. Default: 4
+      --audio-device-index <index>   AudioToolbox output index for the virtual device. Default: 3
       --ffmpeg <path>                ffmpeg executable. Default: ffmpeg from PATH
       --token <token>                Optional TCP auth token
       --voice-shortcut <shortcut>    Doubao voice shortcut. Default: cmd+shift+d
@@ -1802,6 +1802,12 @@ do {
 
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
+    if !AXIsProcessTrusted() {
+        let options = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
 
     let captureWindow = TextCaptureWindow(showWindow: config.showWindow)
     let controller = DoubaoController(inputSourceID: config.inputSourceID, hotKey: hotKey)

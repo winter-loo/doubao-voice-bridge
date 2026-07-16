@@ -436,7 +436,10 @@ def paste_text(text):
         return
 
     if system == "windows":
-        ps_set = "Set-Clipboard -Value ([Console]::In.ReadToEnd())"
+        ps_set = (
+            "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); "
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())"
+        )
         subprocess.run(["powershell", "-NoProfile", "-Command", ps_set], input=text.encode("utf-8"), check=True)
         ps_paste = (
             "Add-Type -AssemblyName System.Windows.Forms; "
@@ -469,9 +472,13 @@ def command_record(args):
             if client.activation_failed:
                 raise RuntimeError("Doubao voice activation failed")
         if args.seconds is None:
-            print("[recording] Press Ctrl+C to stop.", file=sys.stderr)
-            while True:
-                time.sleep(1)
+            if args.stdin_stop:
+                print("[recording] Waiting for stdin stop signal.", file=sys.stderr)
+                sys.stdin.readline()
+            else:
+                print("[recording] Press Ctrl+C to stop.", file=sys.stderr)
+                while True:
+                    time.sleep(1)
         else:
             time.sleep(args.seconds)
     except KeyboardInterrupt:
@@ -543,6 +550,7 @@ def build_parser():
     record.add_argument("--recording-timeout", type=float, default=8.0)
     record.add_argument("--release-before-stop-microphone", action="store_true")
     record.add_argument("--python-tcp-audio", action="store_true", help="Experimental: proxy TCP audio through Python instead of ffmpeg direct TCP")
+    record.add_argument("--stdin-stop", action="store_true", help="Stop when stdin receives a line or closes")
     record.add_argument("--paste", action="store_true", help="Paste final recognized text into active app")
     record.set_defaults(func=command_record)
 

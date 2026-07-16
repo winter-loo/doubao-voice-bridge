@@ -30,7 +30,7 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac --list-audio-devices
 
 On the current Mac:
 
-- Soundflower AudioToolbox output index: `4`
+- Soundflower AudioToolbox output index: `3` (FFmpeg 8.0.1)
 - Doubao input source: `com.bytedance.inputmethod.doubaoime.pinyin`
 - Doubao app bundle: `com.bytedance.inputmethod.doubaoime`
 
@@ -54,7 +54,7 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
   --port 4387 \
   --udp-port 5004 \
   --audio-transport tcp \
-  --audio-device-index 4 \
+  --audio-device-index 3 \
   --remote-input-device "Soundflower (2ch)" \
   --voice-shortcut fn \
   --voice-shortcut-mode hold \
