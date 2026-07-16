@@ -4,7 +4,7 @@
 )]
 
 use std::{
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -35,6 +35,7 @@ enum OverlayPhase {
 
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
 
 fn overlay_phase() -> OverlayPhase {
     match OVERLAY_PHASE.load(Ordering::Acquire) {
@@ -54,6 +55,14 @@ fn next_overlay_generation() -> u64 {
 
 fn overlay_generation() -> u64 {
     OVERLAY_GENERATION.load(Ordering::Acquire)
+}
+
+fn dark_background() -> bool {
+    DARK_BACKGROUND.load(Ordering::Acquire)
+}
+
+fn set_dark_background(dark: bool) {
+    DARK_BACKGROUND.store(dark, Ordering::Release);
 }
 
 fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
@@ -76,13 +85,19 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
         move |bounds, _, window, _| {
             let phase = delta * std::f32::consts::TAU;
             let radius = bounds.size.height / 2.0;
+            let dark = dark_background();
+            let (glass_top, glass_bottom) = if dark {
+                (rgba(0x5f7f966e), rgba(0x07121f9c))
+            } else {
+                (rgba(0xffffff38), rgba(0xd8efff1c))
+            };
             window.paint_quad(
                 fill(
                     bounds,
                     linear_gradient(
                         180.0,
-                        linear_color_stop(rgba(0xffffff47), 0.0),
-                        linear_color_stop(rgba(0xc8ebff24), 1.0),
+                        linear_color_stop(glass_top, 0.0),
+                        linear_color_stop(glass_bottom, 1.0),
                     )
                     .color_space(ColorSpace::Oklab),
                 )
@@ -90,15 +105,22 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
             );
 
             let top_lens = Bounds::new(
-                bounds.origin + point(px(2.0), px(1.0)),
-                size(bounds.size.width - px(4.0), px(9.0)),
+                bounds.origin + point(px(4.0), px(1.0)),
+                size(bounds.size.width - px(8.0), px(10.0)),
             );
             window.paint_quad(
                 fill(
                     top_lens,
                     linear_gradient(
                         180.0,
-                        linear_color_stop(rgba(0xffffff8f), 0.0),
+                        linear_color_stop(
+                            if dark {
+                                rgba(0xffffffec)
+                            } else {
+                                rgba(0xffffffb8)
+                            },
+                            0.0,
+                        ),
                         linear_color_stop(rgba(0xffffff00), 1.0),
                     )
                     .color_space(ColorSpace::Oklab),
@@ -116,32 +138,56 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     linear_gradient(
                         180.0,
                         linear_color_stop(rgba(0xffffff00), 0.0),
-                        linear_color_stop(rgba(0xbdeeff36), 1.0),
+                        linear_color_stop(
+                            if dark {
+                                rgba(0xa7dcff68)
+                            } else {
+                                rgba(0xffffff4c)
+                            },
+                            1.0,
+                        ),
                     )
                     .color_space(ColorSpace::Oklab),
                 )
                 .corner_radii(radius),
             );
 
-            let sheen_progress = 0.5 + 0.5 * (phase * 0.42).sin();
-            let sheen_x = bounds.origin.x + px(12.0 + 78.0 * sheen_progress);
-            for (offset, alpha) in [(-3.0, 0x0a), (0.0, 0x32), (3.0, 0x0d)] {
-                let sheen = Bounds::new(
-                    point(sheen_x + px(offset), bounds.origin.y + px(3.0)),
-                    size(px(2.0), bounds.size.height - px(6.0)),
-                );
-                window.paint_quad(
-                    fill(
-                        sheen,
-                        linear_gradient(
-                            160.0,
-                            linear_color_stop(rgba(0xffffff00 | alpha), 0.0),
-                            linear_color_stop(rgba(0xbdeeff00 | alpha), 1.0),
-                        ),
+            let left_refraction = Bounds::new(
+                bounds.origin + point(px(1.0), px(4.0)),
+                size(px(8.0), bounds.size.height - px(8.0)),
+            );
+            window.paint_quad(
+                fill(
+                    left_refraction,
+                    linear_gradient(
+                        90.0,
+                        linear_color_stop(rgba(0x8ee9ff42), 0.0),
+                        linear_color_stop(rgba(0xffffff00), 1.0),
                     )
-                    .corner_radii(px(1.0)),
-                );
-            }
+                    .color_space(ColorSpace::Oklab),
+                )
+                .corner_radii(radius),
+            );
+
+            let right_refraction = Bounds::new(
+                point(
+                    bounds.origin.x + bounds.size.width - px(9.0),
+                    bounds.origin.y + px(4.0),
+                ),
+                size(px(8.0), bounds.size.height - px(8.0)),
+            );
+            window.paint_quad(
+                fill(
+                    right_refraction,
+                    linear_gradient(
+                        270.0,
+                        linear_color_stop(rgba(0xffc8f12e), 0.0),
+                        linear_color_stop(rgba(0xffffff00), 1.0),
+                    )
+                    .color_space(ColorSpace::Oklab),
+                )
+                .corner_radii(radius),
+            );
 
             let upper_rim = Bounds::new(
                 bounds.origin + point(px(13.0), px(1.0)),
@@ -152,8 +198,8 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     upper_rim,
                     linear_gradient(
                         90.0,
-                        linear_color_stop(rgba(0xffffff38), 0.0),
-                        linear_color_stop(rgba(0xffffffd6), 0.5),
+                        linear_color_stop(rgba(0xffffff22), 0.0),
+                        linear_color_stop(rgba(0xffffffea), 0.5),
                     ),
                 )
                 .corner_radii(px(0.5)),
@@ -168,8 +214,8 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     lower_rim,
                     linear_gradient(
                         90.0,
-                        linear_color_stop(rgba(0xffffff24), 0.0),
-                        linear_color_stop(rgba(0x9fdaff70), 1.0),
+                        linear_color_stop(rgba(0xaeeaff18), 0.0),
+                        linear_color_stop(rgba(0xffffff78), 0.55),
                     ),
                 )
                 .corner_radii(px(0.5)),
@@ -183,7 +229,7 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     point(x, bounds.origin.y + px(6.0)),
                     size(px(1.0), bounds.size.height - px(12.0)),
                 );
-                window.paint_quad(fill(edge_caustic, rgba(0xffffff8a)).corner_radii(px(0.5)));
+                window.paint_quad(fill(edge_caustic, rgba(0xffffff62)).corner_radii(px(0.5)));
             }
 
             if !show_waveform {
@@ -213,7 +259,7 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     bar_bounds.size + size(px(2.0), px(2.0)),
                 );
                 window.paint_quad(
-                    fill(glow_bounds, rgba((color << 8) | 0x2e)).corner_radii(px(BAR_WIDTH)),
+                    fill(glow_bounds, rgba((color << 8) | 0x24)).corner_radii(px(BAR_WIDTH)),
                 );
                 window.paint_quad(fill(bar_bounds, rgb(color)).corner_radii(px(BAR_WIDTH / 2.0)));
             }
@@ -224,6 +270,7 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
 }
 
 fn capsule_base() -> gpui::Div {
+    let dark = dark_background();
     div()
         .relative()
         .flex()
@@ -231,16 +278,22 @@ fn capsule_base() -> gpui::Div {
         .justify_center()
         .rounded_full()
         .overflow_hidden()
-        .bg(linear_gradient(
-            180.0,
-            linear_color_stop(rgba(0xffffff52), 0.0),
-            linear_color_stop(rgba(0xffffff3d), 1.0),
-        )
-        .color_space(ColorSpace::Oklab))
+        .bg(if dark {
+            rgba(0x06101b38)
+        } else {
+            rgba(0xffffff0c)
+        })
         .border_1()
-        .border_color(rgba(0xffffff9c))
-        .shadow_lg()
-        .text_color(rgba(0x07131ff5))
+        .border_color(if dark {
+            rgba(0xffffffe0)
+        } else {
+            rgba(0xaec8d55a)
+        })
+        .text_color(if dark {
+            rgba(0xffffffff)
+        } else {
+            rgba(0x07131ff5)
+        })
 }
 
 fn listening_capsule(delta: f32) -> impl IntoElement {
@@ -341,20 +394,21 @@ mod platform {
 
     use super::{
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
-        OverlayPhase, next_overlay_generation, overlay_generation, overlay_phase,
-        set_overlay_phase,
+        OverlayPhase, dark_background, next_overlay_generation, overlay_generation, overlay_phase,
+        set_dark_background, set_overlay_phase,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::Graphics::Dwm::{
         DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
-        DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DwmRegisterThumbnail,
+        DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
+        DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DwmRegisterThumbnail, DwmSetWindowAttribute,
         DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
     };
     use windows::Win32::Graphics::Gdi::{
-        CreateRoundRectRgn, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-        MonitorFromWindow, SetWindowRgn,
+        CreateRoundRectRgn, GetDC, GetMonitorInfoW, GetPixel, MONITOR_DEFAULTTOPRIMARY,
+        MONITORINFO, MonitorFromWindow, ReleaseDC, SetWindowRgn,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_RCONTROL, VK_SPACE,
@@ -372,6 +426,13 @@ mod platform {
     const HOTKEY_ID: i32 = 0xDB01;
     const HOLD_THRESHOLD: Duration = Duration::from_millis(420);
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
+    const BACKDROP_SAMPLES: [(i32, i32, u8); 5] = [
+        (0, 0, 255),
+        (-2, 0, 18),
+        (2, 0, 18),
+        (0, -1, 14),
+        (0, 1, 14),
+    ];
     static BACKDROP_HWND: AtomicIsize = AtomicIsize::new(0);
 
     pub fn configure_overlay(window: &Window) {
@@ -399,6 +460,8 @@ mod platform {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
+        suppress_native_frame(hwnd);
+        clip_overlay_to_capsule(hwnd);
         let backdrop = create_backdrop_window(hwnd);
         BACKDROP_HWND.store(backdrop.0 as isize, Ordering::Release);
         hide_overlay(hwnd);
@@ -431,6 +494,52 @@ mod platform {
             let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
             let _ = SetWindowRgn(backdrop, Some(region), false);
             backdrop
+        }
+    }
+
+    fn suppress_native_frame(hwnd: HWND) {
+        unsafe {
+            let border_color = DWMWA_COLOR_NONE;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &border_color as *const _ as *const c_void,
+                std::mem::size_of_val(&border_color) as u32,
+            );
+
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY,
+                &DWMNCRP_DISABLED as *const _ as *const c_void,
+                std::mem::size_of_val(&DWMNCRP_DISABLED) as u32,
+            );
+        }
+    }
+
+    fn clip_overlay_to_capsule(hwnd: HWND) {
+        unsafe {
+            let mut window = RECT::default();
+            if GetWindowRect(hwnd, &mut window).is_err() {
+                return;
+            }
+
+            let window_width = window.right - window.left;
+            let window_height = window.bottom - window.top;
+            let scale_x = window_width as f32 / OVERLAY_WIDTH;
+            let scale_y = window_height as f32 / OVERLAY_HEIGHT;
+            let width = (LISTENING_CAPSULE_WIDTH * scale_x).round() as i32;
+            let height = (LISTENING_CAPSULE_HEIGHT * scale_y).round() as i32;
+            let left = (window_width - width) / 2;
+            let top = (window_height - height) / 2;
+            let region = CreateRoundRectRgn(
+                left,
+                top,
+                left + width + 1,
+                top + height + 1,
+                height,
+                height,
+            );
+            let _ = SetWindowRgn(hwnd, Some(region), true);
         }
     }
 
@@ -490,7 +599,54 @@ mod platform {
 
     fn begin_input(hwnd: HWND) {
         next_overlay_generation();
+        set_dark_background(sample_dark_background(hwnd));
         show_phase(hwnd, OverlayPhase::Listening);
+    }
+
+    fn sample_dark_background(hwnd: HWND) -> bool {
+        let Some(capsule) = capsule_screen_rect(hwnd) else {
+            return false;
+        };
+
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return false;
+            }
+
+            let width = capsule.right - capsule.left;
+            let height = capsule.bottom - capsule.top;
+            let mut luminance_sum = 0u32;
+            let mut dark_samples = 0u32;
+            let mut valid_samples = 0u32;
+
+            for x_step in 1..=7 {
+                for y_step in 1..=3 {
+                    let x = capsule.left + width * x_step / 8;
+                    let y = capsule.top + height * y_step / 4;
+                    let color = GetPixel(screen, x, y).0;
+                    if color == u32::MAX {
+                        continue;
+                    }
+
+                    let red = color & 0xff;
+                    let green = (color >> 8) & 0xff;
+                    let blue = (color >> 16) & 0xff;
+                    let luminance = (red * 54 + green * 183 + blue * 19) / 256;
+                    luminance_sum += luminance;
+                    dark_samples += u32::from(luminance < 148);
+                    valid_samples += 1;
+                }
+            }
+
+            let _ = ReleaseDC(None, screen);
+            if valid_samples == 0 {
+                return false;
+            }
+
+            let average_luminance = luminance_sum / valid_samples;
+            average_luminance < 150 || dark_samples * 2 >= valid_samples
+        }
     }
 
     fn capsule_screen_rect(hwnd: HWND) -> Option<RECT> {
@@ -553,26 +709,27 @@ mod platform {
             let overlay = HWND(overlay_value as *mut c_void);
             let backdrop = HWND(backdrop_value as *mut c_void);
             let mut source = HWND::default();
-            let mut thumbnail = None;
+            let mut thumbnails: Option<Vec<isize>> = None;
 
             loop {
                 if IsWindowVisible(overlay).as_bool() {
                     let window_below = window_beneath_capsule(overlay, backdrop);
-                    let binding_is_current = thumbnail
-                        .is_some_and(|handle| update_live_backdrop(handle, backdrop, source));
+                    let binding_is_current = thumbnails
+                        .as_ref()
+                        .is_some_and(|handles| update_live_backdrop(handles, backdrop, source));
                     if window_below != source || !binding_is_current {
                         hide_backdrop(backdrop);
-                        if let Some(handle) = thumbnail.take() {
-                            let _ = DwmUnregisterThumbnail(handle);
+                        if let Some(handles) = thumbnails.take() {
+                            unregister_live_backdrop(handles);
                         }
-                        thumbnail = register_live_backdrop(backdrop, window_below);
-                        source = if thumbnail.is_some() {
+                        thumbnails = register_live_backdrop(backdrop, window_below);
+                        source = if thumbnails.is_some() {
                             window_below
                         } else {
                             HWND::default()
                         };
                     }
-                    if thumbnail.is_some() && !IsWindowVisible(backdrop).as_bool() {
+                    if thumbnails.is_some() && !IsWindowVisible(backdrop).as_bool() {
                         show_backdrop_below_overlay(backdrop, overlay);
                     }
                 } else if IsWindowVisible(backdrop).as_bool() {
@@ -614,23 +771,43 @@ mod platform {
         }
     }
 
-    fn register_live_backdrop(backdrop: HWND, source: HWND) -> Option<isize> {
+    fn register_live_backdrop(backdrop: HWND, source: HWND) -> Option<Vec<isize>> {
         unsafe {
             if source.is_invalid() {
                 return None;
             }
 
-            let thumbnail = DwmRegisterThumbnail(backdrop, source).ok()?;
-            if !update_live_backdrop(thumbnail, backdrop, source) {
-                let _ = DwmUnregisterThumbnail(thumbnail);
+            let mut thumbnails = Vec::with_capacity(BACKDROP_SAMPLES.len());
+            for _ in BACKDROP_SAMPLES {
+                let Ok(thumbnail) = DwmRegisterThumbnail(backdrop, source) else {
+                    unregister_live_backdrop(thumbnails);
+                    return None;
+                };
+                thumbnails.push(thumbnail);
+            }
+
+            if !update_live_backdrop(&thumbnails, backdrop, source) {
+                unregister_live_backdrop(thumbnails);
                 return None;
             }
-            Some(thumbnail)
+            Some(thumbnails)
         }
     }
 
-    fn update_live_backdrop(thumbnail: isize, backdrop: HWND, source: HWND) -> bool {
+    fn unregister_live_backdrop(thumbnails: Vec<isize>) {
         unsafe {
+            for thumbnail in thumbnails {
+                let _ = DwmUnregisterThumbnail(thumbnail);
+            }
+        }
+    }
+
+    fn update_live_backdrop(thumbnails: &[isize], backdrop: HWND, source: HWND) -> bool {
+        unsafe {
+            if thumbnails.len() != BACKDROP_SAMPLES.len() {
+                return false;
+            }
+
             let mut source_window = RECT::default();
             let mut backdrop_window = RECT::default();
             if GetWindowRect(source, &mut source_window).is_err()
@@ -649,34 +826,59 @@ mod platform {
 
             let destination_width = backdrop_window.right - backdrop_window.left;
             let destination_height = backdrop_window.bottom - backdrop_window.top;
-            let inset_x = (destination_width / 28).max(2);
+            let inset_x = (destination_width / 24).max(3);
             let inset_y = (destination_height / 8).max(1);
             let source_left = backdrop_window.left - source_window.left + inset_x;
             let source_top = backdrop_window.top - source_window.top + inset_y;
+            let source_width = destination_width - inset_x * 2;
+            let source_height = destination_height - inset_y * 2;
+            let source_window_width = source_window.right - source_window.left;
+            let source_window_height = source_window.bottom - source_window.top;
 
-            let properties = DWM_THUMBNAIL_PROPERTIES {
-                dwFlags: DWM_TNP_RECTDESTINATION
-                    | DWM_TNP_RECTSOURCE
-                    | DWM_TNP_OPACITY
-                    | DWM_TNP_VISIBLE
-                    | DWM_TNP_SOURCECLIENTAREAONLY,
-                rcDestination: RECT {
-                    left: 0,
-                    top: 0,
-                    right: destination_width,
-                    bottom: destination_height,
+            thumbnails.iter().zip(BACKDROP_SAMPLES).enumerate().all(
+                |(index, (thumbnail, (offset_x, offset_y, light_opacity)))| {
+                    let sample_left = source_left + offset_x;
+                    let sample_top = source_top + offset_y;
+                    if sample_left < 0
+                        || sample_top < 0
+                        || sample_left + source_width > source_window_width
+                        || sample_top + source_height > source_window_height
+                    {
+                        return false;
+                    }
+
+                    let opacity = if index == 0 {
+                        255
+                    } else if dark_background() {
+                        52
+                    } else {
+                        light_opacity
+                    };
+                    let properties = DWM_THUMBNAIL_PROPERTIES {
+                        dwFlags: DWM_TNP_RECTDESTINATION
+                            | DWM_TNP_RECTSOURCE
+                            | DWM_TNP_OPACITY
+                            | DWM_TNP_VISIBLE
+                            | DWM_TNP_SOURCECLIENTAREAONLY,
+                        rcDestination: RECT {
+                            left: 0,
+                            top: 0,
+                            right: destination_width,
+                            bottom: destination_height,
+                        },
+                        rcSource: RECT {
+                            left: sample_left,
+                            top: sample_top,
+                            right: sample_left + source_width,
+                            bottom: sample_top + source_height,
+                        },
+                        opacity,
+                        fVisible: BOOL(1),
+                        fSourceClientAreaOnly: BOOL(0),
+                    };
+                    DwmUpdateThumbnailProperties(*thumbnail, &properties).is_ok()
                 },
-                rcSource: RECT {
-                    left: source_left,
-                    top: source_top,
-                    right: source_left + destination_width - inset_x * 2,
-                    bottom: source_top + destination_height - inset_y * 2,
-                },
-                opacity: 236,
-                fVisible: BOOL(1),
-                fSourceClientAreaOnly: BOOL(0),
-            };
-            DwmUpdateThumbnailProperties(thumbnail, &properties).is_ok()
+            )
         }
     }
 
