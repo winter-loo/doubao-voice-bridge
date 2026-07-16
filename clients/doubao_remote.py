@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import array
 import collections
 import json
+import math
 import os
 import platform
 import re
@@ -271,6 +273,49 @@ class DirectFFmpegAudioStream:
         pass
 
 
+class PCMLevelMeter:
+    def __init__(self, interval=0.08):
+        self.interval = interval
+        self.last_emit = None
+        self.carry = b""
+        self.sum_squares = 0
+        self.sample_count = 0
+        self.peak = 0
+
+    def push(self, chunk, now=None):
+        data = self.carry + chunk
+        if len(data) % 2:
+            self.carry = data[-1:]
+            data = data[:-1]
+        else:
+            self.carry = b""
+
+        if data:
+            samples = array.array("h")
+            samples.frombytes(data)
+            if sys.byteorder != "little":
+                samples.byteswap()
+            self.sum_squares += sum(sample * sample for sample in samples)
+            self.sample_count += len(samples)
+            self.peak = max(self.peak, max((abs(sample) for sample in samples), default=0))
+
+        if self.sample_count == 0:
+            return None
+
+        now = time.monotonic() if now is None else now
+        if self.last_emit is not None and now - self.last_emit < self.interval:
+            return None
+
+        rms = math.sqrt(self.sum_squares / self.sample_count)
+        rms_dbfs = 20 * math.log10(rms / 32768.0) if rms > 0 else -120.0
+        peak_dbfs = 20 * math.log10(self.peak / 32768.0) if self.peak > 0 else -120.0
+        self.last_emit = now
+        self.sum_squares = 0
+        self.sample_count = 0
+        self.peak = 0
+        return max(rms_dbfs, -120.0), max(peak_dbfs, -120.0)
+
+
 class TCPAudioStream:
     def __init__(self, process, audio_socket, pump_thread, tail_limit):
         self.process = process
@@ -305,10 +350,19 @@ class TCPAudioStream:
         return stream
 
     def _pump_stdout(self):
+        meter = PCMLevelMeter()
         while True:
             chunk = self.process.stdout.read(4096)
             if not chunk:
                 return
+            level = meter.push(chunk)
+            if level:
+                rms_dbfs, peak_dbfs = level
+                print(
+                    f"[local_audio_level] rms={rms_dbfs:.1f}dBFS peak={peak_dbfs:.1f}dBFS",
+                    file=sys.stderr,
+                    flush=True,
+                )
             self._remember_tail(chunk)
             try:
                 with self.send_lock:

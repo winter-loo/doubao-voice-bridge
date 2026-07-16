@@ -2,6 +2,7 @@ import json
 import io
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -118,6 +119,31 @@ class PasteTextTests(unittest.TestCase):
         self.assertIn("UTF8Encoding", clipboard_call.args[0][-1])
         self.assertEqual(clipboard_call.kwargs["input"], "你好".encode("utf-8"))
         self.assertTrue(clipboard_call.kwargs["check"])
+
+
+class PCMLevelMeterTests(unittest.TestCase):
+    def test_silence_reports_floor_level(self):
+        meter = doubao_remote.PCMLevelMeter(interval=0)
+
+        self.assertEqual(meter.push(b"\x00" * 64, now=1.0), (-120.0, -120.0))
+
+    def test_pcm_amplitude_is_reported_in_dbfs(self):
+        meter = doubao_remote.PCMLevelMeter(interval=0)
+        pcm = struct.pack("<8h", *([8192, -8192] * 4))
+
+        rms_dbfs, peak_dbfs = meter.push(pcm, now=1.0)
+
+        self.assertAlmostEqual(rms_dbfs, -12.04, places=1)
+        self.assertAlmostEqual(peak_dbfs, -12.04, places=1)
+
+    def test_split_sample_is_reassembled(self):
+        meter = doubao_remote.PCMLevelMeter(interval=0)
+        pcm = struct.pack("<h", 16384)
+
+        self.assertIsNone(meter.push(pcm[:1], now=1.0))
+        _, peak_dbfs = meter.push(pcm[1:], now=1.1)
+
+        self.assertAlmostEqual(peak_dbfs, -6.02, places=1)
 
 
 class RecordCommandTests(unittest.TestCase):
