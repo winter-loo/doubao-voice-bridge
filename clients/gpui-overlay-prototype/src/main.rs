@@ -4,10 +4,7 @@
 )]
 
 use std::{
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -46,10 +43,11 @@ static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 static VOICE_ACTIVITY_UPDATED_AT: AtomicU64 = AtomicU64::new(0);
 static SPEECH_ACTIVITY_UNTIL: AtomicU64 = AtomicU64::new(0);
-static FORCE_WAVEFORM_ACTIVITY: OnceLock<bool> = OnceLock::new();
 
 const VOICE_RMS_GATE_DBFS: f32 = -58.0;
 const VOICE_PEAK_GATE_DBFS: f32 = -45.0;
+const VOICE_ONSET_RMS_DBFS: f32 = -40.0;
+const VOICE_ONSET_PEAK_DBFS: f32 = -25.0;
 const VOICE_ACTIVITY_STALE_AFTER_MS: u64 = 300;
 const SPEECH_ACTIVITY_HOLD_MS: u64 = 500;
 
@@ -117,17 +115,10 @@ fn decoded_voice_activity(level: u32, updated_at: u64, speech_until: u64, now: u
 }
 
 fn voice_activity() -> f32 {
-    let speech_until = if *FORCE_WAVEFORM_ACTIVITY
-        .get_or_init(|| std::env::var_os("DOUBAO_WAVEFORM_FORCE_ACTIVITY").is_some())
-    {
-        u64::MAX
-    } else {
-        SPEECH_ACTIVITY_UNTIL.load(Ordering::Acquire)
-    };
     decoded_voice_activity(
         VOICE_ACTIVITY.load(Ordering::Acquire),
         VOICE_ACTIVITY_UPDATED_AT.load(Ordering::Acquire),
-        speech_until,
+        SPEECH_ACTIVITY_UNTIL.load(Ordering::Acquire),
         now_millis(),
     )
 }
@@ -150,6 +141,16 @@ fn voice_activity_from_audio_line(line: &str) -> Option<f32> {
     let rms_strength = ((rms - VOICE_RMS_GATE_DBFS) / -VOICE_RMS_GATE_DBFS).clamp(0.0, 1.0);
     let peak_strength = ((peak - VOICE_PEAK_GATE_DBFS) / -VOICE_PEAK_GATE_DBFS).clamp(0.0, 1.0);
     Some((0.75 * rms_strength + 0.25 * peak_strength).clamp(0.12, 1.0))
+}
+
+fn is_strong_voice_activity_line(line: &str) -> bool {
+    let Some(rms) = parse_dbfs(line, "rms=") else {
+        return false;
+    };
+    let Some(peak) = parse_dbfs(line, "peak=") else {
+        return false;
+    };
+    rms >= VOICE_ONSET_RMS_DBFS && peak >= VOICE_ONSET_PEAK_DBFS
 }
 
 fn is_partial_speech_line(line: &str) -> bool {
@@ -499,8 +500,9 @@ mod platform {
     use super::{
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
         OverlayPhase, clear_voice_activity, dark_background, is_partial_speech_line,
-        mark_speech_activity, next_overlay_generation, overlay_generation, overlay_phase,
-        set_dark_background, set_overlay_phase, set_voice_activity, voice_activity_from_audio_line,
+        is_strong_voice_activity_line, mark_speech_activity, next_overlay_generation,
+        overlay_generation, overlay_phase, set_dark_background, set_overlay_phase,
+        set_voice_activity, voice_activity_from_audio_line,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -770,6 +772,9 @@ mod platform {
                     let line = String::from_utf8_lossy(&buffer);
                     if let Some(level) = voice_activity_from_audio_line(line.trim()) {
                         set_voice_activity(level);
+                        if is_strong_voice_activity_line(line.trim()) {
+                            mark_speech_activity();
+                        }
                     }
                 }
                 if parse_speech_activity {
@@ -1269,8 +1274,8 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        BAR_COUNT, decoded_voice_activity, is_partial_speech_line, voice_activity_from_audio_line,
-        waveform_bar_height,
+        BAR_COUNT, decoded_voice_activity, is_partial_speech_line, is_strong_voice_activity_line,
+        voice_activity_from_audio_line, waveform_bar_height,
     };
 
     #[test]
@@ -1325,6 +1330,16 @@ mod tests {
             .count();
 
         assert!(changed_bars > BAR_COUNT / 2);
+    }
+
+    #[test]
+    fn strong_voice_onset_ignores_the_observed_noise_floor() {
+        assert!(!is_strong_voice_activity_line(
+            "[local_audio_level] rms=-47.0dBFS peak=-35.0dBFS"
+        ));
+        assert!(is_strong_voice_activity_line(
+            "[local_audio_level] rms=-20.0dBFS peak=-8.0dBFS"
+        ));
     }
 }
 
