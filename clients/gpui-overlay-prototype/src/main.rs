@@ -4,14 +4,18 @@
 )]
 
 use std::{
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, ColorSpace, Context, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill,
-    linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
+    Animation, AnimationExt as _, App, Application, Bounds, ColorSpace, Context, FontWeight,
+    RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    canvas, div, fill, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba,
+    size,
 };
 
 const BOTTOM_MARGIN: f32 = 22.0;
@@ -35,6 +39,8 @@ enum OverlayPhase {
 
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static GLASS_BACKDROP: OnceLock<RwLock<Option<Arc<RenderImage>>>> = OnceLock::new();
+static GLASS_BACKDROP_IS_DARK: AtomicBool = AtomicBool::new(false);
 
 fn overlay_phase() -> OverlayPhase {
     match OVERLAY_PHASE.load(Ordering::Acquire) {
@@ -54,6 +60,29 @@ fn next_overlay_generation() -> u64 {
 
 fn overlay_generation() -> u64 {
     OVERLAY_GENERATION.load(Ordering::Acquire)
+}
+
+fn glass_backdrop() -> Option<Arc<RenderImage>> {
+    GLASS_BACKDROP
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .expect("glass backdrop lock poisoned")
+        .clone()
+}
+
+fn set_glass_backdrop(backdrop: Option<Arc<RenderImage>>) {
+    *GLASS_BACKDROP
+        .get_or_init(|| RwLock::new(None))
+        .write()
+        .expect("glass backdrop lock poisoned") = backdrop;
+}
+
+fn glass_backdrop_is_dark() -> bool {
+    GLASS_BACKDROP_IS_DARK.load(Ordering::Acquire)
+}
+
+fn set_glass_backdrop_is_dark(is_dark: bool) {
+    GLASS_BACKDROP_IS_DARK.store(is_dark, Ordering::Release);
 }
 
 fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
@@ -76,16 +105,29 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
         move |bounds, _, window, _| {
             let phase = delta * std::f32::consts::TAU;
             let radius = bounds.size.height / 2.0;
+            window.paint_quad(
+                fill(
+                    bounds,
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(rgba(0xffffff47), 0.0),
+                        linear_color_stop(rgba(0xc8ebff24), 1.0),
+                    )
+                    .color_space(ColorSpace::Oklab),
+                )
+                .corner_radii(radius),
+            );
+
             let top_lens = Bounds::new(
                 bounds.origin + point(px(2.0), px(1.0)),
-                size(bounds.size.width - px(4.0), px(10.0)),
+                size(bounds.size.width - px(4.0), px(9.0)),
             );
             window.paint_quad(
                 fill(
                     top_lens,
                     linear_gradient(
                         180.0,
-                        linear_color_stop(rgba(0xffffff3d), 0.0),
+                        linear_color_stop(rgba(0xffffff8f), 0.0),
                         linear_color_stop(rgba(0xffffff00), 1.0),
                     )
                     .color_space(ColorSpace::Oklab),
@@ -102,8 +144,8 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     lower_reflection,
                     linear_gradient(
                         180.0,
-                        linear_color_stop(rgba(0x42ded200), 0.0),
-                        linear_color_stop(rgba(0x557cff24), 1.0),
+                        linear_color_stop(rgba(0xffffff00), 0.0),
+                        linear_color_stop(rgba(0xbdeeff36), 1.0),
                     )
                     .color_space(ColorSpace::Oklab),
                 )
@@ -112,7 +154,7 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
 
             let sheen_progress = 0.5 + 0.5 * (phase * 0.42).sin();
             let sheen_x = bounds.origin.x + px(12.0 + 78.0 * sheen_progress);
-            for (offset, alpha) in [(-3.0, 0x05), (0.0, 0x16), (3.0, 0x07)] {
+            for (offset, alpha) in [(-3.0, 0x0a), (0.0, 0x32), (3.0, 0x0d)] {
                 let sheen = Bounds::new(
                     point(sheen_x + px(offset), bounds.origin.y + px(3.0)),
                     size(px(2.0), bounds.size.height - px(6.0)),
@@ -139,8 +181,8 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     upper_rim,
                     linear_gradient(
                         90.0,
-                        linear_color_stop(rgba(0xffffff14), 0.0),
-                        linear_color_stop(rgba(0xffffff70), 0.5),
+                        linear_color_stop(rgba(0xffffff38), 0.0),
+                        linear_color_stop(rgba(0xffffffd6), 0.5),
                     ),
                 )
                 .corner_radii(px(0.5)),
@@ -155,12 +197,23 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                     lower_rim,
                     linear_gradient(
                         90.0,
-                        linear_color_stop(rgba(0x43ded214), 0.0),
-                        linear_color_stop(rgba(0x648dff3d), 1.0),
+                        linear_color_stop(rgba(0xffffff24), 0.0),
+                        linear_color_stop(rgba(0x9fdaff70), 1.0),
                     ),
                 )
                 .corner_radii(px(0.5)),
             );
+
+            for x in [
+                bounds.origin.x + px(1.0),
+                bounds.origin.x + bounds.size.width - px(2.0),
+            ] {
+                let edge_caustic = Bounds::new(
+                    point(x, bounds.origin.y + px(6.0)),
+                    size(px(1.0), bounds.size.height - px(12.0)),
+                );
+                window.paint_quad(fill(edge_caustic, rgba(0xffffff8a)).corner_radii(px(0.5)));
+            }
 
             if !show_waveform {
                 return;
@@ -200,21 +253,47 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
 }
 
 fn capsule_base() -> gpui::Div {
+    let border_color = if glass_backdrop_is_dark() {
+        rgba(0xffffffb8)
+    } else {
+        rgba(0x526a806b)
+    };
+
     div()
+        .relative()
         .flex()
         .items_center()
         .justify_center()
         .rounded_full()
+        .overflow_hidden()
         .bg(linear_gradient(
             180.0,
-            linear_color_stop(rgba(0x23303bd9), 0.0),
-            linear_color_stop(rgba(0x080d14ed), 1.0),
+            linear_color_stop(rgba(0xffffff52), 0.0),
+            linear_color_stop(rgba(0xffffff3d), 1.0),
         )
         .color_space(ColorSpace::Oklab))
         .border_1()
-        .border_color(rgba(0xffffff52))
+        .border_color(border_color)
         .shadow_lg()
-        .text_color(rgb(0xf7f8fb))
+        .text_color(rgba(0x07131ff5))
+}
+
+fn backdrop_element() -> gpui::AnyElement {
+    match glass_backdrop() {
+        Some(backdrop) => img(backdrop)
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into_any_element(),
+        None => div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgba(0xffffff2e))
+            .into_any_element(),
+    }
 }
 
 fn listening_capsule(delta: f32) -> impl IntoElement {
@@ -224,7 +303,8 @@ fn listening_capsule(delta: f32) -> impl IntoElement {
         .h(px(LISTENING_CAPSULE_HEIGHT))
         .cursor_pointer()
         .on_click(|_, window, _| platform::finish_input(window))
-        .child(glass_canvas(delta, true))
+        .child(backdrop_element())
+        .child(glass_canvas(delta, true).relative())
 }
 
 fn optimizing_capsule(delta: f32) -> impl IntoElement {
@@ -233,8 +313,15 @@ fn optimizing_capsule(delta: f32) -> impl IntoElement {
         .relative()
         .w(px(LISTENING_CAPSULE_WIDTH))
         .h(px(LISTENING_CAPSULE_HEIGHT))
+        .child(backdrop_element())
         .child(glass_canvas(delta, false).absolute().top_0().left_0())
-        .child(div().relative().text_xs().child("优化识别中"))
+        .child(
+            div()
+                .relative()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .child("优化识别中"),
+        )
 }
 
 struct VoiceOverlay;
@@ -303,23 +390,32 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod platform {
     use std::ffi::c_void;
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
-        OverlayPhase, next_overlay_generation, overlay_generation, overlay_phase, set_overlay_phase,
+        LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
+        OverlayPhase, next_overlay_generation, overlay_generation, overlay_phase,
+        set_glass_backdrop, set_glass_backdrop_is_dark, set_overlay_phase,
     };
-    use gpui::Window;
+    use gpui::{RenderImage, Window};
+    use image::{Frame, RgbaImage, imageops};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, HGDIOBJ,
+        MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_RCONTROL, VK_SPACE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, MSG,
-        SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER, WS_DLGFRAME,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+        GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST,
+        IsWindowVisible, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER,
+        WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
     };
 
     const HOTKEY_ID: i32 = 0xDB01;
@@ -340,6 +436,7 @@ mod platform {
                 GWL_EXSTYLE,
                 styles | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize,
             );
+            position_above_work_area(hwnd);
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -351,8 +448,33 @@ mod platform {
             );
         }
         hide_overlay(hwnd);
+        capture_glass_backdrop(hwnd);
         start_hotkey_thread(hwnd.0 as isize);
         start_hold_key_thread(hwnd.0 as isize);
+    }
+
+    fn position_above_work_area(hwnd: HWND) {
+        unsafe {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+            let mut monitor_info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let mut window_rect = Default::default();
+            if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool()
+                || GetWindowRect(hwnd, &mut window_rect).is_err()
+            {
+                return;
+            }
+
+            let window_width = window_rect.right - window_rect.left;
+            let window_height = window_rect.bottom - window_rect.top;
+            let scale = window_width as f32 / OVERLAY_WIDTH;
+            let work_area = monitor_info.rcWork;
+            let x = work_area.left + (work_area.right - work_area.left - window_width) / 2;
+            let y = work_area.bottom - window_height - (8.0 * scale).round() as i32;
+            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 
     pub fn finish_input(window: &Window) {
@@ -384,7 +506,132 @@ mod platform {
 
     fn begin_input(hwnd: HWND) {
         next_overlay_generation();
+        capture_glass_backdrop(hwnd);
         show_phase(hwnd, OverlayPhase::Listening);
+    }
+
+    fn capture_glass_backdrop(hwnd: HWND) {
+        let mut window_rect = Default::default();
+        if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
+            set_glass_backdrop_is_dark(false);
+            set_glass_backdrop(None);
+            return;
+        }
+
+        let window_width = window_rect.right - window_rect.left;
+        let window_height = window_rect.bottom - window_rect.top;
+        if window_width <= 0 || window_height <= 0 {
+            set_glass_backdrop_is_dark(false);
+            set_glass_backdrop(None);
+            return;
+        }
+
+        let scale_x = window_width as f32 / OVERLAY_WIDTH;
+        let scale_y = window_height as f32 / OVERLAY_HEIGHT;
+        let capsule_width = (LISTENING_CAPSULE_WIDTH * scale_x).round() as i32;
+        let capsule_height = (LISTENING_CAPSULE_HEIGHT * scale_y).round() as i32;
+
+        // Sample slightly inside the capsule footprint, then stretch it back out.
+        // The small magnification is the refraction cue; blur alone reads as Acrylic.
+        let source_width = (capsule_width - (6.0 * scale_x).round() as i32).max(1);
+        let source_height = (capsule_height - (4.0 * scale_y).round() as i32).max(1);
+        let source_x = window_rect.left + (window_width - source_width) / 2;
+        let source_y = window_rect.top + (window_height - source_height) / 2;
+
+        let backdrop = capture_screen_region(source_x, source_y, source_width, source_height);
+        if backdrop.is_none() {
+            set_glass_backdrop_is_dark(false);
+        }
+        set_glass_backdrop(backdrop);
+    }
+
+    fn capture_screen_region(x: i32, y: i32, width: i32, height: i32) -> Option<Arc<RenderImage>> {
+        unsafe {
+            let screen_dc = GetDC(None);
+            if screen_dc.is_invalid() {
+                return None;
+            }
+
+            let memory_dc = CreateCompatibleDC(Some(screen_dc));
+            if memory_dc.is_invalid() {
+                let _ = ReleaseDC(None, screen_dc);
+                return None;
+            }
+
+            let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(memory_dc);
+                let _ = ReleaseDC(None, screen_dc);
+                return None;
+            }
+
+            let previous = SelectObject(memory_dc, HGDIOBJ(bitmap.0));
+            let copied = BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                Some(screen_dc),
+                x,
+                y,
+                SRCCOPY,
+            )
+            .is_ok();
+
+            let mut bitmap_info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            let scan_lines = if copied {
+                GetDIBits(
+                    memory_dc,
+                    bitmap,
+                    0,
+                    height as u32,
+                    Some(pixels.as_mut_ptr().cast()),
+                    &mut bitmap_info,
+                    DIB_RGB_COLORS,
+                )
+            } else {
+                0
+            };
+
+            let _ = SelectObject(memory_dc, previous);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory_dc);
+            let _ = ReleaseDC(None, screen_dc);
+
+            if scan_lines == 0 {
+                return None;
+            }
+
+            let mut luma_sum = 0u64;
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+                luma_sum +=
+                    (pixel[0] as u64 * 54 + pixel[1] as u64 * 183 + pixel[2] as u64 * 19) >> 8;
+                pixel[0] = ((pixel[0] as u16 * 91 + 255 * 9) / 100) as u8;
+                pixel[1] = ((pixel[1] as u16 * 91 + 255 * 9) / 100) as u8;
+                pixel[2] = ((pixel[2] as u16 * 91 + 255 * 9) / 100) as u8;
+                pixel[3] = 255;
+            }
+            let pixel_count = (width as u64 * height as u64).max(1);
+            set_glass_backdrop_is_dark(luma_sum / pixel_count < 144);
+
+            let image = RgbaImage::from_raw(width as u32, height as u32, pixels)?;
+            let blurred = imageops::blur(&image, 4.5);
+            Some(Arc::new(RenderImage::new(vec![Frame::new(blurred)])))
+        }
     }
 
     fn finish_input_hwnd(hwnd: HWND) {
