@@ -9,15 +9,12 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, Context, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill, point,
-    prelude::*, px, rgb, rgba, size,
+    Animation, AnimationExt as _, App, Application, Bounds, ColorSpace, Context, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill,
+    linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
 };
 
-const OVERLAY_WIDTH: f32 = 266.0;
-const OVERLAY_HEIGHT: f32 = 48.0;
-const BOTTOM_MARGIN: f32 = 30.0;
-const WAVEFORM_HEIGHT: f32 = 16.0;
+const BOTTOM_MARGIN: f32 = 22.0;
 const BAR_WIDTH: f32 = 2.0;
 const BAR_GAP: f32 = 2.0;
 const BAR_COUNT: usize = 20;
@@ -25,6 +22,8 @@ const WAVEFORM_BARS_WIDTH: f32 = BAR_COUNT as f32 * BAR_WIDTH + (BAR_COUNT - 1) 
 const LISTENING_HORIZONTAL_PADDING: f32 = 30.0;
 const LISTENING_CAPSULE_WIDTH: f32 = WAVEFORM_BARS_WIDTH + LISTENING_HORIZONTAL_PADDING;
 const LISTENING_CAPSULE_HEIGHT: f32 = 26.0;
+const OVERLAY_WIDTH: f32 = 128.0;
+const OVERLAY_HEIGHT: f32 = 42.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -66,7 +65,7 @@ fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
-fn waveform_canvas(delta: f32) -> impl IntoElement {
+fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
     const AMPLITUDES: [f32; BAR_COUNT] = [
         0.24, 0.32, 0.44, 0.58, 0.42, 0.64, 0.88, 1.0, 0.78, 0.56, 0.92, 0.74, 0.58, 0.68, 0.49,
         0.42, 0.35, 0.3, 0.25, 0.2,
@@ -76,6 +75,97 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
         |_, _, _| {},
         move |bounds, _, window, _| {
             let phase = delta * std::f32::consts::TAU;
+            let radius = bounds.size.height / 2.0;
+            let top_lens = Bounds::new(
+                bounds.origin + point(px(2.0), px(1.0)),
+                size(bounds.size.width - px(4.0), px(10.0)),
+            );
+            window.paint_quad(
+                fill(
+                    top_lens,
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(rgba(0xffffff3d), 0.0),
+                        linear_color_stop(rgba(0xffffff00), 1.0),
+                    )
+                    .color_space(ColorSpace::Oklab),
+                )
+                .corner_radii(radius),
+            );
+
+            let lower_reflection = Bounds::new(
+                bounds.origin + point(px(3.0), bounds.size.height - px(8.0)),
+                size(bounds.size.width - px(6.0), px(6.0)),
+            );
+            window.paint_quad(
+                fill(
+                    lower_reflection,
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(rgba(0x42ded200), 0.0),
+                        linear_color_stop(rgba(0x557cff24), 1.0),
+                    )
+                    .color_space(ColorSpace::Oklab),
+                )
+                .corner_radii(radius),
+            );
+
+            let sheen_progress = 0.5 + 0.5 * (phase * 0.42).sin();
+            let sheen_x = bounds.origin.x + px(12.0 + 78.0 * sheen_progress);
+            for (offset, alpha) in [(-3.0, 0x05), (0.0, 0x16), (3.0, 0x07)] {
+                let sheen = Bounds::new(
+                    point(sheen_x + px(offset), bounds.origin.y + px(3.0)),
+                    size(px(2.0), bounds.size.height - px(6.0)),
+                );
+                window.paint_quad(
+                    fill(
+                        sheen,
+                        linear_gradient(
+                            160.0,
+                            linear_color_stop(rgba(0xffffff00 | alpha), 0.0),
+                            linear_color_stop(rgba(0xbdeeff00 | alpha), 1.0),
+                        ),
+                    )
+                    .corner_radii(px(1.0)),
+                );
+            }
+
+            let upper_rim = Bounds::new(
+                bounds.origin + point(px(13.0), px(1.0)),
+                size(bounds.size.width - px(26.0), px(1.0)),
+            );
+            window.paint_quad(
+                fill(
+                    upper_rim,
+                    linear_gradient(
+                        90.0,
+                        linear_color_stop(rgba(0xffffff14), 0.0),
+                        linear_color_stop(rgba(0xffffff70), 0.5),
+                    ),
+                )
+                .corner_radii(px(0.5)),
+            );
+
+            let lower_rim = Bounds::new(
+                bounds.origin + point(px(15.0), bounds.size.height - px(2.0)),
+                size(bounds.size.width - px(30.0), px(1.0)),
+            );
+            window.paint_quad(
+                fill(
+                    lower_rim,
+                    linear_gradient(
+                        90.0,
+                        linear_color_stop(rgba(0x43ded214), 0.0),
+                        linear_color_stop(rgba(0x648dff3d), 1.0),
+                    ),
+                )
+                .corner_radii(px(0.5)),
+            );
+
+            if !show_waveform {
+                return;
+            }
+
             let start_x = bounds.origin.x + (bounds.size.width - px(WAVEFORM_BARS_WIDTH)) / 2.0;
             let center_y = bounds.origin.y + bounds.size.height / 2.0;
 
@@ -94,12 +184,19 @@ fn waveform_canvas(delta: f32) -> impl IntoElement {
                 );
 
                 let color = lerp_rgb(0x43ded2, 0x648dff, index as f32 / (BAR_COUNT - 1) as f32);
+                let glow_bounds = Bounds::new(
+                    bar_bounds.origin - point(px(1.0), px(1.0)),
+                    bar_bounds.size + size(px(2.0), px(2.0)),
+                );
+                window.paint_quad(
+                    fill(glow_bounds, rgba((color << 8) | 0x2e)).corner_radii(px(BAR_WIDTH)),
+                );
                 window.paint_quad(fill(bar_bounds, rgb(color)).corner_radii(px(BAR_WIDTH / 2.0)));
             }
         },
     )
     .w(px(LISTENING_CAPSULE_WIDTH))
-    .h(px(WAVEFORM_HEIGHT))
+    .h(px(LISTENING_CAPSULE_HEIGHT))
 }
 
 fn capsule_base() -> gpui::Div {
@@ -108,9 +205,14 @@ fn capsule_base() -> gpui::Div {
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(rgba(0x111318f2))
+        .bg(linear_gradient(
+            180.0,
+            linear_color_stop(rgba(0x23303bd9), 0.0),
+            linear_color_stop(rgba(0x080d14ed), 1.0),
+        )
+        .color_space(ColorSpace::Oklab))
         .border_1()
-        .border_color(rgba(0xffffff24))
+        .border_color(rgba(0xffffff52))
         .shadow_lg()
         .text_color(rgb(0xf7f8fb))
 }
@@ -122,16 +224,17 @@ fn listening_capsule(delta: f32) -> impl IntoElement {
         .h(px(LISTENING_CAPSULE_HEIGHT))
         .cursor_pointer()
         .on_click(|_, window, _| platform::finish_input(window))
-        .child(waveform_canvas(delta))
+        .child(glass_canvas(delta, true))
 }
 
-fn optimizing_capsule() -> impl IntoElement {
+fn optimizing_capsule(delta: f32) -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
+        .relative()
         .w(px(LISTENING_CAPSULE_WIDTH))
         .h(px(LISTENING_CAPSULE_HEIGHT))
-        .text_xs()
-        .child("优化识别中")
+        .child(glass_canvas(delta, false).absolute().top_0().left_0())
+        .child(div().relative().text_xs().child("优化识别中"))
 }
 
 struct VoiceOverlay;
@@ -150,7 +253,7 @@ impl Render for VoiceOverlay {
                     let content = match overlay_phase() {
                         OverlayPhase::Hidden => div().into_any_element(),
                         OverlayPhase::Listening => listening_capsule(delta).into_any_element(),
-                        OverlayPhase::Optimizing => optimizing_capsule().into_any_element(),
+                        OverlayPhase::Optimizing => optimizing_capsule(delta).into_any_element(),
                     };
                     root.child(content)
                 },
