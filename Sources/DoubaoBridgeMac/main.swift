@@ -775,6 +775,64 @@ struct AudioDeviceInfo {
     let outputChannels: Int
 }
 
+struct DefaultInputRecoveryRecord: Codable {
+    let originalDeviceUID: String
+    let originalDeviceName: String
+    let remoteDeviceUID: String
+    let remoteDeviceName: String
+    let createdAt: Date
+}
+
+final class DefaultInputRecoveryStore {
+    let fileURL: URL
+
+    init(fileURL: URL? = nil) {
+        if let fileURL {
+            self.fileURL = fileURL
+            return
+        }
+
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+        self.fileURL = applicationSupport
+            .appendingPathComponent("DoubaoVoiceBridge", isDirectory: true)
+            .appendingPathComponent("default-input-recovery.json", isDirectory: false)
+    }
+
+    func load() throws -> DefaultInputRecoveryRecord? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(
+            DefaultInputRecoveryRecord.self,
+            from: Data(contentsOf: fileURL)
+        )
+    }
+
+    func save(_ record: DefaultInputRecoveryRecord) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(record).write(to: fileURL, options: .atomic)
+    }
+
+    func clear() throws {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return
+        }
+        try FileManager.default.removeItem(at: fileURL)
+    }
+}
+
 final class CoreAudioDeviceManager {
     func devices() throws -> [AudioDeviceInfo] {
         var address = AudioObjectPropertyAddress(
@@ -880,6 +938,24 @@ final class CoreAudioDeviceManager {
         throw BridgeError.message("Input device not found: \(query)")
     }
 
+    func inputDevice(id: AudioDeviceID) throws -> AudioDeviceInfo {
+        guard let device = try devices().first(where: {
+            $0.id == id && $0.inputChannels > 0
+        }) else {
+            throw BridgeError.message("Input device ID not found: \(id)")
+        }
+        return device
+    }
+
+    func inputDevice(uid: String) throws -> AudioDeviceInfo {
+        guard let device = try devices().first(where: {
+            $0.uid == uid && $0.inputChannels > 0
+        }) else {
+            throw BridgeError.message("Input device UID not found: \(uid)")
+        }
+        return device
+    }
+
     func describe(deviceID: AudioDeviceID) -> String {
         let name = stringProperty(kAudioObjectPropertyName, deviceID: deviceID)
         let uid = stringProperty(kAudioDevicePropertyDeviceUID, deviceID: deviceID)
@@ -944,6 +1020,38 @@ final class CoreAudioDeviceManager {
         return UnsafeMutableAudioBufferListPointer(list).reduce(0) { count, buffer in
             count + Int(buffer.mNumberChannels)
         }
+    }
+}
+
+func recoverDefaultInputAtStartup(
+    audioDeviceManager: CoreAudioDeviceManager,
+    recoveryStore: DefaultInputRecoveryStore
+) {
+    do {
+        guard let record = try recoveryStore.load() else {
+            return
+        }
+
+        let currentID = try audioDeviceManager.defaultInputDevice()
+        let current = try audioDeviceManager.inputDevice(id: currentID)
+        guard current.uid == record.remoteDeviceUID else {
+            try recoveryStore.clear()
+            print(
+                "[audio-recovery] discarded stale recovery record; " +
+                "current=\(current.name) recorded-remote=\(record.remoteDeviceName)"
+            )
+            return
+        }
+
+        let original = try audioDeviceManager.inputDevice(uid: record.originalDeviceUID)
+        try audioDeviceManager.setDefaultInputDevice(original.id)
+        try recoveryStore.clear()
+        print(
+            "[audio-recovery] restored default input after interrupted session: " +
+            "\(original.name) [\(original.uid)]"
+        )
+    } catch {
+        fputs("[audio-recovery] startup recovery failed: \(error)\n", stderr)
     }
 }
 
@@ -1280,7 +1388,9 @@ final class Bridge {
     private let focusStateDetector: FocusStateDetector
     private let audioReceiver: AudioReceiver
     private let audioDeviceManager: CoreAudioDeviceManager
+    private let defaultInputRecoveryStore: DefaultInputRecoveryStore
     private var savedDefaultInputDevice: AudioDeviceID?
+    private var sessionCreatedRecoveryRecord = false
     private var voiceActivationGeneration = 0
     private var voiceActivationAttempt = 0
     private var audioLevelGeneration = 0
@@ -1295,7 +1405,8 @@ final class Bridge {
         voiceStateDetector: VoiceStateDetector,
         focusStateDetector: FocusStateDetector,
         audioReceiver: AudioReceiver,
-        audioDeviceManager: CoreAudioDeviceManager
+        audioDeviceManager: CoreAudioDeviceManager,
+        defaultInputRecoveryStore: DefaultInputRecoveryStore
     ) {
         self.config = config
         self.captureWindow = captureWindow
@@ -1304,6 +1415,7 @@ final class Bridge {
         self.focusStateDetector = focusStateDetector
         self.audioReceiver = audioReceiver
         self.audioDeviceManager = audioDeviceManager
+        self.defaultInputRecoveryStore = defaultInputRecoveryStore
         appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -1380,6 +1492,21 @@ final class Bridge {
         }
     }
 
+    func prepareForTermination() {
+        voiceActivationGeneration += 1
+        audioLevelGeneration += 1
+        if isRecording {
+            if config.voiceShortcutMode == "hold" {
+                controller.releaseVoiceShortcut()
+            } else {
+                controller.pressVoiceShortcut()
+            }
+        }
+        isRecording = false
+        audioReceiver.stop()
+        restoreDefaultInputIfNeeded()
+    }
+
     func toggleSession() {
         isRecording ? stopSession() : startSession()
     }
@@ -1445,11 +1572,32 @@ final class Bridge {
         }
 
         let previous = try audioDeviceManager.defaultInputDevice()
+        let previousInfo = try audioDeviceManager.inputDevice(id: previous)
         let remote = try audioDeviceManager.findInputDevice(matching: remoteInputDeviceName)
         savedDefaultInputDevice = previous
+        sessionCreatedRecoveryRecord = false
 
         if previous != remote.id {
-            try audioDeviceManager.setDefaultInputDevice(remote.id)
+            if config.restoreDefaultInput {
+                let recoveryRecord = DefaultInputRecoveryRecord(
+                    originalDeviceUID: previousInfo.uid,
+                    originalDeviceName: previousInfo.name,
+                    remoteDeviceUID: remote.uid,
+                    remoteDeviceName: remote.name,
+                    createdAt: Date()
+                )
+                try defaultInputRecoveryStore.save(recoveryRecord)
+            }
+            do {
+                try audioDeviceManager.setDefaultInputDevice(remote.id)
+                sessionCreatedRecoveryRecord = config.restoreDefaultInput
+            } catch {
+                if config.restoreDefaultInput {
+                    try? defaultInputRecoveryStore.clear()
+                }
+                savedDefaultInputDevice = nil
+                throw error
+            }
         }
 
         emit?([
@@ -1474,9 +1622,18 @@ final class Bridge {
             ])
         } catch {
             emit?(["type": "error", "message": "Failed to restore default input: \(error)"])
+            return
         }
 
+        if sessionCreatedRecoveryRecord {
+            do {
+                try defaultInputRecoveryStore.clear()
+            } catch {
+                emit?(["type": "error", "message": "Default input restored, but recovery record cleanup failed: \(error)"])
+            }
+        }
         self.savedDefaultInputDevice = nil
+        sessionCreatedRecoveryRecord = false
     }
 
     private func logDiagnostics(_ label: String) {
@@ -1790,9 +1947,28 @@ final class BridgeServer {
     }
 }
 
+final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
+    private let onWillTerminate: () -> Void
+
+    init(onWillTerminate: @escaping () -> Void) {
+        self.onWillTerminate = onWillTerminate
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        onWillTerminate()
+    }
+}
+
 do {
     let config = try Config.parse()
     let audioDeviceManager = CoreAudioDeviceManager()
+    let defaultInputRecoveryStore = DefaultInputRecoveryStore()
+    if config.restoreDefaultInput {
+        recoverDefaultInputAtStartup(
+            audioDeviceManager: audioDeviceManager,
+            recoveryStore: defaultInputRecoveryStore
+        )
+    }
     if config.listAudioDevices {
         try audioDeviceManager.printDevices()
         exit(0)
@@ -1827,7 +2003,8 @@ do {
         voiceStateDetector: voiceStateDetector,
         focusStateDetector: focusStateDetector,
         audioReceiver: audioReceiver,
-        audioDeviceManager: audioDeviceManager
+        audioDeviceManager: audioDeviceManager,
+        defaultInputRecoveryStore: defaultInputRecoveryStore
     )
     let server = try BridgeServer(port: config.port, token: config.token, bridge: bridge)
 
@@ -1853,7 +2030,13 @@ do {
     if let audioSourceCommand = config.audioSourceCommand {
         print("Audio source command: \(audioSourceCommand)")
     }
-    app.run()
+    let lifecycleDelegate = AppLifecycleDelegate { [weak bridge] in
+        bridge?.prepareForTermination()
+    }
+    app.delegate = lifecycleDelegate
+    withExtendedLifetime(lifecycleDelegate) {
+        app.run()
+    }
 } catch {
     fputs("doubao-bridge-mac: \(error)\n", stderr)
     printUsage()
