@@ -64,6 +64,13 @@ If Doubao honors that during ASR startup, bridge-level microphone switching can 
 
 With `--remote-input-device`, the bridge saves the current macOS default input device, switches the default input to the named virtual device when a remote session starts, and restores the previous default input after the session stops.
 
+The original and remote device UIDs are persisted before the switch. Normal stop
+and application termination restore the original input and clear that record. If
+the process crashes or is force-terminated, the next launch repairs the default
+input before creating the capture UI. Startup recovery only changes the device
+when the current default still matches the recorded virtual device, so it does
+not overwrite a microphone the user selected after the interruption.
+
 This still depends on Doubao's `自动检测` behavior. If Doubao snapshots a different device or ignores the system default, use the UI automation fallback.
 
 ## UI automation fallback

@@ -66,6 +66,19 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
 
 With `--remote-input-device`, the bridge temporarily switches macOS default input to Soundflower when a session starts, then restores the previous input device after stop.
 
+Before switching, the bridge atomically records the original and remote CoreAudio
+device UIDs in:
+
+```text
+~/Library/Application Support/DoubaoVoiceBridge/default-input-recovery.json
+```
+
+If the bridge is interrupted before normal restoration, its next launch restores
+the original input device before starting the UI or network listeners. If the
+current input no longer matches the recorded remote device, the bridge assumes
+the user already selected another microphone and only removes the stale record.
+`--no-restore-default-input` disables both normal and crash recovery.
+
 During an active remote recording, the bridge brings its Voice Input capture window to the foreground and keeps its text view as the first responder. If another application takes focus, the bridge immediately reactivates the capture window so Doubao does not insert recognized text into the wrong application. This focus enforcement stops when recording ends.
 
 ## Run Linux Client

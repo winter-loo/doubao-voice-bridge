@@ -20,6 +20,10 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("Network")
             ]
+        ),
+        .testTarget(
+            name: "DoubaoBridgeMacTests",
+            dependencies: ["DoubaoBridgeMac"]
         )
     ]
 )
