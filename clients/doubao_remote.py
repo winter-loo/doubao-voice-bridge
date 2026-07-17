@@ -17,6 +17,13 @@ import threading
 import time
 
 
+BRIDGE_PHASE_PREFIX = "[bridge_phase]"
+
+
+def emit_bridge_phase(phase):
+    print(f"{BRIDGE_PHASE_PREFIX} {phase}", file=sys.stderr, flush=True)
+
+
 class BridgeClient:
     def __init__(self, server, token=None):
         host, port_text = server.rsplit(":", 1)
@@ -88,6 +95,7 @@ class BridgeClient:
             print(self.final_text)
         elif event_type == "status":
             self.phase = event.get("phase", self.phase)
+            emit_bridge_phase(self.phase)
             if self.phase == "recording":
                 self.recording_ready.set()
             print(f"[event] {event}", file=sys.stderr)
@@ -135,6 +143,7 @@ class BridgeClient:
             if event.get("phase") == "voice_activation_failed":
                 self.activation_failed = True
                 self.recording_ready.set()
+                emit_bridge_phase("voice_activation_failed")
             print(f"[{event_type}] {event}", file=sys.stderr)
         elif event_type == "auth":
             print(f"[{event_type}] {event}", file=sys.stderr)

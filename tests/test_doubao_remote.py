@@ -36,6 +36,32 @@ class RecordArgumentsTests(unittest.TestCase):
 
 
 class BridgeClientEventTests(unittest.TestCase):
+    def test_status_emits_machine_readable_bridge_phase(self):
+        client = doubao_remote.BridgeClient("127.0.0.1:4387")
+        error_output = io.StringIO()
+
+        with mock.patch("sys.stderr", error_output):
+            client.handle_event({"type": "status", "phase": "arming", "recording": True})
+            client.handle_event({"type": "status", "phase": "recording", "recording": True})
+
+        self.assertIn("[bridge_phase] arming\n", error_output.getvalue())
+        self.assertIn("[bridge_phase] recording\n", error_output.getvalue())
+        self.assertTrue(client.recording_ready.is_set())
+
+    def test_activation_failure_emits_machine_readable_bridge_phase(self):
+        client = doubao_remote.BridgeClient("127.0.0.1:4387")
+        error_output = io.StringIO()
+
+        with mock.patch("sys.stderr", error_output):
+            client.handle_event({
+                "type": "error",
+                "phase": "voice_activation_failed",
+                "message": "not active",
+            })
+
+        self.assertIn("[bridge_phase] voice_activation_failed\n", error_output.getvalue())
+        self.assertTrue(client.activation_failed)
+
     def test_partial_text_replaces_the_terminal_preview(self):
         client = doubao_remote.BridgeClient("127.0.0.1:4387")
         output = TTYBuffer()

@@ -15,8 +15,11 @@ window when launched directly. Debug builds retain their console for diagnostics
 
 The prototype opens a transparent voice capsule near the bottom of the primary
 display. Its 20 cyan-to-blue waveform bars are drawn in one Canvas from one
-animation clock. Activation immediately shows the animated listening waveform,
-followed by `优化识别中` after input ends.
+animation clock. Activation first shows `激活中` while the Mac bridge opens and
+verifies the Doubao voice input UI. The animated listening waveform appears only
+after the bridge emits `phase=recording`, followed by `优化识别中` after input
+ends. Speech made during `激活中` is not yet recognized and does not animate the
+waveform.
 
 The listening capsule is intentionally compact at 108 x 26 logical px: its width
 is the exact 20-bar waveform width plus 30 logical px of total horizontal padding

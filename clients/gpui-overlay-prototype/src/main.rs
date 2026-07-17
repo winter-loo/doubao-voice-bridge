@@ -29,10 +29,11 @@ const BAR_AMPLITUDES: [f32; BAR_COUNT] = [
     0.35, 0.3, 0.25, 0.2,
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum OverlayPhase {
     Hidden,
+    Activating,
     Listening,
     Optimizing,
 }
@@ -53,8 +54,9 @@ const SPEECH_ACTIVITY_HOLD_MS: u64 = 500;
 
 fn overlay_phase() -> OverlayPhase {
     match OVERLAY_PHASE.load(Ordering::Acquire) {
-        1 => OverlayPhase::Listening,
-        2 => OverlayPhase::Optimizing,
+        1 => OverlayPhase::Activating,
+        2 => OverlayPhase::Listening,
+        3 => OverlayPhase::Optimizing,
         _ => OverlayPhase::Hidden,
     }
 }
@@ -156,6 +158,14 @@ fn is_strong_voice_activity_line(line: &str) -> bool {
 fn is_partial_speech_line(line: &str) -> bool {
     line.strip_prefix("[partial]")
         .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn overlay_phase_from_bridge_line(line: &str) -> Option<OverlayPhase> {
+    match line.strip_prefix("[bridge_phase] ")?.trim() {
+        "arming" | "voice_retry" => Some(OverlayPhase::Activating),
+        "recording" => Some(OverlayPhase::Listening),
+        _ => None,
+    }
 }
 
 fn waveform_bar_height(index: usize, delta: f32, voice_level: f32) -> f32 {
@@ -405,6 +415,22 @@ fn listening_capsule(delta: f32) -> impl IntoElement {
         .child(glass_canvas(delta, true).relative())
 }
 
+fn activating_capsule(delta: f32) -> impl IntoElement {
+    capsule_base()
+        .id("voice-capsule")
+        .relative()
+        .w(px(LISTENING_CAPSULE_WIDTH))
+        .h(px(LISTENING_CAPSULE_HEIGHT))
+        .child(glass_canvas(delta, false).absolute().top_0().left_0())
+        .child(
+            div()
+                .relative()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .child("激活中"),
+        )
+}
+
 fn optimizing_capsule(delta: f32) -> impl IntoElement {
     capsule_base()
         .id("voice-capsule")
@@ -436,6 +462,7 @@ impl Render for VoiceOverlay {
                 |root, delta| {
                     let content = match overlay_phase() {
                         OverlayPhase::Hidden => div().into_any_element(),
+                        OverlayPhase::Activating => activating_capsule(delta).into_any_element(),
                         OverlayPhase::Listening => listening_capsule(delta).into_any_element(),
                         OverlayPhase::Optimizing => optimizing_capsule(delta).into_any_element(),
                     };
@@ -501,8 +528,8 @@ mod platform {
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
         OverlayPhase, clear_voice_activity, dark_background, is_partial_speech_line,
         is_strong_voice_activity_line, mark_speech_activity, next_overlay_generation,
-        overlay_generation, overlay_phase, set_dark_background, set_overlay_phase,
-        set_voice_activity, voice_activity_from_audio_line,
+        overlay_generation, overlay_phase, overlay_phase_from_bridge_line, set_dark_background,
+        set_overlay_phase, set_voice_activity, voice_activity_from_audio_line,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -713,11 +740,11 @@ mod platform {
     }
 
     fn begin_input(hwnd: HWND) {
-        next_overlay_generation();
+        let generation = next_overlay_generation();
         clear_voice_activity();
         set_dark_background(sample_dark_background(hwnd));
-        show_phase(hwnd, OverlayPhase::Listening);
-        if let Err(error) = start_voice_client() {
+        show_phase(hwnd, OverlayPhase::Activating);
+        if let Err(error) = start_voice_client(generation) {
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
         }
     }
@@ -751,6 +778,7 @@ mod platform {
         stream: R,
         parse_audio_levels: bool,
         parse_speech_activity: bool,
+        bridge_generation: Option<u64>,
     ) where
         R: Read + Send + 'static,
     {
@@ -783,6 +811,21 @@ mod platform {
                         mark_speech_activity();
                     }
                 }
+                if let Some(generation) = bridge_generation {
+                    let line = String::from_utf8_lossy(&buffer);
+                    if overlay_generation() == generation
+                        && let Some(phase) = overlay_phase_from_bridge_line(line.trim())
+                        && matches!(
+                            overlay_phase(),
+                            OverlayPhase::Activating | OverlayPhase::Listening
+                        )
+                    {
+                        if phase == OverlayPhase::Listening {
+                            clear_voice_activity();
+                        }
+                        set_overlay_phase(phase);
+                    }
+                }
                 if let Some(log) = log.as_mut() {
                     let _ = log.write_all(&buffer);
                 }
@@ -797,7 +840,7 @@ mod platform {
         });
     }
 
-    fn start_voice_client() -> Result<(), String> {
+    fn start_voice_client(generation: u64) -> Result<(), String> {
         let mut active = VOICE_CLIENT
             .lock()
             .map_err(|_| "voice client lock is poisoned".to_string())?;
@@ -884,8 +927,8 @@ mod platform {
             .stderr
             .take()
             .ok_or_else(|| "Python client stderr was not piped".to_string())?;
-        start_voice_client_output_thread(stdout, false, true);
-        start_voice_client_output_thread(stderr, true, false);
+        start_voice_client_output_thread(stdout, false, true, None);
+        start_voice_client_output_thread(stderr, true, false, Some(generation));
         *active = Some(VoiceClientProcess { child, stdin });
         Ok(())
     }
@@ -1185,7 +1228,7 @@ mod platform {
                 hide_overlay(hwnd);
                 return;
             }
-            OverlayPhase::Listening => {}
+            OverlayPhase::Activating | OverlayPhase::Listening => {}
         }
 
         let generation = overlay_generation();
@@ -1274,9 +1317,30 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        BAR_COUNT, decoded_voice_activity, is_partial_speech_line, is_strong_voice_activity_line,
+        BAR_COUNT, OverlayPhase, decoded_voice_activity, is_partial_speech_line,
+        is_strong_voice_activity_line, overlay_phase_from_bridge_line,
         voice_activity_from_audio_line, waveform_bar_height,
     };
+
+    #[test]
+    fn bridge_status_distinguishes_activation_from_recording() {
+        assert_eq!(
+            overlay_phase_from_bridge_line("[bridge_phase] arming"),
+            Some(OverlayPhase::Activating)
+        );
+        assert_eq!(
+            overlay_phase_from_bridge_line("[bridge_phase] voice_retry"),
+            Some(OverlayPhase::Activating)
+        );
+        assert_eq!(
+            overlay_phase_from_bridge_line("[bridge_phase] recording"),
+            Some(OverlayPhase::Listening)
+        );
+        assert_eq!(
+            overlay_phase_from_bridge_line("[event] {'phase': 'recording'}"),
+            None
+        );
+    }
 
     #[test]
     fn silence_is_hard_gated_to_zero() {

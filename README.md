@@ -102,6 +102,11 @@ Without `--seconds`, the client records until you press `Ctrl+C`. To stop automa
 
 The client starts streaming audio early, but recording begins after the Mac bridge emits `phase=recording`. That phase is only emitted after the Mac confirms Doubao's voice UI is active. Pressing `Ctrl+C` stops the remote microphone, releases the Doubao voice shortcut, and waits for the final committed text.
 
+The Windows GPUI client mirrors that protocol state. It displays `激活中` for
+the Mac bridge's `arming` and `voice_retry` phases, and only switches to the
+audio-reactive waveform after `phase=recording`. This prevents early microphone
+energy from looking as if Doubao is already recognizing speech.
+
 When launching the client as a one-shot SSH command, allocate a pseudo-terminal so `Ctrl+C` reaches the remote Python process:
 
 ```bash
