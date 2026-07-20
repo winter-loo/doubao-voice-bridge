@@ -11,7 +11,7 @@ final class AppPreferencesTests: XCTestCase {
 
         XCTAssertEqual(preferences.controlPort, 4387)
         XCTAssertEqual(preferences.audioPort, 5004)
-        XCTAssertEqual(preferences.virtualAudioDevice, "Soundflower (2ch)")
+        XCTAssertEqual(preferences.virtualAudioDevice, "BlackHole 2ch")
         XCTAssertTrue(preferences.restoreDefaultInput)
         XCTAssertFalse(preferences.showCaptureWindow)
     }
@@ -32,5 +32,17 @@ final class AppPreferencesTests: XCTestCase {
         expected.save(to: defaults)
 
         XCTAssertEqual(AppPreferences(defaults: defaults), expected)
+    }
+
+    func testLegacySoundflowerPreferenceMigratesToBlackHole() {
+        let suiteName = "AppPreferencesTests.migration.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("Soundflower (2ch)", forKey: "virtualAudioDevice")
+
+        XCTAssertEqual(
+            AppPreferences(defaults: defaults).virtualAudioDevice,
+            "BlackHole 2ch"
+        )
     }
 }

@@ -1,6 +1,9 @@
 import Foundation
 
 struct AppPreferences: Equatable {
+    private static let defaultVirtualAudioDevice = "BlackHole 2ch"
+    private static let legacyVirtualAudioDevice = "Soundflower (2ch)"
+
     private enum Key {
         static let controlPort = "controlPort"
         static let audioPort = "audioPort"
@@ -13,7 +16,7 @@ struct AppPreferences: Equatable {
 
     var controlPort = 4387
     var audioPort = 5004
-    var virtualAudioDevice = "Soundflower (2ch)"
+    var virtualAudioDevice = Self.defaultVirtualAudioDevice
     var restoreDefaultInput = true
     var showCaptureWindow = false
     var launchAtLogin = false
@@ -29,7 +32,9 @@ struct AppPreferences: Equatable {
             audioPort = value.intValue
         }
         if let value = defaults.string(forKey: Key.virtualAudioDevice), !value.isEmpty {
-            virtualAudioDevice = value
+            virtualAudioDevice = value == Self.legacyVirtualAudioDevice
+                ? Self.defaultVirtualAudioDevice
+                : value
         }
         if defaults.object(forKey: Key.restoreDefaultInput) != nil {
             restoreDefaultInput = defaults.bool(forKey: Key.restoreDefaultInput)

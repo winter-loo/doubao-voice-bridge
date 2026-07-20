@@ -11,7 +11,7 @@ Windows application that had focus.
 Windows microphone
   -> native Rust Windows client using WASAPI
   -> TCP audio stream to the Mac on port 5004
-  -> Soundflower (2ch)
+  -> native CoreAudio output to BlackHole 2ch
   -> Doubao IME on the Mac
   -> Doubao Voice Bridge capture window
   -> recognized text over TCP port 4387
@@ -28,18 +28,17 @@ network or Tailscale network is recommended.
 Install these components on the Mac:
 
 - Doubao IME
-- Soundflower with the `Soundflower (2ch)` device
+- BlackHole with the `BlackHole 2ch` device
 - Xcode Command Line Tools
-- FFmpeg
 
-For example, install the command line tools and FFmpeg with:
+For example, install the command line tools and BlackHole with:
 
 ```bash
 xcode-select --install
-brew install ffmpeg
+brew install blackhole-2ch
 ```
 
-Soundflower installation and approval may require restarting macOS.
+Restart macOS after installing BlackHole so CoreAudio loads the new device.
 
 ### Configure Doubao IME
 
@@ -49,8 +48,8 @@ Open Doubao IME settings and make these changes:
 2. Set voice input activation to long-press `Fn`.
 3. Confirm that Doubao IME has macOS Microphone permission.
 
-Do not permanently select Soundflower as the Mac's default input. The bridge
-temporarily switches the default input to Soundflower when a remote session
+Do not permanently select BlackHole as the Mac's default input. The bridge
+temporarily switches the default input to BlackHole when a remote session
 starts and restores the previous physical microphone when the session ends.
 
 ### Build the Mac app
@@ -92,7 +91,7 @@ tailscale ip -4
 For a local network, use the IP shown in **System Settings > Network**. In the
 commands below, replace `<MAC_IP>` with this address.
 
-### Verify Soundflower
+### Verify BlackHole
 
 List the audio devices seen by the bridge:
 
@@ -101,7 +100,7 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
   --list-audio-devices
 ```
 
-The output must include `Soundflower (2ch)`. Device numbers can change, so the
+The output must include `BlackHole 2ch`. Device identifiers can change, so the
 normal launch command selects the device by name instead of by index.
 
 ## 2. Start the Mac Bridge
@@ -110,7 +109,7 @@ Double-click `dist/DoubaoVoiceBridge.app`. The bridge appears in the macOS menu
 bar and does not require a Terminal window. Complete the setup assistant on the
 first launch. A green waveform menu-bar icon means the service is ready.
 
-The app starts with the tested TCP, Soundflower, and Fn settings automatically.
+The app starts with the TCP, BlackHole, and Fn settings automatically.
 Open its menu-bar item to access Settings, Diagnostics, Start at Login, and the
 setup assistant.
 
@@ -121,8 +120,8 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
   --port 4387 \
   --udp-port 5004 \
   --audio-transport tcp \
-  --audio-device-name "Soundflower (2ch)" \
-  --remote-input-device "Soundflower (2ch)" \
+  --audio-device-name "BlackHole 2ch" \
+  --remote-input-device "BlackHole 2ch" \
   --voice-shortcut fn \
   --voice-shortcut-mode hold \
   --startup-delay 0.3 \
@@ -136,7 +135,7 @@ When launched from Terminal, a successful startup includes messages similar to:
 ```text
 Doubao bridge listening on TCP 4387, audio 5004
 Audio transport: tcp
-AudioToolbox output device: Soundflower (2ch)
+CoreAudio output device: BlackHole 2ch
 ```
 
 The app bundle should be used even when launching from Terminal because its
@@ -224,7 +223,7 @@ before launching the executable directly from File Explorer.
 1. Click the text field in the Windows application where the result should go.
 2. Hold **Left Ctrl** for at least 420 ms.
 3. The compact overlay first displays `激活中` while the Mac switches to
-   Soundflower, focuses the capture window, and activates Doubao voice input.
+   BlackHole, focuses the capture window, and activates Doubao voice input.
 4. Wait until the overlay changes to the animated waveform, then speak.
 5. Release **Left Ctrl** to finish.
 6. The overlay displays `优化识别中` while Doubao commits the final result.
@@ -314,13 +313,13 @@ Get-Content "$env:TEMP\doubao-gpui-voice-client.log" -Tail 100
 ### The waveform appears, but no text is pasted
 
 - Speak only after the waveform appears.
-- Confirm the Mac default input changes to Soundflower during recording and
+- Confirm the Mac default input changes to BlackHole during recording and
   returns to the physical microphone afterward.
 - Confirm Doubao has Microphone permission.
 - Make sure the original Windows text field still accepts keyboard input and
   clipboard paste.
-- Run the command-line client once so its bridge events and FFmpeg errors are
-  visible.
+- Check the Mac bridge log for CoreAudio errors and the Windows client log for
+  WASAPI capture errors.
 
 ### Text appears on the Mac instead of Windows
 
@@ -330,9 +329,9 @@ restart the Mac bridge and inspect the Windows log for focus recovery errors.
 
 ### The GPUI app starts but immediately stops recording
 
-FFmpeg probably found zero or multiple DirectShow audio devices. Inspect the log
-and run the microphone-listing command above. Use the command-line client with
-`--input-device` when multiple devices are required.
+WASAPI could not open the selected microphone, or the saved device is no longer
+present. Inspect the Windows log, open the tray Settings window, and select an
+available microphone. The command-line client remains useful for device diagnostics.
 
 ### The Windows UI shows an old Mac address
 
