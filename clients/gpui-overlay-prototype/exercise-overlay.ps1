@@ -86,7 +86,7 @@ function Set-RightControl([bool]$Down) {
     [OverlayExercise]::keybd_event(0xA3, 0, $flags, [UIntPtr]::Zero)
 }
 
-$process = Get-Process gpui-overlay-prototype -ErrorAction Stop
+$process = Get-Process DoubaoVoiceClient -ErrorAction Stop
 $hwnd = Find-ProcessWindow $process.Id
 if ($hwnd -eq [IntPtr]::Zero) {
     throw "Could not find the prototype window"

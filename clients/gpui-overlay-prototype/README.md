@@ -1,19 +1,34 @@
-# GPUI Windows Overlay Prototype
+# GPUI Windows Voice Client
 
-> THROWAWAY PROTOTYPE: validates GPUI transparency, animation, always-on-top,
-> no-activate behavior, and a global Windows hotkey. It does not contain the
-> production voice client architecture.
+The Windows release executable contains the complete native Rust client. It
+captures the selected Windows microphone through WASAPI, normalizes audio to
+48 kHz mono s16le PCM, streams it to the Mac bridge, receives bridge events,
+and pastes the final text without launching Python, FFmpeg, PowerShell, or a
+console window.
 
-Run from this directory:
+Build from this directory:
 
 ```powershell
-cargo run --release
+cargo build --release
+Start-Process .\target\release\DoubaoVoiceClient.exe
 ```
 
 The Windows release binary uses the GUI subsystem and does not create a console
 window when launched directly. Debug builds retain their console for diagnostics.
 
-The prototype opens a transparent voice capsule near the bottom of the primary
+On first launch, a small setup window asks for the Mac server address and the
+microphone to use. Saving performs a connection check, stores the choices in
+`%LOCALAPPDATA%\DoubaoVoiceBridge\client.json`, and can register the client to
+start when the user signs in. After setup, the client lives in the notification
+area. Its menu provides **Settings** and **Quit**; launching the executable again
+opens the existing instance instead of starting a second client.
+
+The default Windows microphone is selected automatically. To select a stable
+CPAL device ID or exact device name explicitly, set `DOUBAO_VOICE_INPUT_DEVICE`.
+The bridge address remains configurable through `DOUBAO_BRIDGE_SERVER`; the
+audio port can be overridden with `DOUBAO_BRIDGE_AUDIO_PORT`.
+
+The client opens a transparent voice capsule near the bottom of the primary
 display. Its 20 cyan-to-blue waveform bars are drawn in one Canvas from one
 animation clock. Activation first shows `激活中` while the Mac bridge opens and
 verifies the Doubao voice input UI. The animated listening waveform appears only
@@ -35,17 +50,17 @@ retaining captured pixels. A slightly smaller source rectangle is stretched into
 the capsule for a refraction cue; the GPUI canvas adds the translucent tint,
 moving specular band, edge caustics, lower reflection, and waveform glow.
 
-On Windows, hold right `Ctrl` for 420 ms to activate and release it to finish.
+On Windows, hold left `Ctrl` for 420 ms to activate and release it to finish.
 `Ctrl+Alt+Space` starts or finishes a session for remote testing, and clicking the
 capsule also finishes. The previously focused application should retain keyboard
 focus.
 
 Most Windows keyboards handle `Fn` in firmware and do not expose a standard
-virtual key, so right `Ctrl` is the prototype's configurable stand-in. A macOS
+virtual key, so left `Ctrl` is the client's stand-in. A macOS
 client can bind the same hold behavior to the observable Fn/Globe modifier.
 
 Useful verification command while the prototype is running:
 
 ```powershell
-Get-Process gpui-overlay-prototype | Select-Object Id, MainWindowHandle
+Get-Process DoubaoVoiceClient | Select-Object Id, MainWindowHandle
 ```

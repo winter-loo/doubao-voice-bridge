@@ -14,6 +14,13 @@ use gpui::{
     linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
 };
 
+mod client_core;
+mod client_settings;
+#[cfg(target_os = "windows")]
+mod windows_shell;
+#[cfg(target_os = "windows")]
+mod windows_voice;
+
 const BOTTOM_MARGIN: f32 = 22.0;
 const BAR_WIDTH: f32 = 2.0;
 const BAR_GAP: f32 = 2.0;
@@ -125,26 +132,33 @@ fn voice_activity() -> f32 {
     )
 }
 
+#[cfg(test)]
 fn parse_dbfs(line: &str, label: &str) -> Option<f32> {
     let value = line.split_once(label)?.1.split_once("dBFS")?.0.trim();
     value.parse().ok()
 }
 
+#[cfg(test)]
 fn voice_activity_from_audio_line(line: &str) -> Option<f32> {
     if !line.starts_with("[local_audio_level]") {
         return None;
     }
     let rms = parse_dbfs(line, "rms=")?;
     let peak = parse_dbfs(line, "peak=")?;
+    Some(voice_activity_from_levels(rms, peak))
+}
+
+fn voice_activity_from_levels(rms: f32, peak: f32) -> f32 {
     if rms < VOICE_RMS_GATE_DBFS || peak < VOICE_PEAK_GATE_DBFS {
-        return Some(0.0);
+        return 0.0;
     }
 
     let rms_strength = ((rms - VOICE_RMS_GATE_DBFS) / -VOICE_RMS_GATE_DBFS).clamp(0.0, 1.0);
     let peak_strength = ((peak - VOICE_PEAK_GATE_DBFS) / -VOICE_PEAK_GATE_DBFS).clamp(0.0, 1.0);
-    Some((0.75 * rms_strength + 0.25 * peak_strength).clamp(0.12, 1.0))
+    (0.75 * rms_strength + 0.25 * peak_strength).clamp(0.12, 1.0)
 }
 
+#[cfg(test)]
 fn is_strong_voice_activity_line(line: &str) -> bool {
     let Some(rms) = parse_dbfs(line, "rms=") else {
         return false;
@@ -155,11 +169,13 @@ fn is_strong_voice_activity_line(line: &str) -> bool {
     rms >= VOICE_ONSET_RMS_DBFS && peak >= VOICE_ONSET_PEAK_DBFS
 }
 
+#[cfg(test)]
 fn is_partial_speech_line(line: &str) -> bool {
     line.strip_prefix("[partial]")
         .is_some_and(|text| !text.trim().is_empty())
 }
 
+#[cfg(test)]
 fn overlay_phase_from_bridge_line(line: &str) -> Option<OverlayPhase> {
     match line.strip_prefix("[bridge_phase] ")?.trim() {
         "arming" | "voice_retry" => Some(OverlayPhase::Activating),
@@ -490,6 +506,11 @@ fn overlay_bounds(cx: &App) -> Bounds<gpui::Pixels> {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if !platform::claim_single_instance() {
+        return;
+    }
+
     Application::new().run(|cx: &mut App| {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(overlay_bounds(cx))),
@@ -515,25 +536,26 @@ fn main() {
 mod platform {
     use std::ffi::c_void;
     use std::fs::OpenOptions;
-    use std::io::{BufRead as _, BufReader, Read, Write as _};
-    use std::os::windows::process::CommandExt as _;
+    use std::io::Write as _;
     use std::path::PathBuf;
-    use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use super::windows_voice::{NativeVoiceConfig, NativeVoiceEvent, NativeVoiceSession};
     use super::{
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
-        OverlayPhase, clear_voice_activity, dark_background, is_partial_speech_line,
-        is_strong_voice_activity_line, mark_speech_activity, next_overlay_generation,
-        overlay_generation, overlay_phase, overlay_phase_from_bridge_line, set_dark_background,
-        set_overlay_phase, set_voice_activity, voice_activity_from_audio_line,
+        OverlayPhase, VOICE_ONSET_PEAK_DBFS, VOICE_ONSET_RMS_DBFS, clear_voice_activity,
+        dark_background, mark_speech_activity, next_overlay_generation, overlay_generation,
+        overlay_phase, set_dark_background, set_overlay_phase, set_voice_activity,
+        voice_activity_from_levels,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+    use windows::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, RECT, WPARAM,
+    };
     use windows::Win32::Graphics::Dwm::{
         DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
         DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
@@ -544,21 +566,21 @@ mod platform {
         CreateRoundRectRgn, GetDC, GetMonitorInfoW, GetPixel, MONITOR_DEFAULTTOPRIMARY,
         MONITORINFO, MonitorFromWindow, ReleaseDC, SetWindowRgn,
     };
+    use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_RCONTROL, VK_SPACE,
+        GetAsyncKeyState, MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_LCONTROL, VK_SPACE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindow,
-        GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE,
+        CreateWindowExW, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindow,
+        GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE, SW_SHOW,
         SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER, WS_DISABLED,
-        WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER,
+        WS_DISABLED, WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         WS_THICKFRAME,
     };
     use windows::core::{BOOL, w};
 
     const HOTKEY_ID: i32 = 0xDB01;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const HOLD_THRESHOLD: Duration = Duration::from_millis(420);
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
     const BACKDROP_SAMPLES: [(i32, i32, u8); 5] = [
@@ -569,11 +591,28 @@ mod platform {
         (0, 1, 14),
     ];
     static BACKDROP_HWND: AtomicIsize = AtomicIsize::new(0);
-    static VOICE_CLIENT: Mutex<Option<VoiceClientProcess>> = Mutex::new(None);
+    static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
+    static VOICE_CLIENT: Mutex<Option<NativeVoiceSession>> = Mutex::new(None);
 
-    struct VoiceClientProcess {
-        child: Child,
-        stdin: ChildStdin,
+    pub fn claim_single_instance() -> bool {
+        let Ok(handle) =
+            (unsafe { CreateMutexW(None, false, w!("Local\\DoubaoVoiceClient.SingleInstance")) })
+        else {
+            return true;
+        };
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            if let Ok(settings) =
+                unsafe { FindWindowW(w!("DoubaoVoiceClientSettings"), w!("Doubao Voice Client")) }
+            {
+                unsafe {
+                    let _ = ShowWindow(settings, SW_SHOW);
+                    let _ = SetForegroundWindow(settings);
+                }
+            }
+            return false;
+        }
+        INSTANCE_MUTEX.store(handle.0 as isize, Ordering::Release);
+        true
     }
 
     pub fn configure_overlay(window: &Window) {
@@ -610,6 +649,7 @@ mod platform {
         start_backdrop_thread(hwnd.0 as isize, backdrop.0 as isize);
         start_hotkey_thread(hwnd.0 as isize);
         start_hold_key_thread(hwnd.0 as isize);
+        super::windows_shell::start(hwnd);
     }
 
     fn create_backdrop_window(overlay: HWND) -> HWND {
@@ -744,20 +784,9 @@ mod platform {
         clear_voice_activity();
         set_dark_background(sample_dark_background(hwnd));
         show_phase(hwnd, OverlayPhase::Activating);
-        if let Err(error) = start_voice_client(generation) {
+        if let Err(error) = start_voice_client(generation, hwnd.0 as isize) {
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
         }
-    }
-
-    fn project_root() -> Option<PathBuf> {
-        let executable = std::env::current_exe().ok()?;
-        let mut directory = executable.parent()?.to_path_buf();
-        for _ in 0..4 {
-            if !directory.pop() {
-                return None;
-            }
-        }
-        Some(directory)
     }
 
     fn voice_client_log_path() -> PathBuf {
@@ -774,99 +803,17 @@ mod platform {
         }
     }
 
-    fn start_voice_client_output_thread<R>(
-        stream: R,
-        parse_audio_levels: bool,
-        parse_speech_activity: bool,
-        bridge_generation: Option<u64>,
-    ) where
-        R: Read + Send + 'static,
-    {
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stream);
-            let mut log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(voice_client_log_path())
-                .ok();
-
-            loop {
-                let mut buffer = Vec::new();
-                match reader.read_until(b'\n', &mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                if parse_audio_levels {
-                    let line = String::from_utf8_lossy(&buffer);
-                    if let Some(level) = voice_activity_from_audio_line(line.trim()) {
-                        set_voice_activity(level);
-                        if is_strong_voice_activity_line(line.trim()) {
-                            mark_speech_activity();
-                        }
-                    }
-                }
-                if parse_speech_activity {
-                    let line = String::from_utf8_lossy(&buffer);
-                    if is_partial_speech_line(line.trim()) {
-                        mark_speech_activity();
-                    }
-                }
-                if let Some(generation) = bridge_generation {
-                    let line = String::from_utf8_lossy(&buffer);
-                    if overlay_generation() == generation
-                        && let Some(phase) = overlay_phase_from_bridge_line(line.trim())
-                        && matches!(
-                            overlay_phase(),
-                            OverlayPhase::Activating | OverlayPhase::Listening
-                        )
-                    {
-                        if phase == OverlayPhase::Listening {
-                            clear_voice_activity();
-                        }
-                        set_overlay_phase(phase);
-                    }
-                }
-                if let Some(log) = log.as_mut() {
-                    let _ = log.write_all(&buffer);
-                }
-            }
-
-            if parse_audio_levels {
-                set_voice_activity(0.0);
-            }
-            if parse_speech_activity {
-                clear_voice_activity();
-            }
-        });
-    }
-
-    fn start_voice_client(generation: u64) -> Result<(), String> {
+    fn start_voice_client(generation: u64, hwnd_value: isize) -> Result<(), String> {
         let mut active = VOICE_CLIENT
             .lock()
             .map_err(|_| "voice client lock is poisoned".to_string())?;
-        if let Some(process) = active.as_mut() {
-            match process.child.try_wait() {
-                Ok(None) => return Ok(()),
-                Ok(Some(_)) => {}
-                Err(error) => return Err(format!("could not inspect previous client: {error}")),
-            }
+        if active
+            .as_ref()
+            .is_some_and(|session| !session.is_finished())
+        {
+            return Ok(());
         }
         active.take();
-
-        let root = project_root().ok_or_else(|| "could not locate project root".to_string())?;
-        let script = root.join("clients").join("doubao_remote.py");
-        if !script.is_file() {
-            return Err(format!("missing client script: {}", script.display()));
-        }
-
-        let server = std::env::var("DOUBAO_BRIDGE_SERVER")
-            .unwrap_or_else(|_| "100.116.241.81:4387".to_string());
-        let audio_host = server
-            .rsplit_once(':')
-            .map(|(host, _)| host)
-            .filter(|host| !host.is_empty())
-            .ok_or_else(|| format!("invalid DOUBAO_BRIDGE_SERVER: {server}"))?;
-        let input_file = std::env::var_os("DOUBAO_VOICE_INPUT_FILE").map(PathBuf::from);
 
         OpenOptions::new()
             .create(true)
@@ -874,72 +821,59 @@ mod platform {
             .truncate(true)
             .open(voice_client_log_path())
             .map_err(|error| format!("could not open voice client log: {error}"))?;
-
-        let mut child = Command::new("py");
-        child
-            .env("PYTHONUNBUFFERED", "1")
-            .arg("-3")
-            .arg(script)
-            .arg("--server")
-            .arg(&server)
-            .arg("--udp-host")
-            .arg(audio_host)
-            .arg("--udp-port")
-            .arg("5004")
-            .arg("--audio-transport")
-            .arg("tcp");
-        if let Some(input_file) = input_file {
-            child
-                .arg("--input-file")
-                .arg(input_file)
-                .arg("--no-loop-input");
-        }
-        child
-            .arg("record")
-            .arg("--audio-start-delay")
-            .arg("0.2")
-            .arg("--audio-stop-delay")
-            .arg("0.5")
-            .arg("--recording-timeout")
-            .arg("15")
-            .arg("--final-timeout")
-            .arg("8")
-            .arg("--stdin-stop")
-            .arg("--python-tcp-audio")
-            .arg("--paste")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW);
-
-        let mut child = child
-            .spawn()
-            .map_err(|error| format!("could not launch Python client: {error}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Python client stdin was not piped".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Python client stdout was not piped".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "Python client stderr was not piped".to_string())?;
-        start_voice_client_output_thread(stdout, false, true, None);
-        start_voice_client_output_thread(stderr, true, false, Some(generation));
-        *active = Some(VoiceClientProcess { child, stdin });
+        let mut config = NativeVoiceConfig::from_environment()?;
+        config.clipboard_owner = hwnd_value;
+        let session = NativeVoiceSession::start(config, move |event| {
+            if overlay_generation() != generation {
+                return;
+            }
+            match event {
+                NativeVoiceEvent::Phase(phase) => match phase.as_str() {
+                    "arming" | "voice_retry" => set_overlay_phase(OverlayPhase::Activating),
+                    "recording" => {
+                        clear_voice_activity();
+                        set_overlay_phase(OverlayPhase::Listening);
+                    }
+                    "optimizing" => set_overlay_phase(OverlayPhase::Optimizing),
+                    _ => {}
+                },
+                NativeVoiceEvent::Partial(text) => {
+                    if !text.trim().is_empty() {
+                        mark_speech_activity();
+                    }
+                }
+                NativeVoiceEvent::AudioLevel {
+                    rms_dbfs,
+                    peak_dbfs,
+                } => {
+                    let level = voice_activity_from_levels(rms_dbfs, peak_dbfs);
+                    set_voice_activity(level);
+                    if rms_dbfs >= VOICE_ONSET_RMS_DBFS && peak_dbfs >= VOICE_ONSET_PEAK_DBFS {
+                        mark_speech_activity();
+                    }
+                }
+                NativeVoiceEvent::Error(error) => {
+                    append_voice_client_log(&format!("[native-client] {error}\n"));
+                }
+                NativeVoiceEvent::Finished => {
+                    clear_voice_activity();
+                    hide_overlay(HWND(hwnd_value as *mut c_void));
+                }
+            }
+        })?;
+        *active = Some(session);
         Ok(())
     }
 
-    fn stop_voice_client() -> Option<Child> {
-        let mut active = VOICE_CLIENT.lock().ok()?;
-        let mut process = active.take()?;
-        let _ = process.stdin.write_all(b"stop\n");
-        let _ = process.stdin.flush();
-        drop(process.stdin);
-        Some(process.child)
+    fn stop_voice_client() -> bool {
+        let Ok(active) = VOICE_CLIENT.lock() else {
+            return false;
+        };
+        let Some(session) = active.as_ref() else {
+            return false;
+        };
+        session.request_stop();
+        true
     }
 
     fn sample_dark_background(hwnd: HWND) -> bool {
@@ -1235,15 +1169,7 @@ mod platform {
         clear_voice_activity();
         show_phase(hwnd, OverlayPhase::Optimizing);
         let hwnd_value = hwnd.0 as isize;
-        if let Some(mut client) = stop_voice_client() {
-            thread::spawn(move || {
-                let _ = client.wait();
-                if overlay_generation() == generation && overlay_phase() == OverlayPhase::Optimizing
-                {
-                    hide_overlay(HWND(hwnd_value as *mut c_void));
-                }
-            });
-        } else {
+        if !stop_voice_client() {
             thread::spawn(move || {
                 thread::sleep(OPTIMIZING_DURATION);
                 if overlay_generation() == generation && overlay_phase() == OverlayPhase::Optimizing
@@ -1293,7 +1219,7 @@ mod platform {
             let mut activated = false;
 
             loop {
-                let is_down = unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0 };
+                let is_down = unsafe { GetAsyncKeyState(VK_LCONTROL.0 as i32) < 0 };
 
                 if is_down {
                     let started = pressed_at.get_or_insert_with(Instant::now);

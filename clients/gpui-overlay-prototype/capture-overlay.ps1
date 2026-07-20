@@ -23,7 +23,7 @@ public static class OverlayDiagnostics {
 }
 "@
 
-$process = Get-Process gpui-overlay-prototype -ErrorAction Stop
+$process = Get-Process DoubaoVoiceClient -ErrorAction Stop
 $hwnd = $process.MainWindowHandle
 $rect = New-Object OverlayDiagnostics+RECT
 [void][OverlayDiagnostics]::GetWindowRect($hwnd, [ref]$rect)
