@@ -199,7 +199,17 @@ final class CaptureTextView: NSTextView {
     }
 }
 
-final class TextCaptureWindow: NSObject, NSTextViewDelegate {
+struct VoiceInputReadiness {
+    static func isReady(doubaoUIActive: Bool, captureFocused: Bool) -> Bool {
+        doubaoUIActive && captureFocused
+    }
+
+    static func needsRecovery(shortcutActive: Bool, captureFocused: Bool) -> Bool {
+        shortcutActive && !captureFocused
+    }
+}
+
+final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
     private let window: NSWindow
     private let textView: CaptureTextView
     private var partialObservationTimer: Timer?
@@ -208,6 +218,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
     private var lastPartialEmitTime = Date.distantPast
     var onChange: ((String, String) -> Void)?
     var onPartial: ((String) -> Void)?
+    var onCaptureUnavailable: ((String) -> Void)?
 
     init(showWindow: Bool) {
         let rect = showWindow
@@ -223,6 +234,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
         window.title = "Doubao Voice Bridge Capture"
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isReleasedWhenClosed = false
 
         let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: rect.width, height: rect.height))
         scrollView.hasVerticalScroller = true
@@ -240,6 +252,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
         window.contentView = scrollView
 
         super.init()
+        window.delegate = self
         textView.delegate = self
         textView.onMarkedTextChange = { [weak self] in
             self?.emitPartialIfChanged()
@@ -257,20 +270,20 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
     }
 
     func ensureVoiceInputUIActive(reason: String) {
-        guard !isVoiceInputUIActive else {
+        guard !isReadyForVoiceInput else {
             return
         }
 
         activateVoiceInputUI(reason: reason)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self, !self.isVoiceInputUIActive else {
+            guard let self, !self.isReadyForVoiceInput else {
                 return
             }
             self.activateVoiceInputUI(reason: "\(reason) retry")
         }
     }
 
-    private var isVoiceInputUIActive: Bool {
+    var isReadyForVoiceInput: Bool {
         NSRunningApplication.current.isActive
             && window.isKeyWindow
             && window.firstResponder === textView
@@ -286,7 +299,26 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate {
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         window.makeMain()
-        window.makeFirstResponder(textView)
+        let focused = window.makeFirstResponder(textView)
+        print("[voice-ui] activation result focused=\(focused) ready=\(isReadyForVoiceInput)")
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        print("[voice-ui] capture window close requested; preserving input target")
+        sender.orderOut(nil)
+        DispatchQueue.main.async { [weak self] in
+            self?.onCaptureUnavailable?("capture window closed")
+        }
+        return false
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.isReadyForVoiceInput else {
+                return
+            }
+            self.onCaptureUnavailable?("capture window resigned key")
+        }
     }
 
     func diagnosticSnapshot() -> [String: Any] {
@@ -1498,6 +1530,7 @@ final class Bridge {
     private var voiceActivationAttempt = 0
     private var audioLevelGeneration = 0
     private var appActivationObserver: NSObjectProtocol?
+    private var captureRecoveryInProgress = false
     private(set) var isRecording = false
     var emit: (([String: Any]) -> Void)?
 
@@ -1519,15 +1552,18 @@ final class Bridge {
         self.audioReceiver = audioReceiver
         self.audioDeviceManager = audioDeviceManager
         self.defaultInputRecoveryStore = defaultInputRecoveryStore
+        captureWindow.onCaptureUnavailable = { [weak self] reason in
+            self?.recoverCaptureFocusIfNeeded(reason: reason)
+        }
         appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, self.isRecording else {
+            guard let self else {
                 return
             }
-            self.captureWindow.ensureVoiceInputUIActive(reason: "foreground app changed during recording")
+            self.recoverCaptureFocusIfNeeded(reason: "foreground app changed during recording")
         }
     }
 
@@ -1543,6 +1579,7 @@ final class Bridge {
             voiceActivationGeneration += 1
             audioLevelGeneration += 1
             voiceActivationAttempt = 0
+            captureRecoveryInProgress = false
             try switchDefaultInputForRemoteSession()
             try audioReceiver.start()
             audioReceiver.resetAudioLevel()
@@ -1568,6 +1605,7 @@ final class Bridge {
         print("[session] stop requested")
         voiceActivationGeneration += 1
         audioLevelGeneration += 1
+        captureRecoveryInProgress = false
         logDiagnostics("before stop shortcut")
         emitVoiceState("before stop shortcut")
         emitFocusState("before stop shortcut")
@@ -1771,9 +1809,14 @@ final class Bridge {
             return
         }
 
+        captureWindow.ensureVoiceInputUIActive(reason: "voice activation check")
         let snapshot = emitVoiceState("voice activation check attempt \(voiceActivationAttempt + 1)")
-        if snapshot["likelyVoiceUIActive"] as? Bool == true {
-            captureWindow.ensureVoiceInputUIActive(reason: "recording confirmed")
+        let doubaoUIActive = snapshot["likelyVoiceUIActive"] as? Bool == true
+        if VoiceInputReadiness.isReady(
+            doubaoUIActive: doubaoUIActive,
+            captureFocused: captureWindow.isReadyForVoiceInput
+        ) {
+            captureRecoveryInProgress = false
             emit?(["type": "status", "recording": true, "phase": "recording"])
             startAudioLevelReporting(generation: generation)
             return
@@ -1781,7 +1824,7 @@ final class Bridge {
 
         if voiceActivationAttempt < config.voiceActivationRetries {
             voiceActivationAttempt += 1
-            print("[voice-state] voice UI not active; retry \(voiceActivationAttempt)/\(config.voiceActivationRetries)")
+            print("[voice-state] voice input not ready doubaoUI=\(doubaoUIActive) captureFocused=\(captureWindow.isReadyForVoiceInput); retry \(voiceActivationAttempt)/\(config.voiceActivationRetries)")
             emit?([
                 "type": "status",
                 "recording": true,
@@ -1837,9 +1880,70 @@ final class Bridge {
             else {
                 return
             }
-            self.captureWindow.ensureVoiceInputUIActive(reason: "recording watchdog")
+            if VoiceInputReadiness.needsRecovery(
+                shortcutActive: self.isRecording,
+                captureFocused: self.captureWindow.isReadyForVoiceInput
+            ) {
+                self.recoverCaptureFocusIfNeeded(reason: "recording watchdog")
+                return
+            }
             self.emitAudioLevel(label: "recording interval", reset: true)
             self.scheduleAudioLevelReport(voiceGeneration: voiceGeneration, levelGeneration: levelGeneration)
+        }
+    }
+
+    private func recoverCaptureFocusIfNeeded(reason: String) {
+        guard VoiceInputReadiness.needsRecovery(
+            shortcutActive: isRecording,
+            captureFocused: captureWindow.isReadyForVoiceInput
+        ), !captureRecoveryInProgress else {
+            return
+        }
+
+        captureRecoveryInProgress = true
+        let generation = voiceActivationGeneration
+        print("[voice-ui] capture focus lost reason=\(reason); rearming voice input")
+        emit?(["type": "status", "recording": true, "phase": "arming"])
+        captureWindow.ensureVoiceInputUIActive(reason: reason)
+        scheduleCaptureRecovery(generation: generation, attempt: 0)
+    }
+
+    private func scheduleCaptureRecovery(generation: Int, attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self,
+                  generation == self.voiceActivationGeneration,
+                  self.captureRecoveryInProgress
+            else {
+                return
+            }
+
+            guard self.captureWindow.isReadyForVoiceInput else {
+                if attempt < self.config.voiceActivationRetries {
+                    self.captureWindow.ensureVoiceInputUIActive(reason: "capture recovery retry")
+                    self.scheduleCaptureRecovery(generation: generation, attempt: attempt + 1)
+                    return
+                }
+
+                print("[voice-ui] capture focus recovery failed")
+                self.releaseVoiceShortcutIfNeeded()
+                self.captureRecoveryInProgress = false
+                self.audioReceiver.stop()
+                self.restoreDefaultInputIfNeeded()
+                self.emit?([
+                    "type": "error",
+                    "message": "Voice input capture window could not regain focus",
+                    "phase": "voice_activation_failed"
+                ])
+                self.emit?(["type": "status", "recording": false, "phase": "idle"])
+                return
+            }
+
+            self.releaseVoiceShortcutIfNeeded()
+            self.captureRecoveryInProgress = false
+            self.voiceActivationAttempt = 0
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.config.voiceActivationRetryDelay) { [weak self] in
+                self?.beginVoiceActivation(generation: generation)
+            }
         }
     }
 
