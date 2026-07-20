@@ -980,6 +980,13 @@ final class CoreAudioDeviceManager {
         guard status == noErr else {
             throw BridgeError.message("Set default input device failed: \(status)")
         }
+
+        let selectedDeviceID = try defaultInputDevice()
+        guard selectedDeviceID == deviceID else {
+            throw BridgeError.message(
+                "Default input verification failed: requested \(deviceID), selected \(selectedDeviceID)"
+            )
+        }
     }
 
     func findInputDevice(matching query: String) throws -> AudioDeviceInfo {
@@ -2059,15 +2066,15 @@ do {
     let config = try Config.parse()
     let audioDeviceManager = CoreAudioDeviceManager()
     let defaultInputRecoveryStore = DefaultInputRecoveryStore()
+    if config.listAudioDevices {
+        try audioDeviceManager.printDevices()
+        exit(0)
+    }
     if config.restoreDefaultInput {
         recoverDefaultInputAtStartup(
             audioDeviceManager: audioDeviceManager,
             recoveryStore: defaultInputRecoveryStore
         )
-    }
-    if config.listAudioDevices {
-        try audioDeviceManager.printDevices()
-        exit(0)
     }
 
     let hotKey = try parseHotKey(config.voiceShortcut)
