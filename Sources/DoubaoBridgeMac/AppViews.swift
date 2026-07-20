@@ -130,18 +130,13 @@ struct SetupAssistantView: View {
         case .audio:
             SetupPage(
                 title: "Check Audio Routing",
-                subtitle: "Remote microphone audio is played into the virtual device selected below.",
+                subtitle: "Remote microphone audio is sent directly to the virtual device through CoreAudio.",
                 symbol: "waveform"
             ) {
                 ReadinessRow(
                     title: model.preferences.virtualAudioDevice,
                     detail: model.readiness.virtualAudioAvailable ? "Available" : "Not found",
                     isReady: model.readiness.virtualAudioAvailable
-                )
-                ReadinessRow(
-                    title: "FFmpeg",
-                    detail: model.readiness.ffmpegAvailable ? "Available" : "Not found in PATH",
-                    isReady: model.readiness.ffmpegAvailable
                 )
                 Text("The bridge switches the default Mac input only while a remote session is active, then restores the physical microphone.")
                     .foregroundStyle(.secondary)
@@ -431,8 +426,8 @@ struct BridgeSettingsView: View {
                     isReady: model.readiness.virtualAudioAvailable
                 )
                 ReadinessRow(
-                    title: "FFmpeg",
-                    detail: model.readiness.ffmpegAvailable ? "Available" : "Missing",
+                    title: "Legacy FFmpeg path",
+                    detail: model.readiness.ffmpegAvailable ? "Available" : "Optional",
                     isReady: model.readiness.ffmpegAvailable
                 )
             }

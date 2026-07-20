@@ -10,14 +10,14 @@ struct Config {
     var udpPort: UInt16 = 5004
     var audioTransport = "tcp"
     var audioDeviceIndex: Int = 3
-    var audioDeviceName: String? = "Soundflower (2ch)"
+    var audioDeviceName: String? = "BlackHole 2ch"
     var ffmpegPath = "ffmpeg"
     var token: String?
     var voiceShortcut = "fn"
     var voiceShortcutMode = "hold"
     var audioSourceCommand: String?
     var inputSourceID = "com.bytedance.inputmethod.doubaoime.pinyin"
-    var remoteInputDeviceName: String? = "Soundflower (2ch)"
+    var remoteInputDeviceName: String? = "BlackHole 2ch"
     var restoreDefaultInput = true
     var listAudioDevices = false
     var startupDelay: TimeInterval = 0.3
@@ -1057,6 +1057,22 @@ final class CoreAudioDeviceManager {
         throw BridgeError.message("Input device not found: \(query)")
     }
 
+    func findOutputDevice(matching query: String) throws -> AudioDeviceInfo {
+        let normalized = query.lowercased()
+        let outputDevices = try devices().filter { $0.outputChannels > 0 }
+        if let exact = outputDevices.first(where: {
+            $0.name.lowercased() == normalized || $0.uid.lowercased() == normalized
+        }) {
+            return exact
+        }
+        if let partial = outputDevices.first(where: {
+            $0.name.lowercased().contains(normalized) || $0.uid.lowercased().contains(normalized)
+        }) {
+            return partial
+        }
+        throw BridgeError.message("Output device not found: \(query)")
+    }
+
     func inputDevice(id: AudioDeviceID) throws -> AudioDeviceInfo {
         guard let device = try devices().first(where: {
             $0.id == id && $0.inputChannels > 0
@@ -1177,6 +1193,7 @@ func recoverDefaultInputAtStartup(
 final class AudioReceiver {
     struct AudioLevelSnapshot {
         let bytes: UInt64
+        let droppedBytes: UInt64
         let packets: UInt64
         let peak: Int16
         let rmsDBFS: Double
@@ -1185,6 +1202,7 @@ final class AudioReceiver {
         var dictionary: [String: Any] {
             [
                 "bytes": bytes,
+                "droppedBytes": droppedBytes,
                 "packets": packets,
                 "peak": peak,
                 "rmsDBFS": rmsDBFS,
@@ -1203,13 +1221,14 @@ final class AudioReceiver {
     private var sourceProcess: Process?
     private var processErrorPipe: Pipe?
     private var sourceErrorPipe: Pipe?
-    private var tcpInputPipe: Pipe?
+    private var realtimeOutput: RealtimeAudioOutput?
     private var tcpListener: NWListener?
     private var tcpConnections: [NWConnection] = []
     private let tcpQueue = DispatchQueue(label: "doubao.bridge.audio.tcp")
     private let tcpQueueKey = DispatchSpecificKey<Bool>()
     private var tcpIsStopping = false
     private var levelBytes: UInt64 = 0
+    private var droppedAudioBytes: UInt64 = 0
     private var levelPackets: UInt64 = 0
     private var levelSumSquares: Double = 0
     private var levelSamples: UInt64 = 0
@@ -1248,7 +1267,26 @@ final class AudioReceiver {
     }
 
     func start() throws {
-        if process?.isRunning == true {
+        if process?.isRunning == true || realtimeOutput != nil {
+            return
+        }
+
+        if audioSourceCommand == nil, audioTransport == "tcp" {
+            guard let audioDeviceName else {
+                throw BridgeError.message("TCP audio requires a named output device")
+            }
+            let device = try CoreAudioDeviceManager().findOutputDevice(matching: audioDeviceName)
+            let output = RealtimeAudioOutput()
+            do {
+                try output.start(deviceID: device.id)
+                realtimeOutput = output
+                try startTCPAudioServer()
+                print("[audio] native CoreAudio output started device=\(device.name) id=\(device.id)")
+            } catch {
+                output.stop()
+                realtimeOutput = nil
+                throw error
+            }
             return
         }
 
@@ -1259,6 +1297,10 @@ final class AudioReceiver {
             ffmpegPath,
             "-hide_banner",
             "-loglevel", "warning",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-probesize", "32",
+            "-analyzeduration", "0",
         ]
 
         if let audioSourceCommand {
@@ -1287,17 +1329,6 @@ final class AudioReceiver {
                 "-ac", "1",
                 "-i", "-"
             ]
-        } else if audioTransport == "tcp" {
-            let pipe = Pipe()
-            tcpInputPipe = pipe
-            process.standardInput = pipe.fileHandleForReading
-
-            arguments += [
-                "-f", "s16le",
-                "-ar", "48000",
-                "-ac", "1",
-                "-i", "-"
-            ]
         } else {
             let extraInputArguments: [String]
             let inputURL: String
@@ -1310,10 +1341,6 @@ final class AudioReceiver {
             }
 
             arguments += [
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-probesize", "32",
-            "-analyzeduration", "0",
             "-f", "s16le",
             "-ar", "48000",
             "-ac", "1",
@@ -1325,6 +1352,7 @@ final class AudioReceiver {
         arguments += [
             "-ac", "2",
             "-ar", "48000",
+            "-flush_packets", "1",
             "-f", "audiotoolbox",
             "-audio_device_index", "\(selectedAudioDeviceIndex)",
             "-"
@@ -1340,9 +1368,13 @@ final class AudioReceiver {
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             print("[audio-ffmpeg stderr] \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
-        process.terminationHandler = { _ in
+        process.terminationHandler = { [weak self] process in
             errorPipe.fileHandleForReading.readabilityHandler = nil
             print("[audio] ffmpeg exited status=\(process.terminationStatus)")
+            self?.tcpQueue.async { [weak self] in
+                guard let self, !self.tcpIsStopping else { return }
+                self.stopTCPAudioServerOnQueue()
+            }
         }
 
         try process.run()
@@ -1350,9 +1382,6 @@ final class AudioReceiver {
         self.process = process
         self.processErrorPipe = errorPipe
 
-        if audioSourceCommand == nil && audioTransport == "tcp" {
-            try startTCPAudioServer()
-        }
     }
 
     private func resolvedAudioDeviceIndex() throws -> Int {
@@ -1389,6 +1418,8 @@ final class AudioReceiver {
 
     func stop() {
         stopTCPAudioServer()
+        realtimeOutput?.stop()
+        realtimeOutput = nil
         guard let process else {
             return
         }
@@ -1451,7 +1482,12 @@ final class AudioReceiver {
             }
             if let data, !data.isEmpty {
                 self.ingestAudioLevel(data)
-                self.tcpInputPipe?.fileHandleForWriting.write(data)
+                guard let output = self.realtimeOutput else {
+                    connection.cancel()
+                    self.tcpConnections.removeAll { $0 === connection }
+                    return
+                }
+                self.droppedAudioBytes += output.enqueueS16LE(data)
             }
             if isComplete || error != nil {
                 connection.cancel()
@@ -1480,12 +1516,11 @@ final class AudioReceiver {
             connection.cancel()
         }
         tcpConnections.removeAll()
-        tcpInputPipe?.fileHandleForWriting.closeFile()
-        tcpInputPipe = nil
     }
 
     private func resetAudioLevelOnQueue() {
         levelBytes = 0
+        droppedAudioBytes = 0
         levelPackets = 0
         levelSumSquares = 0
         levelSamples = 0
@@ -1504,6 +1539,7 @@ final class AudioReceiver {
         let peakDBFS = 20 * log10(Double(peak) / 32768.0)
         let snapshot = AudioLevelSnapshot(
             bytes: levelBytes,
+            droppedBytes: droppedAudioBytes,
             packets: levelPackets,
             peak: levelPeak,
             rmsDBFS: max(rmsDBFS, -120.0),
@@ -1617,6 +1653,7 @@ final class Bridge {
             }
         } catch {
             restoreDefaultInputIfNeeded()
+            fputs("[session] start failed: \(error)\n", stderr)
             emit?(["type": "error", "message": "\(error)"])
         }
     }
@@ -2285,7 +2322,7 @@ func runApplication() throws {
     print("Audio transport: \(config.audioTransport)")
     print("Bundle identifier: \(Bundle.main.bundleIdentifier ?? "(none)")")
     if let audioDeviceName = config.audioDeviceName ?? config.remoteInputDeviceName {
-        print("AudioToolbox output device: \(audioDeviceName)")
+        print("CoreAudio output device: \(audioDeviceName)")
     } else {
         print("AudioToolbox output index: \(config.audioDeviceIndex)")
     }

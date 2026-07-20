@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
@@ -26,9 +25,6 @@ const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
 const AUDIO_START_DELAY: Duration = Duration::from_millis(200);
 const AUDIO_STOP_SILENCE: Duration = Duration::from_millis(500);
-const AUDIO_TAIL_SECONDS: usize = 1;
-const AUDIO_REPLAY_TAIL_MS: usize = 500;
-const BYTES_PER_SECOND: usize = 48_000 * 2;
 const CF_UNICODETEXT: u32 = 13;
 
 #[derive(Clone, Debug)]
@@ -179,7 +175,6 @@ where
         let stream = start_microphone(config.input_device.as_deref(), audio_tx, audio_error_tx)?;
         let mut latest_text = String::new();
         let mut final_text = String::new();
-        let mut tail = VecDeque::with_capacity(BYTES_PER_SECOND * AUDIO_TAIL_SECONDS);
 
         loop {
             drain_bridge_events(&bridge_rx, notify, &mut latest_text, &mut final_text)?;
@@ -196,7 +191,6 @@ where
                         rms_dbfs: chunk.rms_dbfs,
                         peak_dbfs: chunk.peak_dbfs,
                     });
-                    remember_tail(&mut tail, &chunk.pcm);
                     audio_socket
                         .write_all(&chunk.pcm)
                         .map_err(|error| format!("audio connection failed: {error}"))?;
@@ -210,12 +204,10 @@ where
 
         drop(stream);
         while let Ok(chunk) = audio_rx.try_recv() {
-            remember_tail(&mut tail, &chunk.pcm);
             audio_socket
                 .write_all(&chunk.pcm)
                 .map_err(|error| format!("audio connection failed while stopping: {error}"))?;
         }
-        replay_tail(&mut audio_socket, &tail)?;
         write_command(&mut control, "stop")?;
         stop_sent = true;
         send_silence(&mut audio_socket, AUDIO_STOP_SILENCE)?;
@@ -465,23 +457,6 @@ fn write_command(stream: &mut TcpStream, command: &str) -> Result<(), String> {
     stream
         .write_all(format!("{command}\n").as_bytes())
         .map_err(|error| format!("could not send bridge command: {error}"))
-}
-
-fn remember_tail(tail: &mut VecDeque<u8>, chunk: &[u8]) {
-    tail.extend(chunk);
-    let limit = BYTES_PER_SECOND * AUDIO_TAIL_SECONDS;
-    while tail.len() > limit {
-        tail.pop_front();
-    }
-}
-
-fn replay_tail(stream: &mut TcpStream, tail: &VecDeque<u8>) -> Result<(), String> {
-    let wanted = BYTES_PER_SECOND * AUDIO_REPLAY_TAIL_MS / 1_000;
-    let skip = tail.len().saturating_sub(wanted);
-    let bytes: Vec<u8> = tail.iter().skip(skip).copied().collect();
-    stream
-        .write_all(&bytes)
-        .map_err(|error| format!("could not send audio tail: {error}"))
 }
 
 fn send_silence(stream: &mut TcpStream, duration: Duration) -> Result<(), String> {

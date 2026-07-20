@@ -9,17 +9,17 @@ The current working path is:
 
 ```text
 Linux/Windows client
-  -> ffmpeg captures microphone or replays a fixture file
+  -> native client captures the microphone as 48 kHz PCM
   -> raw PCM over TCP to the Mac
-  -> Mac bridge plays PCM into Soundflower
-  -> Doubao IME listens to Soundflower
+  -> Mac bridge writes PCM to BlackHole through CoreAudio
+  -> Doubao IME listens to BlackHole
   -> Doubao commits text into a dedicated capture NSTextView
   -> Mac bridge streams text/final events back to the client
 ```
 
 ## Mac Setup
 
-1. Install a virtual audio device. The tested device is `Soundflower (2ch)`.
+1. Install `BlackHole 2ch` with `brew install blackhole-2ch`, then restart macOS.
 2. Set Doubao microphone to `自动检测`.
 3. Set Doubao voice input shortcut to long-press `fn`.
 4. Grant Accessibility permission to the app or terminal running the bridge.
@@ -33,7 +33,7 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac --list-audio-devices
 
 On the current Mac:
 
-- Soundflower AudioToolbox output is resolved by name because numeric indexes
+- BlackHole CoreAudio output is resolved by name because numeric identifiers
   change when audio devices are installed or removed.
 - Doubao input source: `com.bytedance.inputmethod.doubaoime.pinyin`
 - Doubao app bundle: `com.bytedance.inputmethod.doubaoime`
@@ -59,7 +59,7 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac --help
 
 For normal use, double-click `dist/DoubaoVoiceBridge.app`. The app runs in the
 menu bar without a Terminal or Dock icon. On first launch, its setup assistant
-checks Accessibility permission, Doubao, Soundflower, FFmpeg, and the Windows
+checks Accessibility permission, Doubao, BlackHole, and the Windows
 connection. Settings and diagnostics remain available from the menu-bar icon.
 
 ## Run Mac Bridge
@@ -67,7 +67,7 @@ connection. Settings and diagnostics remain available from the menu-bar icon.
 The packaged app now uses the tested configuration by default:
 
 - TCP control on `4387` and TCP audio on `5004`
-- `Soundflower (2ch)` for virtual audio and temporary default input
+- `BlackHole 2ch` for virtual audio and temporary default input
 - long-press Fn for Doubao activation
 - automatic physical-microphone restoration
 - an off-screen capture window
@@ -80,8 +80,8 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
   --port 4387 \
   --udp-port 5004 \
   --audio-transport tcp \
-  --audio-device-name "Soundflower (2ch)" \
-  --remote-input-device "Soundflower (2ch)" \
+  --audio-device-name "BlackHole 2ch" \
+  --remote-input-device "BlackHole 2ch" \
   --voice-shortcut fn \
   --voice-shortcut-mode hold \
   --startup-delay 0.3 \
@@ -90,7 +90,7 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
   --voice-activation-retry-delay 0.25
 ```
 
-With `--remote-input-device`, the bridge temporarily switches macOS default input to Soundflower when a session starts, then restores the previous input device after stop.
+With `--remote-input-device`, the bridge temporarily switches macOS default input to BlackHole when a session starts, then restores the previous input device after stop.
 
 Before switching, the bridge atomically records the original and remote CoreAudio
 device UIDs in:
@@ -240,7 +240,7 @@ python3 clients/doubao_remote.py --server MAC_IP:4387 send test-hotkey
 
 ## Notes
 
-- The stable short-term audio transport is TCP with the remote `ffmpeg` process connecting directly to the Mac audio port.
-- `--python-tcp-audio` exists as an experimental client-side proxy path, but it is not the default.
+- The production audio transport is TCP: the native Windows client sends 48 kHz mono PCM directly to the Mac's CoreAudio output.
+- FFmpeg and `--python-tcp-audio` remain diagnostic paths and are not used by the normal Windows application.
 - Doubao first inserts ASR text as marked text in the capture text view. Releasing `fn` commits it to normal text.
 - If `voice_state` is active and `audio_level` is strong but no text appears, the failure is inside Doubao recognition/commit behavior, not network audio or focus routing.

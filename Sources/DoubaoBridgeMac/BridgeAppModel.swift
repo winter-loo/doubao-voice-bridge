@@ -57,7 +57,6 @@ struct AppReadiness: Equatable {
         accessibilityGranted
             && doubaoInputAvailable
             && virtualAudioAvailable
-            && ffmpegAvailable
     }
 }
 
@@ -117,12 +116,16 @@ final class BridgeAppModel: ObservableObject {
     }
 
     func refreshReadiness() {
+        let virtualAudioAvailable = (
+            try? (
+                audioDeviceManager.findInputDevice(matching: preferences.virtualAudioDevice),
+                audioDeviceManager.findOutputDevice(matching: preferences.virtualAudioDevice)
+            )
+        ) != nil
         readiness = AppReadiness(
             accessibilityGranted: AXIsProcessTrusted(),
             doubaoInputAvailable: controller.isInputSourceAvailable(),
-            virtualAudioAvailable: (try? audioDeviceManager.findInputDevice(
-                matching: preferences.virtualAudioDevice
-            )) != nil,
+            virtualAudioAvailable: virtualAudioAvailable,
             ffmpegAvailable: Self.executableIsAvailable(ffmpegPath)
         )
 
