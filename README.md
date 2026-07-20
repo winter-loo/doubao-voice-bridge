@@ -41,6 +41,12 @@ swift build -c release
 scripts/build-mac-app.sh
 ```
 
+The app build uses `DOUBAO_CODESIGN_IDENTITY` when set, otherwise it selects
+the first valid local code-signing identity. Stable signing keeps the macOS
+Accessibility grant valid across rebuilds. If identity signing is unavailable,
+the script falls back to ad-hoc signing with a stable designated requirement
+instead of binding the permission identity to the executable's changing hash.
+
 Prefer the app bundle for IME testing. It gives macOS and Doubao a stable app identity:
 
 ```bash
