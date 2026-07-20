@@ -10,6 +10,7 @@ struct Config {
     var udpPort: UInt16 = 5004
     var audioTransport = "udp"
     var audioDeviceIndex: Int = 3
+    var audioDeviceName: String?
     var ffmpegPath = "ffmpeg"
     var token: String?
     var voiceShortcut = "cmd+shift+d"
@@ -48,6 +49,8 @@ struct Config {
                 config.audioTransport = try takeValue(after: option)
             case "--audio-device-index":
                 config.audioDeviceIndex = Int(try takeValue(after: option)) ?? config.audioDeviceIndex
+            case "--audio-device-name":
+                config.audioDeviceName = try takeValue(after: option)
             case "--ffmpeg":
                 config.ffmpegPath = try takeValue(after: option)
             case "--token":
@@ -111,6 +114,7 @@ func printUsage() {
       --udp-port <port>              UDP raw PCM audio port. Default: 5004
       --audio-transport <udp|tcp>    Raw PCM push transport. Default: udp
       --audio-device-index <index>   AudioToolbox output index for the virtual device. Default: 3
+      --audio-device-name <name>     Resolve the AudioToolbox output index by device name
       --ffmpeg <path>                ffmpeg executable. Default: ffmpeg from PATH
       --token <token>                Optional TCP auth token
       --voice-shortcut <shortcut>    Doubao voice shortcut. Default: cmd+shift+d
@@ -775,6 +779,62 @@ struct AudioDeviceInfo {
     let outputChannels: Int
 }
 
+struct AudioToolboxDevice: Equatable {
+    let index: Int
+    let name: String
+    let uid: String
+}
+
+func parseAudioToolboxDevices(_ output: String) -> [AudioToolboxDevice] {
+    let pattern = #"\[(\d+)\]\s+(.+?),\s*([^,\r\n]+)$"#
+    guard let expression = try? NSRegularExpression(pattern: pattern) else {
+        return []
+    }
+
+    return output.split(whereSeparator: \.isNewline).compactMap { rawLine in
+        let line = String(rawLine)
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard let match = expression.firstMatch(in: line, range: range),
+              let indexRange = Range(match.range(at: 1), in: line),
+              let nameRange = Range(match.range(at: 2), in: line),
+              let uidRange = Range(match.range(at: 3), in: line),
+              let index = Int(line[indexRange])
+        else {
+            return nil
+        }
+
+        return AudioToolboxDevice(
+            index: index,
+            name: line[nameRange].trimmingCharacters(in: .whitespaces),
+            uid: line[uidRange].trimmingCharacters(in: .whitespaces)
+        )
+    }
+}
+
+func audioToolboxDeviceIndex(named query: String, in output: String) throws -> Int {
+    let normalized = query.lowercased()
+    let devices = parseAudioToolboxDevices(output)
+    if let exact = devices.first(where: {
+        $0.name.lowercased() == normalized || $0.uid.lowercased() == normalized
+    }) {
+        return exact.index
+    }
+
+    let partialMatches = devices.filter {
+        $0.name.lowercased().contains(normalized) || $0.uid.lowercased().contains(normalized)
+    }
+    if partialMatches.count == 1, let match = partialMatches.first {
+        return match.index
+    }
+
+    let available = devices.map { "[\($0.index)] \($0.name)" }.joined(separator: ", ")
+    if partialMatches.isEmpty {
+        throw BridgeError.message("AudioToolbox output device not found: \(query). Available: \(available)")
+    }
+    let matches = partialMatches.map { "[\($0.index)] \($0.name)" }.joined(separator: ", ")
+    throw BridgeError.message("AudioToolbox output device is ambiguous: \(query). Matches: \(matches)")
+}
+
 struct DefaultInputRecoveryRecord: Codable {
     let originalDeviceUID: String
     let originalDeviceName: String
@@ -1078,6 +1138,7 @@ final class AudioReceiver {
     private let udpPort: UInt16
     private let audioTransport: String
     private let audioDeviceIndex: Int
+    private let audioDeviceName: String?
     private let audioSourceCommand: String?
     private var process: Process?
     private var sourceProcess: Process?
@@ -1100,12 +1161,14 @@ final class AudioReceiver {
         udpPort: UInt16,
         audioTransport: String,
         audioDeviceIndex: Int,
+        audioDeviceName: String?,
         audioSourceCommand: String?
     ) {
         self.ffmpegPath = ffmpegPath
         self.udpPort = udpPort
         self.audioTransport = audioTransport
         self.audioDeviceIndex = audioDeviceIndex
+        self.audioDeviceName = audioDeviceName
         self.audioSourceCommand = audioSourceCommand
         tcpQueue.setSpecific(key: tcpQueueKey, value: true)
     }
@@ -1130,6 +1193,7 @@ final class AudioReceiver {
             return
         }
 
+        let selectedAudioDeviceIndex = try resolvedAudioDeviceIndex()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         var arguments = [
@@ -1203,7 +1267,7 @@ final class AudioReceiver {
             "-ac", "2",
             "-ar", "48000",
             "-f", "audiotoolbox",
-            "-audio_device_index", "\(audioDeviceIndex)",
+            "-audio_device_index", "\(selectedAudioDeviceIndex)",
             "-"
         ]
         process.arguments = arguments
@@ -1230,6 +1294,38 @@ final class AudioReceiver {
         if audioSourceCommand == nil && audioTransport == "tcp" {
             try startTCPAudioServer()
         }
+    }
+
+    private func resolvedAudioDeviceIndex() throws -> Int {
+        guard let audioDeviceName else {
+            return audioDeviceIndex
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            ffmpegPath,
+            "-hide_banner",
+            "-f", "lavfi",
+            "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", "0.01",
+            "-f", "audiotoolbox",
+            "-list_devices", "true",
+            "-"
+        ]
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        process.standardOutput = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+
+        let output = String(
+            data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        let index = try audioToolboxDeviceIndex(named: audioDeviceName, in: output)
+        print("[audio] resolved AudioToolbox output \(audioDeviceName) to index \(index)")
+        return index
     }
 
     func stop() {
@@ -1994,6 +2090,7 @@ do {
         udpPort: config.udpPort,
         audioTransport: config.audioTransport,
         audioDeviceIndex: config.audioDeviceIndex,
+        audioDeviceName: config.audioDeviceName ?? config.remoteInputDeviceName,
         audioSourceCommand: config.audioSourceCommand
     )
     let bridge = Bridge(
@@ -2022,7 +2119,11 @@ do {
     print("Doubao bridge listening on TCP \(config.port), audio \(config.udpPort)")
     print("Audio transport: \(config.audioTransport)")
     print("Bundle identifier: \(Bundle.main.bundleIdentifier ?? "(none)")")
-    print("AudioToolbox output index: \(config.audioDeviceIndex)")
+    if let audioDeviceName = config.audioDeviceName ?? config.remoteInputDeviceName {
+        print("AudioToolbox output device: \(audioDeviceName)")
+    } else {
+        print("AudioToolbox output index: \(config.audioDeviceIndex)")
+    }
     print("Doubao input source: \(config.inputSourceID)")
     if let remoteInputDeviceName = config.remoteInputDeviceName {
         print("Remote session default input override: \(remoteInputDeviceName)")
