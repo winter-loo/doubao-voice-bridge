@@ -8,27 +8,35 @@ import Network
 struct Config {
     var port: UInt16 = 4387
     var udpPort: UInt16 = 5004
-    var audioTransport = "udp"
+    var audioTransport = "tcp"
     var audioDeviceIndex: Int = 3
-    var audioDeviceName: String?
+    var audioDeviceName: String? = "Soundflower (2ch)"
     var ffmpegPath = "ffmpeg"
     var token: String?
-    var voiceShortcut = "cmd+shift+d"
-    var voiceShortcutMode = "toggle"
+    var voiceShortcut = "fn"
+    var voiceShortcutMode = "hold"
     var audioSourceCommand: String?
     var inputSourceID = "com.bytedance.inputmethod.doubaoime.pinyin"
-    var remoteInputDeviceName: String?
+    var remoteInputDeviceName: String? = "Soundflower (2ch)"
     var restoreDefaultInput = true
     var listAudioDevices = false
-    var startupDelay: TimeInterval = 0.6
+    var startupDelay: TimeInterval = 0.3
     var voiceActivationCheckDelay: TimeInterval = 1.0
     var voiceActivationRetries = 2
     var voiceActivationRetryDelay: TimeInterval = 0.25
     var finalDelay: TimeInterval = 1.8
-    var showWindow = true
+    var showWindow = false
 
     static func parse() throws -> Config {
         var config = Config()
+        let preferences = AppPreferences(defaults: .standard)
+        config.port = UInt16(exactly: preferences.controlPort) ?? config.port
+        config.udpPort = UInt16(exactly: preferences.audioPort) ?? config.udpPort
+        config.audioDeviceName = preferences.virtualAudioDevice
+        config.remoteInputDeviceName = preferences.virtualAudioDevice
+        config.restoreDefaultInput = preferences.restoreDefaultInput
+        config.showWindow = preferences.showCaptureWindow
+        config.ffmpegPath = ExecutableResolver.resolve(config.ffmpegPath)
         var args = Array(CommandLine.arguments.dropFirst())
 
         func takeValue(after option: String) throws -> String {
@@ -81,6 +89,8 @@ struct Config {
                 config.finalDelay = Double(try takeValue(after: option)) ?? config.finalDelay
             case "--hide-window":
                 config.showWindow = false
+            case "--show-capture-window":
+                config.showWindow = true
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -112,26 +122,27 @@ func printUsage() {
     Options:
       --port <port>                  TCP control port. Default: 4387
       --udp-port <port>              UDP raw PCM audio port. Default: 5004
-      --audio-transport <udp|tcp>    Raw PCM push transport. Default: udp
+      --audio-transport <udp|tcp>    Raw PCM push transport. Default: tcp
       --audio-device-index <index>   AudioToolbox output index for the virtual device. Default: 3
       --audio-device-name <name>     Resolve the AudioToolbox output index by device name
       --ffmpeg <path>                ffmpeg executable. Default: ffmpeg from PATH
       --token <token>                Optional TCP auth token
-      --voice-shortcut <shortcut>    Doubao voice shortcut. Default: cmd+shift+d
-      --voice-shortcut-mode <mode>   toggle or hold. Default: toggle
+      --voice-shortcut <shortcut>    Doubao voice shortcut. Default: fn
+      --voice-shortcut-mode <mode>   toggle or hold. Default: hold
       --audio-source-command <cmd>   Command that writes raw s16le 48kHz mono PCM to stdout
       --input-source-id <id>         Doubao input source id
       --remote-input-device <name>   Temporarily set macOS default input to this device on start
       --no-restore-default-input     Do not restore the previous default input device on stop
       --list-audio-devices           List CoreAudio devices and exit
-      --startup-delay <seconds>      Delay before toggling Doubao voice input. Default: 0.6
+      --startup-delay <seconds>      Delay before toggling Doubao voice input. Default: 0.3
       --voice-activation-check-delay <seconds>
                                       Delay before checking Doubao voice UI. Default: 1.0
       --voice-activation-retries <n> Retry voice shortcut when Doubao voice UI is not detected. Default: 2
       --voice-activation-retry-delay <seconds>
                                       Delay between voice shortcut retries. Default: 0.25
       --final-delay <seconds>        Delay after stop before final text emit. Default: 1.8
-      --hide-window                  Create the capture window off-screen
+      --hide-window                  Keep the capture window off-screen. Default behavior.
+      --show-capture-window          Show the developer capture window
     """)
 }
 
@@ -262,7 +273,9 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
         }
         RunLoop.main.add(timer, forMode: .common)
         partialObservationTimer = timer
-        window.makeKeyAndOrderFront(nil)
+        if showWindow {
+            window.orderFront(nil)
+        }
     }
 
     deinit {
@@ -396,6 +409,13 @@ final class DoubaoController {
     init(inputSourceID: String, hotKey: HotKey) {
         self.inputSourceID = inputSourceID
         self.hotKey = hotKey
+    }
+
+    func isInputSourceAvailable() -> Bool {
+        let sources = TISCreateInputSourceList(nil, false).takeRetainedValue() as! [TISInputSource]
+        return sources.contains {
+            inputSourceString($0, kTISPropertyInputSourceID) == inputSourceID
+        }
     }
 
     func switchToDoubao() throws {
@@ -1603,6 +1623,9 @@ final class Bridge {
 
     func stopSession() {
         print("[session] stop requested")
+        if isRecording {
+            emit?(["type": "status", "recording": false, "phase": "optimizing"])
+        }
         voiceActivationGeneration += 1
         audioLevelGeneration += 1
         captureRecoveryInProgress = false
@@ -1999,6 +2022,8 @@ final class BridgeServer {
     private let token: String?
     private let bridge: Bridge
     private var clients: [UUID: Client] = [:]
+    var onClientCountChange: ((Int) -> Void)?
+    var onStateChange: ((String) -> Void)?
 
     init(port: UInt16, token: String?, bridge: Bridge) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
@@ -2013,8 +2038,9 @@ final class BridgeServer {
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
-        listener.stateUpdateHandler = { state in
+        listener.stateUpdateHandler = { [weak self] state in
             print("Bridge server state: \(state)")
+            self?.onStateChange?(String(describing: state))
         }
         listener.start(queue: queue)
     }
@@ -2040,14 +2066,17 @@ final class BridgeServer {
     private func accept(_ connection: NWConnection) {
         let client = Client(connection: connection, authorized: token == nil)
         clients[client.id] = client
+        onClientCountChange?(clients.count)
 
         connection.stateUpdateHandler = { [weak self, weak client] state in
             guard let self, let client else { return }
             if case .cancelled = state {
                 self.clients.removeValue(forKey: client.id)
+                self.onClientCountChange?(self.clients.count)
             }
             if case .failed = state {
                 self.clients.removeValue(forKey: client.id)
+                self.onClientCountChange?(self.clients.count)
             }
         }
 
@@ -2156,8 +2185,10 @@ final class BridgeServer {
 
 final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     private let onWillTerminate: () -> Void
+    private let retainedObjects: [AnyObject]
 
-    init(onWillTerminate: @escaping () -> Void) {
+    init(retaining retainedObjects: [AnyObject], onWillTerminate: @escaping () -> Void) {
+        self.retainedObjects = retainedObjects
         self.onWillTerminate = onWillTerminate
     }
 
@@ -2166,7 +2197,9 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-do {
+@MainActor
+func runApplication() throws {
+    AppLog.redirectWhenDetached()
     let config = try Config.parse()
     let audioDeviceManager = CoreAudioDeviceManager()
     let defaultInputRecoveryStore = DefaultInputRecoveryStore()
@@ -2184,16 +2217,16 @@ do {
     let hotKey = try parseHotKey(config.voiceShortcut)
 
     let app = NSApplication.shared
-    app.setActivationPolicy(.regular)
-    if !AXIsProcessTrusted() {
-        let options = [
-            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-        ] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-    }
+    app.setActivationPolicy(.accessory)
 
     let captureWindow = TextCaptureWindow(showWindow: config.showWindow)
     let controller = DoubaoController(inputSourceID: config.inputSourceID, hotKey: hotKey)
+    let appModel = BridgeAppModel(
+        preferences: AppPreferences(defaults: .standard),
+        audioDeviceManager: audioDeviceManager,
+        controller: controller,
+        ffmpegPath: config.ffmpegPath
+    )
     let voiceStateDetector = VoiceStateDetector(controller: controller)
     let focusStateDetector = FocusStateDetector()
     let audioReceiver = AudioReceiver(
@@ -2215,9 +2248,30 @@ do {
         defaultInputRecoveryStore: defaultInputRecoveryStore
     )
     let server = try BridgeServer(port: config.port, token: config.token, bridge: bridge)
+    let menuBarController = MenuBarController(model: appModel)
+
+    appModel.testDoubaoAction = { [weak bridge] in
+        bridge?.testHotkey()
+    }
+    appModel.openDoubaoSettingsAction = { [weak bridge] in
+        bridge?.openSettings()
+    }
+    server.onClientCountChange = { count in
+        DispatchQueue.main.async {
+            appModel.clientCountChanged(count)
+        }
+    }
+    server.onStateChange = { state in
+        DispatchQueue.main.async {
+            appModel.serverStateChanged(state)
+        }
+    }
 
     bridge.emit = { object in
         server.broadcast(object)
+        DispatchQueue.main.async {
+            appModel.handleBridgeEvent(object)
+        }
     }
     captureWindow.onChange = { text, delta in
         server.broadcast(["type": "text", "text": text, "delta": delta])
@@ -2242,15 +2296,24 @@ do {
     if let audioSourceCommand = config.audioSourceCommand {
         print("Audio source command: \(audioSourceCommand)")
     }
-    let lifecycleDelegate = AppLifecycleDelegate { [weak bridge] in
+    let lifecycleDelegate = AppLifecycleDelegate(
+        retaining: [bridge, server, appModel, menuBarController]
+    ) { [weak bridge] in
         bridge?.prepareForTermination()
     }
     app.delegate = lifecycleDelegate
     withExtendedLifetime(lifecycleDelegate) {
         app.run()
     }
+}
+
+do {
+    try MainActor.assumeIsolated {
+        try runApplication()
+    }
 } catch {
     fputs("doubao-bridge-mac: \(error)\n", stderr)
+    AppFailurePresenter.present(error)
     printUsage()
     exit(1)
 }

@@ -18,7 +18,9 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Carbon"),
                 .linkedFramework("CoreAudio"),
-                .linkedFramework("Network")
+                .linkedFramework("Network"),
+                .linkedFramework("ServiceManagement"),
+                .linkedFramework("SwiftUI")
             ]
         ),
         .testTarget(

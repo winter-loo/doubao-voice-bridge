@@ -2,6 +2,9 @@
 
 Prototype for using Doubao IME on macOS as a remote speech input bridge for Windows/Linux.
 
+For a complete first-time setup and daily-use walkthrough, see
+[macOS and Windows Tutorial](MACOS_WINDOWS_TUTORIAL.md).
+
 The current working path is:
 
 ```text
@@ -54,7 +57,23 @@ Prefer the app bundle for IME testing. It gives macOS and Doubao a stable app id
 dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac --help
 ```
 
+For normal use, double-click `dist/DoubaoVoiceBridge.app`. The app runs in the
+menu bar without a Terminal or Dock icon. On first launch, its setup assistant
+checks Accessibility permission, Doubao, Soundflower, FFmpeg, and the Windows
+connection. Settings and diagnostics remain available from the menu-bar icon.
+
 ## Run Mac Bridge
+
+The packaged app now uses the tested configuration by default:
+
+- TCP control on `4387` and TCP audio on `5004`
+- `Soundflower (2ch)` for virtual audio and temporary default input
+- long-press Fn for Doubao activation
+- automatic physical-microphone restoration
+- an off-screen capture window
+
+The command below remains available for developer diagnostics and explicit
+overrides:
 
 ```bash
 dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
@@ -86,7 +105,12 @@ current input no longer matches the recorded remote device, the bridge assumes
 the user already selected another microphone and only removes the stale record.
 `--no-restore-default-input` disables both normal and crash recovery.
 
-During an active remote recording, the bridge brings its Voice Input capture window to the foreground and keeps its text view as the first responder. If another application takes focus, the bridge immediately reactivates the capture window so Doubao does not insert recognized text into the wrong application. This focus enforcement stops when recording ends.
+During an active remote recording, the bridge focuses its internal Voice Input
+capture target. The target stays off-screen in normal mode. If another
+application takes focus, the bridge immediately reactivates the capture target
+so Doubao does not insert recognized text into the wrong application. This focus
+enforcement stops when recording ends. Enable **Show developer capture window**
+in Settings only when debugging.
 
 ## Run Linux Client
 
@@ -121,6 +145,20 @@ ssh -t USER@CLIENT_HOST 'cd ~/doubao-voice-bridge && python3 clients/doubao_remo
 ```
 
 ## Run Windows Client
+
+The GPUI Windows release client is implemented entirely in Rust. It captures
+the Windows default microphone through WASAPI and does not require Python or
+FFmpeg at runtime:
+
+```powershell
+cd clients\gpui-overlay-prototype
+cargo build --release
+$env:DOUBAO_BRIDGE_SERVER = "MAC_IP:4387"
+Start-Process .\target\release\DoubaoVoiceClient.exe
+```
+
+The Python commands below remain available for protocol diagnostics and fixture
+replay.
 
 On Windows, the client discovers DirectShow audio input devices automatically. If exactly one device is available, no input option is required:
 
