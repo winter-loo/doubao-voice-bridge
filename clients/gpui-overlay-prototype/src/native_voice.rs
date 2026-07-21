@@ -1,17 +1,29 @@
-use std::ffi::c_void;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+use std::ffi::c_void;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
+
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{FromSample, I24, Sample as _, SampleFormat, SizedSample, Stream, StreamConfig, U24};
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+#[cfg(target_os = "windows")]
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL,
 };
@@ -25,6 +37,7 @@ const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
 const AUDIO_START_DELAY: Duration = Duration::from_millis(200);
 const AUDIO_STOP_SILENCE: Duration = Duration::from_millis(500);
+#[cfg(target_os = "windows")]
 const CF_UNICODETEXT: u32 = 13;
 
 #[derive(Clone, Debug)]
@@ -71,12 +84,14 @@ impl NativeVoiceConfig {
     }
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Clone, Debug)]
 pub struct InputDeviceInfo {
     pub id: String,
     pub name: String,
 }
 
+#[cfg(target_os = "windows")]
 pub fn input_devices() -> Result<Vec<InputDeviceInfo>, String> {
     cpal::default_host()
         .input_devices()
@@ -323,7 +338,7 @@ fn start_microphone(
             .ok_or_else(|| format!("microphone not found: {requested}"))?
     } else {
         host.default_input_device()
-            .ok_or_else(|| "Windows has no default microphone".to_string())?
+            .ok_or_else(|| "no default microphone is available".to_string())?
     };
     let supported = device
         .default_input_config()
@@ -471,6 +486,7 @@ fn send_silence(stream: &mut TcpStream, duration: Duration) -> Result<(), String
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn paste_text(text: &str, clipboard_owner: isize) -> Result<(), String> {
     set_clipboard_text(text, clipboard_owner)?;
     let inputs = [
@@ -486,6 +502,7 @@ fn paste_text(text: &str, clipboard_owner: isize) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
@@ -503,6 +520,7 @@ fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn set_clipboard_text(text: &str, clipboard_owner: isize) -> Result<(), String> {
     let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
@@ -537,5 +555,161 @@ fn set_clipboard_text(text: &str, clipboard_owner: isize) -> Result<(), String> 
         })();
         let _ = CloseClipboard();
         result
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxClipboardTool {
+    WlCopy,
+    Xclip,
+    Xsel,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxPasteTool {
+    Ydotool,
+    Xdotool,
+}
+
+#[cfg(target_os = "linux")]
+fn choose_linux_clipboard_tool<F>(wayland: bool, mut available: F) -> Option<LinuxClipboardTool>
+where
+    F: FnMut(&str) -> bool,
+{
+    if wayland && available("wl-copy") {
+        return Some(LinuxClipboardTool::WlCopy);
+    }
+    if available("xclip") {
+        return Some(LinuxClipboardTool::Xclip);
+    }
+    if available("xsel") {
+        return Some(LinuxClipboardTool::Xsel);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn choose_linux_paste_tool<F>(mut available: F) -> Option<LinuxPasteTool>
+where
+    F: FnMut(&str) -> bool,
+{
+    if available("ydotool") {
+        return Some(LinuxPasteTool::Ydotool);
+    }
+    if available("xdotool") {
+        return Some(LinuxPasteTool::Xdotool);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(command: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate: PathBuf = directory.join(command);
+        candidate
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_clipboard(command: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start {command}: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("could not open {command} stdin"))?
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("could not send text to {command}: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("could not wait for {command}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{command} exited with {status}"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn paste_text(text: &str, _clipboard_owner: isize) -> Result<(), String> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    match choose_linux_clipboard_tool(wayland, command_exists) {
+        Some(LinuxClipboardTool::WlCopy) => write_clipboard("wl-copy", &[], text)?,
+        Some(LinuxClipboardTool::Xclip) => {
+            write_clipboard("xclip", &["-selection", "clipboard"], text)?
+        }
+        Some(LinuxClipboardTool::Xsel) => {
+            write_clipboard("xsel", &["--clipboard", "--input"], text)?
+        }
+        None => {
+            return Err("install wl-copy, xclip, or xsel to receive recognized text".to_string());
+        }
+    }
+
+    let (command, args): (&str, &[&str]) = match choose_linux_paste_tool(command_exists) {
+        Some(LinuxPasteTool::Ydotool) => ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]),
+        Some(LinuxPasteTool::Xdotool) => ("xdotool", &["key", "--clearmodifiers", "ctrl+v"]),
+        None => {
+            return Err(
+                "recognized text is on the clipboard; install ydotool or xdotool to paste it"
+                    .to_string(),
+            );
+        }
+    };
+    let status = Command::new(command)
+        .args(args)
+        .status()
+        .map_err(|error| format!("could not start {command}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "recognized text is on the clipboard, but {command} exited with {status}"
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::{
+        LinuxClipboardTool, LinuxPasteTool, choose_linux_clipboard_tool, choose_linux_paste_tool,
+    };
+
+    #[test]
+    fn prefers_session_native_clipboard_then_x11_fallbacks() {
+        assert_eq!(
+            choose_linux_clipboard_tool(true, |tool| matches!(tool, "wl-copy" | "xclip")),
+            Some(LinuxClipboardTool::WlCopy)
+        );
+        assert_eq!(
+            choose_linux_clipboard_tool(false, |tool| matches!(tool, "wl-copy" | "xclip")),
+            Some(LinuxClipboardTool::Xclip)
+        );
+        assert_eq!(
+            choose_linux_clipboard_tool(false, |tool| tool == "xsel"),
+            Some(LinuxClipboardTool::Xsel)
+        );
+    }
+
+    #[test]
+    fn prefers_wayland_capable_global_input_injector() {
+        assert_eq!(
+            choose_linux_paste_tool(|tool| matches!(tool, "ydotool" | "xdotool")),
+            Some(LinuxPasteTool::Ydotool)
+        );
+        assert_eq!(
+            choose_linux_paste_tool(|tool| tool == "xdotool"),
+            Some(LinuxPasteTool::Xdotool)
+        );
     }
 }

@@ -1,4 +1,4 @@
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::{fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ impl Default for ClientSettings {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 impl ClientSettings {
     pub fn load() -> Result<Self, String> {
         let path = settings_path()?;
@@ -40,6 +40,7 @@ impl ClientSettings {
             .map_err(|error| format!("invalid settings in {}: {error}", path.display()))
     }
 
+    #[cfg(target_os = "windows")]
     pub fn save(&self) -> Result<(), String> {
         let path = settings_path()?;
         if let Some(parent) = path.parent() {
@@ -60,6 +61,15 @@ pub fn settings_path() -> Result<PathBuf, String> {
     Ok(PathBuf::from(local_app_data)
         .join("DoubaoVoiceBridge")
         .join("client.json"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn settings_path() -> Result<PathBuf, String> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is available".to_string())?;
+    Ok(config_home.join("DoubaoVoiceBridge").join("client.json"))
 }
 
 #[cfg(test)]

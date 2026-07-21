@@ -14,14 +14,14 @@ use gpui::{
     linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
 };
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod client_core;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod client_settings;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod native_voice;
 #[cfg(target_os = "windows")]
 mod windows_shell;
-#[cfg(target_os = "windows")]
-mod windows_voice;
 
 const BOTTOM_MARGIN: f32 = 22.0;
 const BAR_WIDTH: f32 = 2.0;
@@ -48,23 +48,23 @@ enum OverlayPhase {
 }
 
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 static VOICE_ACTIVITY_UPDATED_AT: AtomicU64 = AtomicU64::new(0);
 static SPEECH_ACTIVITY_UNTIL: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const VOICE_RMS_GATE_DBFS: f32 = -58.0;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const VOICE_PEAK_GATE_DBFS: f32 = -45.0;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const VOICE_ONSET_RMS_DBFS: f32 = -40.0;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const VOICE_ONSET_PEAK_DBFS: f32 = -25.0;
 const VOICE_ACTIVITY_STALE_AFTER_MS: u64 = 300;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 const SPEECH_ACTIVITY_HOLD_MS: u64 = 500;
 
 fn overlay_phase() -> OverlayPhase {
@@ -80,12 +80,12 @@ fn set_overlay_phase(phase: OverlayPhase) {
     OVERLAY_PHASE.store(phase as u8, Ordering::Release);
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn next_overlay_generation() -> u64 {
     OVERLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn overlay_generation() -> u64 {
     OVERLAY_GENERATION.load(Ordering::Acquire)
 }
@@ -106,14 +106,14 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn set_voice_activity(level: f32) {
     let quantized = (level.clamp(0.0, 1.0) * 1_000.0).round() as u32;
     VOICE_ACTIVITY.store(quantized, Ordering::Release);
     VOICE_ACTIVITY_UPDATED_AT.store(now_millis(), Ordering::Release);
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn mark_speech_activity() {
     SPEECH_ACTIVITY_UNTIL.store(
         now_millis().saturating_add(SPEECH_ACTIVITY_HOLD_MS),
@@ -121,7 +121,7 @@ fn mark_speech_activity() {
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn clear_voice_activity() {
     set_voice_activity(0.0);
     SPEECH_ACTIVITY_UNTIL.store(0, Ordering::Release);
@@ -162,7 +162,7 @@ fn voice_activity_from_audio_line(line: &str) -> Option<f32> {
     Some(voice_activity_from_levels(rms, peak))
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn voice_activity_from_levels(rms: f32, peak: f32) -> f32 {
     if rms < VOICE_RMS_GATE_DBFS || peak < VOICE_PEAK_GATE_DBFS {
         return 0.0;
@@ -559,7 +559,7 @@ mod platform {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::windows_voice::{NativeVoiceConfig, NativeVoiceEvent, NativeVoiceSession};
+    use super::native_voice::{NativeVoiceConfig, NativeVoiceEvent, NativeVoiceSession};
     use super::{
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
         OverlayPhase, VOICE_ONSET_PEAK_DBFS, VOICE_ONSET_RMS_DBFS, clear_voice_activity,
@@ -1349,7 +1349,117 @@ mod tests {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::sync::Mutex;
+
+    use gpui::Window;
+
+    use super::native_voice::{NativeVoiceConfig, NativeVoiceEvent, NativeVoiceSession};
+    use super::{
+        OverlayPhase, VOICE_ONSET_PEAK_DBFS, VOICE_ONSET_RMS_DBFS, clear_voice_activity,
+        mark_speech_activity, next_overlay_generation, overlay_generation, set_overlay_phase,
+        set_voice_activity, voice_activity_from_levels,
+    };
+
+    static VOICE_CLIENT: Mutex<Option<NativeVoiceSession>> = Mutex::new(None);
+
+    pub fn configure_overlay(_window: &Window) {
+        if let Err(error) = ctrlc::set_handler(|| {
+            if stop_voice_client() {
+                set_overlay_phase(OverlayPhase::Optimizing);
+            }
+        }) {
+            eprintln!("[linux-client] could not install signal handler: {error}");
+        }
+        clear_voice_activity();
+        set_overlay_phase(OverlayPhase::Activating);
+        if let Err(error) = start_voice_client() {
+            eprintln!("[linux-client] failed to start voice client: {error}");
+            set_overlay_phase(OverlayPhase::Optimizing);
+        }
+    }
+
+    pub fn finish_input(window: &mut Window) {
+        if stop_voice_client() {
+            set_overlay_phase(OverlayPhase::Optimizing);
+        } else {
+            window.remove_window();
+        }
+    }
+
+    fn start_voice_client() -> Result<(), String> {
+        let mut active = VOICE_CLIENT
+            .lock()
+            .map_err(|_| "voice client lock is poisoned".to_string())?;
+        if active
+            .as_ref()
+            .is_some_and(|session| !session.is_finished())
+        {
+            return Ok(());
+        }
+        active.take();
+
+        let generation = next_overlay_generation();
+        let config = NativeVoiceConfig::from_environment()?;
+        let session = NativeVoiceSession::start(config, move |event| {
+            if overlay_generation() != generation {
+                return;
+            }
+            match event {
+                NativeVoiceEvent::Phase(phase) => {
+                    eprintln!("[linux-client] phase={phase}");
+                    match phase.as_str() {
+                        "arming" | "voice_retry" => set_overlay_phase(OverlayPhase::Activating),
+                        "recording" => {
+                            clear_voice_activity();
+                            set_overlay_phase(OverlayPhase::Listening);
+                        }
+                        "optimizing" => set_overlay_phase(OverlayPhase::Optimizing),
+                        _ => {}
+                    }
+                }
+                NativeVoiceEvent::Partial(text) => {
+                    if !text.trim().is_empty() {
+                        mark_speech_activity();
+                    }
+                }
+                NativeVoiceEvent::AudioLevel {
+                    rms_dbfs,
+                    peak_dbfs,
+                } => {
+                    set_voice_activity(voice_activity_from_levels(rms_dbfs, peak_dbfs));
+                    if rms_dbfs >= VOICE_ONSET_RMS_DBFS && peak_dbfs >= VOICE_ONSET_PEAK_DBFS {
+                        mark_speech_activity();
+                    }
+                }
+                NativeVoiceEvent::Error(error) => {
+                    eprintln!("[linux-client] {error}");
+                    set_overlay_phase(OverlayPhase::Optimizing);
+                }
+                NativeVoiceEvent::Finished => {
+                    eprintln!("[linux-client] finished");
+                    std::process::exit(0);
+                }
+            }
+        })?;
+        *active = Some(session);
+        Ok(())
+    }
+
+    fn stop_voice_client() -> bool {
+        let Ok(active) = VOICE_CLIENT.lock() else {
+            return false;
+        };
+        let Some(session) = active.as_ref() else {
+            return false;
+        };
+        session.request_stop();
+        true
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod platform {
     use gpui::Window;
 

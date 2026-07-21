@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::client_settings::ClientSettings;
-use crate::windows_voice::{InputDeviceInfo, input_devices};
+use crate::native_voice::{InputDeviceInfo, input_devices};
 
 const TRAY_MESSAGE: u32 = WM_APP + 24;
 const TRAY_ID: u32 = 1;

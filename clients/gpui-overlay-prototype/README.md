@@ -1,10 +1,47 @@
-# GPUI Windows Voice Client
+# GPUI Voice Client
 
-The Windows release executable contains the complete native Rust client. It
-captures the selected Windows microphone through WASAPI, normalizes audio to
+The release executable contains the native Rust voice client for Windows and
+Linux. It captures the selected microphone through CPAL, normalizes audio to
 48 kHz mono s16le PCM, streams it to the Mac bridge, receives bridge events,
-and pastes the final text without launching Python, FFmpeg, PowerShell, or a
-console window.
+and pastes the final text without launching Python or FFmpeg.
+
+## Linux
+
+Install an X11 clipboard tool and input injector. On Arch Linux with GNOME
+Wayland/XWayland:
+
+```bash
+sudo pacman -S xclip xdotool
+```
+
+Build and start the client from an interactive desktop terminal:
+
+```bash
+cd clients/gpui-overlay-prototype
+cargo build --release
+DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
+```
+
+The current Linux client is a one-shot session: it starts recording when it
+launches, opens the overlay near the bottom of the screen, and stops when the
+overlay is clicked or the process receives `Ctrl+C`. It exits after receiving
+the final text and attempting to paste it into the previously focused app.
+
+The default PipeWire/PulseAudio microphone is selected automatically. Set
+`DOUBAO_VOICE_INPUT_DEVICE` to an exact CPAL device name to override it. The
+audio port can be changed with `DOUBAO_BRIDGE_AUDIO_PORT`.
+
+On XWayland, the client writes the result with `xclip` (or `xsel`) and injects
+`Ctrl+V` with `xdotool`. For native Wayland applications, install and configure
+`wl-clipboard` plus `ydotool`; compositor security rules may still require
+explicit input-device permissions. If injection is unavailable, the recognized
+text remains in the clipboard for manual paste.
+
+The Linux slice does not yet include a global shortcut, tray menu, or settings
+window. Those desktop integrations can be added without changing the shared
+audio and bridge protocol core.
+
+## Windows
 
 Build from this directory:
 
