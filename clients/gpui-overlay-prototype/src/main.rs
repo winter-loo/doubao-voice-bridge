@@ -883,22 +883,20 @@ mod platform {
         let config =
             NativeVoiceConfig::from_environment()?.with_paste_target(PasteTarget::for_window(hwnd));
         let hwnd_value = hwnd.0 as isize;
-        VOICE_CLIENT
-            .start(config, move |event| {
-                if overlay_generation() != generation {
-                    return;
+        VOICE_CLIENT.start(config, move |event| {
+            if overlay_generation() != generation {
+                return;
+            }
+            match apply_native_voice_event(event) {
+                NativeVoiceEventOutcome::Continue => {}
+                NativeVoiceEventOutcome::Error(error) => {
+                    append_voice_client_log(&format!("[native-client] {error}\n"));
                 }
-                match apply_native_voice_event(event) {
-                    NativeVoiceEventOutcome::Continue => {}
-                    NativeVoiceEventOutcome::Error(error) => {
-                        append_voice_client_log(&format!("[native-client] {error}\n"));
-                    }
-                    NativeVoiceEventOutcome::Finished => {
-                        hide_overlay(HWND(hwnd_value as *mut c_void));
-                    }
+                NativeVoiceEventOutcome::Finished => {
+                    hide_overlay(HWND(hwnd_value as *mut c_void));
                 }
-            })
-            .map(|_| ())
+            }
+        })
     }
 
     fn stop_voice_client() -> bool {
@@ -1405,27 +1403,25 @@ mod platform {
     fn start_voice_client() -> Result<(), String> {
         let generation = next_overlay_generation();
         let config = NativeVoiceConfig::from_environment()?;
-        VOICE_CLIENT
-            .start(config, move |event| {
-                if overlay_generation() != generation {
-                    return;
+        VOICE_CLIENT.start(config, move |event| {
+            if overlay_generation() != generation {
+                return;
+            }
+            if let NativeVoiceEvent::Phase(phase) = &event {
+                eprintln!("[linux-client] phase={phase}");
+            }
+            match apply_native_voice_event(event) {
+                NativeVoiceEventOutcome::Continue => {}
+                NativeVoiceEventOutcome::Error(error) => {
+                    eprintln!("[linux-client] {error}");
+                    set_overlay_phase(OverlayPhase::Optimizing);
                 }
-                if let NativeVoiceEvent::Phase(phase) = &event {
-                    eprintln!("[linux-client] phase={phase}");
+                NativeVoiceEventOutcome::Finished => {
+                    eprintln!("[linux-client] finished");
+                    std::process::exit(0);
                 }
-                match apply_native_voice_event(event) {
-                    NativeVoiceEventOutcome::Continue => {}
-                    NativeVoiceEventOutcome::Error(error) => {
-                        eprintln!("[linux-client] {error}");
-                        set_overlay_phase(OverlayPhase::Optimizing);
-                    }
-                    NativeVoiceEventOutcome::Finished => {
-                        eprintln!("[linux-client] finished");
-                        std::process::exit(0);
-                    }
-                }
-            })
-            .map(|_| ())
+            }
+        })
     }
 
     fn stop_voice_client() -> bool {
