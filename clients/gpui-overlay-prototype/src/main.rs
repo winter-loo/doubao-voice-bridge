@@ -530,7 +530,8 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(overlay_bounds(cx))),
             titlebar: None,
-            focus: false,
+            focus: cfg!(not(target_os = "windows"))
+                && std::env::var_os("DOUBAO_OVERLAY_FOCUS").is_some(),
             kind: WindowKind::PopUp,
             is_movable: false,
             is_resizable: false,
@@ -1358,7 +1359,7 @@ mod platform {
         set_overlay_phase(OverlayPhase::Listening);
     }
 
-    pub fn finish_input(window: &Window) {
+    pub fn finish_input(window: &mut Window) {
         window.remove_window();
     }
 }
