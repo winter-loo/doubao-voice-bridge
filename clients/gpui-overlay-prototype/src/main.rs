@@ -452,6 +452,8 @@ fn activating_capsule(delta: f32) -> impl IntoElement {
         .relative()
         .w(px(LISTENING_CAPSULE_WIDTH))
         .h(px(LISTENING_CAPSULE_HEIGHT))
+        .cursor_pointer()
+        .on_click(|_, window, _| platform::finish_input(window))
         .child(glass_canvas(delta, false).absolute().top_0().left_0())
         .child(
             div()

@@ -24,8 +24,9 @@ DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
 
 The current Linux client is a one-shot session: it starts recording when it
 launches, opens the overlay near the bottom of the screen, and stops when the
-overlay is clicked or the process receives `Ctrl+C`. It exits after receiving
-the final text and attempting to paste it into the previously focused app.
+overlay is clicked or the process receives `Ctrl+C`. It waits up to eight
+seconds for the final bridge event, falls back to the latest committed text if
+needed, and attempts to paste the result into the previously focused app.
 
 The default PipeWire/PulseAudio microphone is selected automatically. Set
 `DOUBAO_VOICE_INPUT_DEVICE` to an exact CPAL device name to override it. The
