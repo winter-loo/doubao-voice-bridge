@@ -14,7 +14,9 @@ use gpui::{
     linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
 };
 
+#[cfg(any(target_os = "windows", test))]
 mod client_core;
+#[cfg(any(target_os = "windows", test))]
 mod client_settings;
 #[cfg(target_os = "windows")]
 mod windows_shell;
@@ -46,17 +48,23 @@ enum OverlayPhase {
 }
 
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
+#[cfg(target_os = "windows")]
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 static VOICE_ACTIVITY_UPDATED_AT: AtomicU64 = AtomicU64::new(0);
 static SPEECH_ACTIVITY_UNTIL: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(any(target_os = "windows", test))]
 const VOICE_RMS_GATE_DBFS: f32 = -58.0;
+#[cfg(any(target_os = "windows", test))]
 const VOICE_PEAK_GATE_DBFS: f32 = -45.0;
+#[cfg(any(target_os = "windows", test))]
 const VOICE_ONSET_RMS_DBFS: f32 = -40.0;
+#[cfg(any(target_os = "windows", test))]
 const VOICE_ONSET_PEAK_DBFS: f32 = -25.0;
 const VOICE_ACTIVITY_STALE_AFTER_MS: u64 = 300;
+#[cfg(target_os = "windows")]
 const SPEECH_ACTIVITY_HOLD_MS: u64 = 500;
 
 fn overlay_phase() -> OverlayPhase {
@@ -72,10 +80,12 @@ fn set_overlay_phase(phase: OverlayPhase) {
     OVERLAY_PHASE.store(phase as u8, Ordering::Release);
 }
 
+#[cfg(target_os = "windows")]
 fn next_overlay_generation() -> u64 {
     OVERLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
 }
 
+#[cfg(target_os = "windows")]
 fn overlay_generation() -> u64 {
     OVERLAY_GENERATION.load(Ordering::Acquire)
 }
@@ -84,6 +94,7 @@ fn dark_background() -> bool {
     DARK_BACKGROUND.load(Ordering::Acquire)
 }
 
+#[cfg(target_os = "windows")]
 fn set_dark_background(dark: bool) {
     DARK_BACKGROUND.store(dark, Ordering::Release);
 }
@@ -95,12 +106,14 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+#[cfg(target_os = "windows")]
 fn set_voice_activity(level: f32) {
     let quantized = (level.clamp(0.0, 1.0) * 1_000.0).round() as u32;
     VOICE_ACTIVITY.store(quantized, Ordering::Release);
     VOICE_ACTIVITY_UPDATED_AT.store(now_millis(), Ordering::Release);
 }
 
+#[cfg(target_os = "windows")]
 fn mark_speech_activity() {
     SPEECH_ACTIVITY_UNTIL.store(
         now_millis().saturating_add(SPEECH_ACTIVITY_HOLD_MS),
@@ -108,6 +121,7 @@ fn mark_speech_activity() {
     );
 }
 
+#[cfg(target_os = "windows")]
 fn clear_voice_activity() {
     set_voice_activity(0.0);
     SPEECH_ACTIVITY_UNTIL.store(0, Ordering::Release);
@@ -148,6 +162,7 @@ fn voice_activity_from_audio_line(line: &str) -> Option<f32> {
     Some(voice_activity_from_levels(rms, peak))
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn voice_activity_from_levels(rms: f32, peak: f32) -> f32 {
     if rms < VOICE_RMS_GATE_DBFS || peak < VOICE_PEAK_GATE_DBFS {
         return 0.0;
