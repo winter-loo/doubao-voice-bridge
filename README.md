@@ -114,6 +114,23 @@ in Settings only when debugging.
 
 ## Run Linux Client
 
+The GPUI Linux client now implements the native microphone-to-bridge path and
+does not require Python or FFmpeg at runtime. From an interactive Linux desktop:
+
+```bash
+cd clients/gpui-overlay-prototype
+cargo build --release
+DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
+```
+
+It starts a one-shot recording session immediately. Click the overlay or press
+`Ctrl+C` to stop, wait for the final text, and attempt to paste it into the
+previously focused application. See
+[`clients/gpui-overlay-prototype/README.md`](clients/gpui-overlay-prototype/README.md)
+for Linux clipboard/input-tool requirements and current Wayland limitations.
+
+The Python client remains useful for protocol diagnostics:
+
 Linux PulseAudio/PipeWire default microphone:
 
 ```bash
@@ -133,7 +150,7 @@ Without `--seconds`, the client records until you press `Ctrl+C`. To stop automa
 
 The client starts streaming audio early, but recording begins after the Mac bridge emits `phase=recording`. That phase is only emitted after the Mac confirms Doubao's voice UI is active. Pressing `Ctrl+C` stops the remote microphone, releases the Doubao voice shortcut, and waits for the final committed text.
 
-The Windows GPUI client mirrors that protocol state. It displays `激活中` for
+The GPUI client mirrors that protocol state. It displays `激活中` for
 the Mac bridge's `arming` and `voice_retry` phases, and only switches to the
 audio-reactive waveform after `phase=recording`. This prevents early microphone
 energy from looking as if Doubao is already recognizing speech.
