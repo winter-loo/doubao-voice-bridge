@@ -114,7 +114,7 @@ impl NativeVoiceController {
         }
     }
 
-    pub fn start<F>(&self, config: NativeVoiceConfig, notify: F) -> Result<bool, String>
+    pub fn start<F>(&self, config: NativeVoiceConfig, notify: F) -> Result<(), String>
     where
         F: Fn(NativeVoiceEvent) + Send + 'static,
     {
@@ -126,11 +126,11 @@ impl NativeVoiceController {
             .as_ref()
             .is_some_and(|session| !session.is_finished())
         {
-            return Ok(false);
+            return Ok(());
         }
         active.take();
         *active = Some(NativeVoiceSession::start(config, notify)?);
-        Ok(true)
+        Ok(())
     }
 
     pub fn request_stop(&self) -> bool {
