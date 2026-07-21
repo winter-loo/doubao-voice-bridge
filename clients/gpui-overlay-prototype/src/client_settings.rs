@@ -1,5 +1,5 @@
-use std::fs;
-use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::{fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,7 @@ impl Default for ClientSettings {
     }
 }
 
+#[cfg(target_os = "windows")]
 impl ClientSettings {
     pub fn load() -> Result<Self, String> {
         let path = settings_path()?;
@@ -52,6 +53,7 @@ impl ClientSettings {
     }
 }
 
+#[cfg(target_os = "windows")]
 pub fn settings_path() -> Result<PathBuf, String> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| "LOCALAPPDATA is not available".to_string())?;
