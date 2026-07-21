@@ -20,6 +20,8 @@ mod client_core;
 mod client_settings;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod native_voice;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod platform_paste;
 #[cfg(target_os = "windows")]
 mod windows_shell;
 
@@ -173,6 +175,61 @@ fn voice_activity_from_levels(rms: f32, peak: f32) -> f32 {
     (0.75 * rms_strength + 0.25 * peak_strength).clamp(0.12, 1.0)
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+enum NativeVoiceEventOutcome {
+    Continue,
+    Error(String),
+    Finished,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn overlay_phase_for_bridge_phase(phase: &str) -> Option<OverlayPhase> {
+    match phase {
+        "arming" | "voice_retry" => Some(OverlayPhase::Activating),
+        "recording" => Some(OverlayPhase::Listening),
+        "optimizing" => Some(OverlayPhase::Optimizing),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn apply_native_voice_event(event: native_voice::NativeVoiceEvent) -> NativeVoiceEventOutcome {
+    use native_voice::NativeVoiceEvent;
+
+    match event {
+        NativeVoiceEvent::Phase(phase) => {
+            if let Some(phase) = overlay_phase_for_bridge_phase(&phase) {
+                if phase == OverlayPhase::Listening {
+                    clear_voice_activity();
+                }
+                set_overlay_phase(phase);
+            }
+            NativeVoiceEventOutcome::Continue
+        }
+        NativeVoiceEvent::Partial(text) => {
+            if !text.trim().is_empty() {
+                mark_speech_activity();
+            }
+            NativeVoiceEventOutcome::Continue
+        }
+        NativeVoiceEvent::AudioLevel {
+            rms_dbfs,
+            peak_dbfs,
+        } => {
+            set_voice_activity(voice_activity_from_levels(rms_dbfs, peak_dbfs));
+            if rms_dbfs >= VOICE_ONSET_RMS_DBFS && peak_dbfs >= VOICE_ONSET_PEAK_DBFS {
+                mark_speech_activity();
+            }
+            NativeVoiceEventOutcome::Continue
+        }
+        NativeVoiceEvent::Error(error) => NativeVoiceEventOutcome::Error(error),
+        NativeVoiceEvent::Finished => {
+            clear_voice_activity();
+            NativeVoiceEventOutcome::Finished
+        }
+    }
+}
+
 #[cfg(test)]
 fn is_strong_voice_activity_line(line: &str) -> bool {
     let Some(rms) = parse_dbfs(line, "rms=") else {
@@ -192,11 +249,7 @@ fn is_partial_speech_line(line: &str) -> bool {
 
 #[cfg(test)]
 fn overlay_phase_from_bridge_line(line: &str) -> Option<OverlayPhase> {
-    match line.strip_prefix("[bridge_phase] ")?.trim() {
-        "arming" | "voice_retry" => Some(OverlayPhase::Activating),
-        "recording" => Some(OverlayPhase::Listening),
-        _ => None,
-    }
+    overlay_phase_for_bridge_phase(line.strip_prefix("[bridge_phase] ")?.trim())
 }
 
 fn waveform_bar_height(index: usize, delta: f32, voice_level: f32) -> f32 {
@@ -556,18 +609,17 @@ mod platform {
     use std::fs::OpenOptions;
     use std::io::Write as _;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::native_voice::{NativeVoiceConfig, NativeVoiceEvent, NativeVoiceSession};
+    use super::native_voice::{NativeVoiceConfig, NativeVoiceController};
+    use super::platform_paste::PasteTarget;
     use super::{
-        LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
-        OverlayPhase, VOICE_ONSET_PEAK_DBFS, VOICE_ONSET_RMS_DBFS, clear_voice_activity,
-        dark_background, mark_speech_activity, next_overlay_generation, overlay_generation,
-        overlay_phase, set_dark_background, set_overlay_phase, set_voice_activity,
-        voice_activity_from_levels,
+        LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, NativeVoiceEventOutcome, OVERLAY_HEIGHT,
+        OVERLAY_WIDTH, OverlayPhase, apply_native_voice_event, clear_voice_activity,
+        dark_background, next_overlay_generation, overlay_generation, overlay_phase,
+        set_dark_background, set_overlay_phase,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -610,7 +662,7 @@ mod platform {
     ];
     static BACKDROP_HWND: AtomicIsize = AtomicIsize::new(0);
     static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
-    static VOICE_CLIENT: Mutex<Option<NativeVoiceSession>> = Mutex::new(None);
+    static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
     pub fn claim_single_instance() -> bool {
         let Ok(handle) =
@@ -802,7 +854,7 @@ mod platform {
         clear_voice_activity();
         set_dark_background(sample_dark_background(hwnd));
         show_phase(hwnd, OverlayPhase::Activating);
-        if let Err(error) = start_voice_client(generation, hwnd.0 as isize) {
+        if let Err(error) = start_voice_client(generation, hwnd) {
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
         }
     }
@@ -821,77 +873,36 @@ mod platform {
         }
     }
 
-    fn start_voice_client(generation: u64, hwnd_value: isize) -> Result<(), String> {
-        let mut active = VOICE_CLIENT
-            .lock()
-            .map_err(|_| "voice client lock is poisoned".to_string())?;
-        if active
-            .as_ref()
-            .is_some_and(|session| !session.is_finished())
-        {
-            return Ok(());
-        }
-        active.take();
-
+    fn start_voice_client(generation: u64, hwnd: HWND) -> Result<(), String> {
         OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(voice_client_log_path())
             .map_err(|error| format!("could not open voice client log: {error}"))?;
-        let mut config = NativeVoiceConfig::from_environment()?;
-        config.clipboard_owner = hwnd_value;
-        let session = NativeVoiceSession::start(config, move |event| {
-            if overlay_generation() != generation {
-                return;
-            }
-            match event {
-                NativeVoiceEvent::Phase(phase) => match phase.as_str() {
-                    "arming" | "voice_retry" => set_overlay_phase(OverlayPhase::Activating),
-                    "recording" => {
-                        clear_voice_activity();
-                        set_overlay_phase(OverlayPhase::Listening);
+        let config =
+            NativeVoiceConfig::from_environment()?.with_paste_target(PasteTarget::for_window(hwnd));
+        let hwnd_value = hwnd.0 as isize;
+        VOICE_CLIENT
+            .start(config, move |event| {
+                if overlay_generation() != generation {
+                    return;
+                }
+                match apply_native_voice_event(event) {
+                    NativeVoiceEventOutcome::Continue => {}
+                    NativeVoiceEventOutcome::Error(error) => {
+                        append_voice_client_log(&format!("[native-client] {error}\n"));
                     }
-                    "optimizing" => set_overlay_phase(OverlayPhase::Optimizing),
-                    _ => {}
-                },
-                NativeVoiceEvent::Partial(text) => {
-                    if !text.trim().is_empty() {
-                        mark_speech_activity();
+                    NativeVoiceEventOutcome::Finished => {
+                        hide_overlay(HWND(hwnd_value as *mut c_void));
                     }
                 }
-                NativeVoiceEvent::AudioLevel {
-                    rms_dbfs,
-                    peak_dbfs,
-                } => {
-                    let level = voice_activity_from_levels(rms_dbfs, peak_dbfs);
-                    set_voice_activity(level);
-                    if rms_dbfs >= VOICE_ONSET_RMS_DBFS && peak_dbfs >= VOICE_ONSET_PEAK_DBFS {
-                        mark_speech_activity();
-                    }
-                }
-                NativeVoiceEvent::Error(error) => {
-                    append_voice_client_log(&format!("[native-client] {error}\n"));
-                }
-                NativeVoiceEvent::Finished => {
-                    clear_voice_activity();
-                    hide_overlay(HWND(hwnd_value as *mut c_void));
-                }
-            }
-        })?;
-        *active = Some(session);
-        Ok(())
+            })
+            .map(|_| ())
     }
 
     fn stop_voice_client() -> bool {
-        let Ok(active) = VOICE_CLIENT.lock() else {
-            return false;
-        };
-        let Some(session) = active.as_ref() else {
-            return false;
-        };
-        session.request_stop();
-        true
+        VOICE_CLIENT.request_stop()
     }
 
     fn sample_dark_background(hwnd: HWND) -> bool {
@@ -1281,6 +1292,10 @@ mod tests {
             Some(OverlayPhase::Listening)
         );
         assert_eq!(
+            overlay_phase_from_bridge_line("[bridge_phase] optimizing"),
+            Some(OverlayPhase::Optimizing)
+        );
+        assert_eq!(
             overlay_phase_from_bridge_line("[event] {'phase': 'recording'}"),
             None
         );
@@ -1353,18 +1368,15 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::sync::Mutex;
-
     use gpui::Window;
 
-    use super::native_voice::{NativeVoiceConfig, NativeVoiceEvent, NativeVoiceSession};
+    use super::native_voice::{NativeVoiceConfig, NativeVoiceController, NativeVoiceEvent};
     use super::{
-        OverlayPhase, VOICE_ONSET_PEAK_DBFS, VOICE_ONSET_RMS_DBFS, clear_voice_activity,
-        mark_speech_activity, next_overlay_generation, overlay_generation, set_overlay_phase,
-        set_voice_activity, voice_activity_from_levels,
+        NativeVoiceEventOutcome, OverlayPhase, apply_native_voice_event, clear_voice_activity,
+        next_overlay_generation, overlay_generation, set_overlay_phase,
     };
 
-    static VOICE_CLIENT: Mutex<Option<NativeVoiceSession>> = Mutex::new(None);
+    static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
     pub fn configure_overlay(_window: &Window) {
         if let Err(error) = ctrlc::set_handler(|| {
@@ -1391,73 +1403,33 @@ mod platform {
     }
 
     fn start_voice_client() -> Result<(), String> {
-        let mut active = VOICE_CLIENT
-            .lock()
-            .map_err(|_| "voice client lock is poisoned".to_string())?;
-        if active
-            .as_ref()
-            .is_some_and(|session| !session.is_finished())
-        {
-            return Ok(());
-        }
-        active.take();
-
         let generation = next_overlay_generation();
         let config = NativeVoiceConfig::from_environment()?;
-        let session = NativeVoiceSession::start(config, move |event| {
-            if overlay_generation() != generation {
-                return;
-            }
-            match event {
-                NativeVoiceEvent::Phase(phase) => {
+        VOICE_CLIENT
+            .start(config, move |event| {
+                if overlay_generation() != generation {
+                    return;
+                }
+                if let NativeVoiceEvent::Phase(phase) = &event {
                     eprintln!("[linux-client] phase={phase}");
-                    match phase.as_str() {
-                        "arming" | "voice_retry" => set_overlay_phase(OverlayPhase::Activating),
-                        "recording" => {
-                            clear_voice_activity();
-                            set_overlay_phase(OverlayPhase::Listening);
-                        }
-                        "optimizing" => set_overlay_phase(OverlayPhase::Optimizing),
-                        _ => {}
+                }
+                match apply_native_voice_event(event) {
+                    NativeVoiceEventOutcome::Continue => {}
+                    NativeVoiceEventOutcome::Error(error) => {
+                        eprintln!("[linux-client] {error}");
+                        set_overlay_phase(OverlayPhase::Optimizing);
+                    }
+                    NativeVoiceEventOutcome::Finished => {
+                        eprintln!("[linux-client] finished");
+                        std::process::exit(0);
                     }
                 }
-                NativeVoiceEvent::Partial(text) => {
-                    if !text.trim().is_empty() {
-                        mark_speech_activity();
-                    }
-                }
-                NativeVoiceEvent::AudioLevel {
-                    rms_dbfs,
-                    peak_dbfs,
-                } => {
-                    set_voice_activity(voice_activity_from_levels(rms_dbfs, peak_dbfs));
-                    if rms_dbfs >= VOICE_ONSET_RMS_DBFS && peak_dbfs >= VOICE_ONSET_PEAK_DBFS {
-                        mark_speech_activity();
-                    }
-                }
-                NativeVoiceEvent::Error(error) => {
-                    eprintln!("[linux-client] {error}");
-                    set_overlay_phase(OverlayPhase::Optimizing);
-                }
-                NativeVoiceEvent::Finished => {
-                    eprintln!("[linux-client] finished");
-                    std::process::exit(0);
-                }
-            }
-        })?;
-        *active = Some(session);
-        Ok(())
+            })
+            .map(|_| ())
     }
 
     fn stop_voice_client() -> bool {
-        let Ok(active) = VOICE_CLIENT.lock() else {
-            return false;
-        };
-        let Some(session) = active.as_ref() else {
-            return false;
-        };
-        session.request_stop();
-        true
+        VOICE_CLIENT.request_stop()
     }
 }
 
