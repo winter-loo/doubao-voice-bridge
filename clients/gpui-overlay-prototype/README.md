@@ -88,14 +88,10 @@ retaining captured pixels. A slightly smaller source rectangle is stretched into
 the capsule for a refraction cue; the GPUI canvas adds the translucent tint,
 moving specular band, edge caustics, lower reflection, and waveform glow.
 
-On Windows, hold left `Ctrl` for 420 ms to activate and release it to finish.
-`Ctrl+Alt+Space` starts or finishes a session for remote testing, and clicking the
+On Windows, `Ctrl+Alt+Space` starts or finishes a session, and clicking the
 capsule also finishes. The previously focused application should retain keyboard
-focus.
-
-Most Windows keyboards handle `Fn` in firmware and do not expose a standard
-virtual key, so left `Ctrl` is the client's stand-in. A macOS
-client can bind the same hold behavior to the observable Fn/Globe modifier.
+focus. Left `Ctrl` is intentionally unbound so normal modifier-key use cannot
+start voice input.
 
 Useful verification command while the prototype is running:
 

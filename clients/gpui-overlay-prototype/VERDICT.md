@@ -35,26 +35,19 @@ The release PE header reports subsystem `2` (`Windows GUI`). A before/after
 RustDesk review confirmed that launching the executable from the same interactive
 scheduled task no longer creates a Command Prompt or Windows Terminal window.
 
-Automated input exercised both the hold gesture and `Ctrl+Alt+Space`. All
-operations passed:
+Automated input exercised `Ctrl+Alt+Space`. All operations passed:
 
 ```json
 {
-  "shortPressStayedHidden": true,
-  "longHoldActivated": true,
-  "visibleWhileListening": true,
-  "visibleWhileOptimizing": true,
-  "hiddenAfterOptimizing": true,
   "hotkeyStarted": true,
   "hotkeyShowedOptimizing": true,
   "hiddenAfterHotkeyOptimizing": true,
-  "holdPreservedFocus": true,
   "hotkeysPreservedFocus": true
 }
 ```
 
-The foreground HWND was identical before and after the hold and global-hotkey
-tests. This validates the critical `WS_EX_NOACTIVATE` behavior.
+The foreground HWND was identical before and after the global-hotkey tests. This
+validates the critical `WS_EX_NOACTIVATE` behavior.
 
 A macOS-side RustDesk capture of the live Windows console session confirmed that
 the listening and optimizing phases render with no clipping or overlap. The final

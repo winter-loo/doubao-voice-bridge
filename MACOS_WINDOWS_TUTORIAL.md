@@ -221,11 +221,11 @@ before launching the executable directly from File Explorer.
 ## 5. Use Voice Input on Windows
 
 1. Click the text field in the Windows application where the result should go.
-2. Hold **Left Ctrl** for at least 420 ms.
+2. Press **Ctrl+Alt+Space** once.
 3. The compact overlay first displays `激活中` while the Mac switches to
    BlackHole, focuses the capture window, and activates Doubao voice input.
 4. Wait until the overlay changes to the animated waveform, then speak.
-5. Release **Left Ctrl** to finish.
+5. Press **Ctrl+Alt+Space** again to finish.
 6. The overlay displays `优化识别中` while Doubao commits the final result.
 7. The final text is pasted into the Windows application that was focused before
    activation.
@@ -233,11 +233,8 @@ before launching the executable directly from File Explorer.
 Speech made while `激活中` is displayed is not recognized yet. Start speaking
 only after the waveform appears.
 
-As an alternative to holding Left Ctrl, press **Ctrl+Alt+Space** once to start
-and once again to stop. Clicking the visible capsule also stops the session.
-
-Windows keyboards generally handle Fn in firmware and do not expose it as a
-normal key, which is why the Windows client uses Left Ctrl instead of Fn.
+Clicking the visible capsule also stops the session. Left Ctrl is not bound by
+the Windows client.
 
 ## 6. Command-Line Client
 

@@ -611,7 +611,7 @@ mod platform {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController};
     use super::platform_paste::PasteTarget;
@@ -638,7 +638,7 @@ mod platform {
     };
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_LCONTROL, VK_SPACE,
+        MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_SPACE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindow,
@@ -651,7 +651,6 @@ mod platform {
     use windows::core::{BOOL, w};
 
     const HOTKEY_ID: i32 = 0xDB01;
-    const HOLD_THRESHOLD: Duration = Duration::from_millis(420);
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
     const BACKDROP_SAMPLES: [(i32, i32, u8); 5] = [
         (0, 0, 255),
@@ -718,7 +717,6 @@ mod platform {
         hide_backdrop(backdrop);
         start_backdrop_thread(hwnd.0 as isize, backdrop.0 as isize);
         start_hotkey_thread(hwnd.0 as isize);
-        start_hold_key_thread(hwnd.0 as isize);
         super::windows_shell::start(hwnd);
     }
 
@@ -1235,33 +1233,6 @@ mod platform {
                         begin_input(hwnd);
                     }
                 }
-            }
-        });
-    }
-
-    fn start_hold_key_thread(hwnd_value: isize) {
-        thread::spawn(move || {
-            let hwnd = HWND(hwnd_value as *mut c_void);
-            let mut pressed_at = None;
-            let mut activated = false;
-
-            loop {
-                let is_down = unsafe { GetAsyncKeyState(VK_LCONTROL.0 as i32) < 0 };
-
-                if is_down {
-                    let started = pressed_at.get_or_insert_with(Instant::now);
-                    if !activated && started.elapsed() >= HOLD_THRESHOLD {
-                        activated = true;
-                        begin_input(hwnd);
-                    }
-                } else if pressed_at.take().is_some() {
-                    if activated {
-                        finish_input_hwnd(hwnd);
-                    }
-                    activated = false;
-                }
-
-                thread::sleep(Duration::from_millis(16));
             }
         });
     }
