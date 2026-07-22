@@ -2058,8 +2058,11 @@ final class BridgeServer {
     private let queue = DispatchQueue(label: "doubao.bridge.server")
     private let token: String?
     private let bridge: Bridge
-    private var clients: [UUID: Client] = [:]
-    var onClientCountChange: ((Int) -> Void)?
+    private let clients = ActiveClientStore<Client>()
+    var onClientCountChange: ((Int) -> Void)? {
+        get { clients.onCountChange }
+        set { clients.onCountChange = newValue }
+    }
     var onStateChange: ((String) -> Void)?
 
     init(port: UInt16, token: String?, bridge: Bridge) throws {
@@ -2102,18 +2105,15 @@ final class BridgeServer {
 
     private func accept(_ connection: NWConnection) {
         let client = Client(connection: connection, authorized: token == nil)
-        clients[client.id] = client
-        onClientCountChange?(clients.count)
+        clients.insert(client, forKey: client.id)
 
         connection.stateUpdateHandler = { [weak self, weak client] state in
             guard let self, let client else { return }
             if case .cancelled = state {
                 self.clients.removeValue(forKey: client.id)
-                self.onClientCountChange?(self.clients.count)
             }
             if case .failed = state {
                 self.clients.removeValue(forKey: client.id)
-                self.onClientCountChange?(self.clients.count)
             }
         }
 
