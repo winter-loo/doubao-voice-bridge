@@ -1,7 +1,6 @@
 param(
-    [ValidateSet("Toggle", "LeftControlHold", "SaveSettings")]
-    [string]$Mode = "Toggle",
-    [int]$HoldMilliseconds = 700
+    [ValidateSet("Toggle", "SaveSettings")]
+    [string]$Mode = "Toggle"
 )
 
 Add-Type @"
@@ -32,13 +31,6 @@ public static class DoubaoOverlayInput {
 function Send-Key([byte]$Key, [bool]$Down) {
     $flags = if ($Down) { 0 } else { 2 }
     [DoubaoOverlayInput]::keybd_event($Key, 0, $flags, [UIntPtr]::Zero)
-}
-
-if ($Mode -eq "LeftControlHold") {
-    Send-Key 0xA2 $true
-    Start-Sleep -Milliseconds $HoldMilliseconds
-    Send-Key 0xA2 $false
-    exit
 }
 
 if ($Mode -eq "SaveSettings") {

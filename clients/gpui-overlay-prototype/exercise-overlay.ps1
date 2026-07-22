@@ -81,11 +81,6 @@ function Send-OverlayHotkey {
     Start-Sleep -Milliseconds 400
 }
 
-function Set-RightControl([bool]$Down) {
-    $flags = if ($Down) { 0 } else { 2 }
-    [OverlayExercise]::keybd_event(0xA3, 0, $flags, [UIntPtr]::Zero)
-}
-
 $process = Get-Process DoubaoVoiceClient -ErrorAction Stop
 $hwnd = Find-ProcessWindow $process.Id
 if ($hwnd -eq [IntPtr]::Zero) {
@@ -99,20 +94,6 @@ if ($initiallyVisible) {
     Send-OverlayHotkey
     Start-Sleep -Milliseconds 2500
 }
-
-Set-RightControl $true
-Start-Sleep -Milliseconds 250
-$visibleBeforeHoldThreshold = [OverlayExercise]::IsWindowVisible($hwnd)
-Start-Sleep -Milliseconds 350
-$visibleAfterHoldThreshold = [OverlayExercise]::IsWindowVisible($hwnd)
-Start-Sleep -Milliseconds 1000
-$visibleWhileListening = [OverlayExercise]::IsWindowVisible($hwnd)
-Set-RightControl $false
-Start-Sleep -Milliseconds 250
-$visibleWhileOptimizing = [OverlayExercise]::IsWindowVisible($hwnd)
-Start-Sleep -Milliseconds 2500
-$hiddenAfterOptimizing = -not [OverlayExercise]::IsWindowVisible($hwnd)
-$foregroundAfterHold = [OverlayExercise]::GetForegroundWindow()
 
 Send-OverlayHotkey
 Start-Sleep -Milliseconds 1100
@@ -129,18 +110,11 @@ Start-Sleep -Milliseconds 1100
 $result = [ordered]@{
     windowHandle = $hwnd.ToInt64()
     initiallyVisible = $initiallyVisible
-    shortPressStayedHidden = -not $visibleBeforeHoldThreshold
-    longHoldActivated = $visibleAfterHoldThreshold
-    visibleWhileListening = $visibleWhileListening
-    visibleWhileOptimizing = $visibleWhileOptimizing
-    hiddenAfterOptimizing = $hiddenAfterOptimizing
     hotkeyStarted = $visibleAfterHotkeyStart
     hotkeyShowedOptimizing = $visibleAfterHotkeyFinish
     hiddenAfterHotkeyOptimizing = $hiddenAfterHotkeyOptimizing
     foregroundBefore = $foregroundBefore.ToInt64()
-    foregroundAfterHold = $foregroundAfterHold.ToInt64()
     foregroundAfterHotkeys = $foregroundAfterHotkeys.ToInt64()
-    holdPreservedFocus = $foregroundBefore -eq $foregroundAfterHold
     hotkeysPreservedFocus = $foregroundBefore -eq $foregroundAfterHotkeys
 }
 
