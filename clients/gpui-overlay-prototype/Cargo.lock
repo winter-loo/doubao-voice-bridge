@@ -2266,6 +2266,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "ctrlc",
+ "embed-resource",
  "gpui",
  "raw-window-handle",
  "serde",
