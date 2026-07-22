@@ -384,13 +384,27 @@ struct BridgeSettingsView: View {
         Form {
             Section("Network") {
                 LabeledContent("Control port") {
-                    TextField("Control port", value: $draft.controlPort, format: .number)
+                    TextField(
+                        "Control port",
+                        value: $draft.controlPort,
+                        format: .number.grouping(.never)
+                    )
+                        .labelsHidden()
                         .textFieldStyle(.roundedBorder)
+                        .monospacedDigit()
+                        .multilineTextAlignment(.trailing)
                         .frame(width: 100)
                 }
                 LabeledContent("Audio port") {
-                    TextField("Audio port", value: $draft.audioPort, format: .number)
+                    TextField(
+                        "Audio port",
+                        value: $draft.audioPort,
+                        format: .number.grouping(.never)
+                    )
+                        .labelsHidden()
                         .textFieldStyle(.roundedBorder)
+                        .monospacedDigit()
+                        .multilineTextAlignment(.trailing)
                         .frame(width: 100)
                 }
             }
