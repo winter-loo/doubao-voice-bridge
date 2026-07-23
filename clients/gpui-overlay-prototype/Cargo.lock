@@ -2272,6 +2272,7 @@ dependencies = [
  "serde",
  "serde_json",
  "windows 0.61.3",
+ "x11rb",
 ]
 
 [[package]]
