@@ -123,10 +123,12 @@ cargo build --release
 DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
 ```
 
-It starts a one-shot recording session immediately. Click the overlay or press
-`Ctrl+C` to stop, wait for the final bridge result (with the latest committed
-text as a timeout fallback), and attempt to paste it into the previously focused
-application. See
+In an X11 desktop session it waits in the background; press `F13` to start and
+press `F13` again to stop. On native Wayland it starts a one-shot recording
+session immediately because compositor-wide shortcuts require portal support.
+Click the overlay or press `Ctrl+C` to stop, wait for the final bridge result
+(with the latest committed text as a timeout fallback), and attempt to paste it
+into the previously focused application. See
 [`clients/gpui-overlay-prototype/README.md`](clients/gpui-overlay-prototype/README.md)
 for Linux clipboard/input-tool requirements and current Wayland limitations.
 

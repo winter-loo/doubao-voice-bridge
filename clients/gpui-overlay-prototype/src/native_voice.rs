@@ -126,7 +126,7 @@ impl NativeVoiceController {
             .as_ref()
             .is_some_and(|session| !session.is_finished())
         {
-            return Ok(());
+            return Err("voice session is already active".to_string());
         }
         active.take();
         *active = Some(NativeVoiceSession::start(config, notify)?);
@@ -140,6 +140,9 @@ impl NativeVoiceController {
         let Some(session) = active.as_ref() else {
             return false;
         };
+        if session.is_finished() {
+            return false;
+        }
         session.request_stop();
         true
     }

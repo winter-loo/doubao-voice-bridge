@@ -49,6 +49,23 @@ enum OverlayPhase {
     Optimizing,
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceHotkeyAction {
+    Begin,
+    Finish,
+    Ignore,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn voice_hotkey_action(phase: OverlayPhase) -> VoiceHotkeyAction {
+    match phase {
+        OverlayPhase::Hidden => VoiceHotkeyAction::Begin,
+        OverlayPhase::Activating | OverlayPhase::Listening => VoiceHotkeyAction::Finish,
+        OverlayPhase::Optimizing => VoiceHotkeyAction::Ignore,
+    }
+}
+
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -854,6 +871,7 @@ mod platform {
         show_phase(hwnd, OverlayPhase::Activating);
         if let Err(error) = start_voice_client(generation, hwnd) {
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
+            hide_overlay(hwnd);
         }
     }
 
@@ -1241,10 +1259,34 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        BAR_COUNT, OverlayPhase, decoded_voice_activity, is_partial_speech_line,
+        BAR_COUNT, OverlayPhase, VoiceHotkeyAction, decoded_voice_activity, is_partial_speech_line,
         is_strong_voice_activity_line, overlay_phase_from_bridge_line,
-        voice_activity_from_audio_line, waveform_bar_height,
+        voice_activity_from_audio_line, voice_hotkey_action, waveform_bar_height,
     };
+
+    #[test]
+    fn f13_starts_only_from_hidden_state() {
+        assert_eq!(
+            voice_hotkey_action(OverlayPhase::Hidden),
+            VoiceHotkeyAction::Begin
+        );
+        assert_eq!(
+            voice_hotkey_action(OverlayPhase::Optimizing),
+            VoiceHotkeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn f13_finishes_activation_or_recording() {
+        assert_eq!(
+            voice_hotkey_action(OverlayPhase::Activating),
+            VoiceHotkeyAction::Finish
+        );
+        assert_eq!(
+            voice_hotkey_action(OverlayPhase::Listening),
+            VoiceHotkeyAction::Finish
+        );
+    }
 
     #[test]
     fn bridge_status_distinguishes_activation_from_recording() {
@@ -1337,41 +1379,107 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::thread;
+
     use gpui::Window;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11rb::{
+        connection::Connection,
+        protocol::{
+            Event,
+            xkb::{BoolCtrl, ConnectionExt as _, ID, PerClientFlag},
+            xproto::{
+                ChangeWindowAttributesAux, ConnectionExt as _, EventMask, GrabMode, Keycode,
+                ModMask, Window as X11Window,
+            },
+        },
+        rust_connection::RustConnection,
+    };
 
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController, NativeVoiceEvent};
     use super::{
-        NativeVoiceEventOutcome, OverlayPhase, apply_native_voice_event, clear_voice_activity,
-        next_overlay_generation, overlay_generation, set_overlay_phase,
+        NativeVoiceEventOutcome, OverlayPhase, VoiceHotkeyAction, apply_native_voice_event,
+        clear_voice_activity, next_overlay_generation, overlay_generation, overlay_phase,
+        set_overlay_phase, voice_hotkey_action,
     };
 
+    const F13_KEYSYM: u32 = 0xffca;
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
-    pub fn configure_overlay(_window: &Window) {
+    pub fn configure_overlay(window: &Window) {
         if let Err(error) = ctrlc::set_handler(|| {
             if stop_voice_client() {
                 set_overlay_phase(OverlayPhase::Optimizing);
+            } else {
+                std::process::exit(0);
             }
         }) {
             eprintln!("[linux-client] could not install signal handler: {error}");
         }
-        clear_voice_activity();
-        set_overlay_phase(OverlayPhase::Activating);
-        if let Err(error) = start_voice_client() {
-            eprintln!("[linux-client] failed to start voice client: {error}");
-            set_overlay_phase(OverlayPhase::Optimizing);
+
+        match x11_window(window) {
+            Some(_) if is_wayland_session() => {
+                eprintln!(
+                    "[linux-client] XWayland cannot register a compositor-wide F13 shortcut; \
+                     starting the legacy one-shot session"
+                );
+                begin_input(None);
+            }
+            Some(x_window) => match register_f13_hotkey() {
+                Ok((connection, keycode)) => {
+                    clear_voice_activity();
+                    set_overlay_phase(OverlayPhase::Hidden);
+                    set_x11_window_visible(x_window, false);
+                    start_f13_hotkey_thread(x_window, connection, keycode);
+                    eprintln!("[linux-client] ready; press F13 to start or finish voice input");
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[linux-client] could not register F13 ({error}); \
+                         starting the legacy one-shot session"
+                    );
+                    begin_input(None);
+                }
+            },
+            None => {
+                eprintln!(
+                    "[linux-client] native Wayland does not permit unprivileged global key \
+                     listeners; starting the legacy one-shot session"
+                );
+                begin_input(None);
+            }
         }
+    }
+
+    fn is_wayland_session() -> bool {
+        std::env::var("XDG_SESSION_TYPE")
+            .is_ok_and(|session_type| session_type.eq_ignore_ascii_case("wayland"))
     }
 
     pub fn finish_input(window: &mut Window) {
         if stop_voice_client() {
             set_overlay_phase(OverlayPhase::Optimizing);
-        } else {
+        } else if x11_window(window).is_none() {
             window.remove_window();
         }
     }
 
-    fn start_voice_client() -> Result<(), String> {
+    fn begin_input(x_window: Option<X11Window>) {
+        clear_voice_activity();
+        set_overlay_phase(OverlayPhase::Activating);
+        if let Some(x_window) = x_window {
+            set_x11_window_visible(x_window, true);
+        }
+        if let Err(error) = start_voice_client(x_window) {
+            eprintln!("[linux-client] failed to start voice client: {error}");
+            set_overlay_phase(OverlayPhase::Hidden);
+            if let Some(x_window) = x_window {
+                set_x11_window_visible(x_window, false);
+            }
+        }
+    }
+
+    fn start_voice_client(x_window: Option<X11Window>) -> Result<(), String> {
         let generation = next_overlay_generation();
         let config = NativeVoiceConfig::from_environment()?;
         VOICE_CLIENT.start(config, move |event| {
@@ -1389,7 +1497,13 @@ mod platform {
                 }
                 NativeVoiceEventOutcome::Finished => {
                     eprintln!("[linux-client] finished");
-                    std::process::exit(0);
+                    if let Some(x_window) = x_window {
+                        clear_voice_activity();
+                        set_overlay_phase(OverlayPhase::Hidden);
+                        set_x11_window_visible(x_window, false);
+                    } else {
+                        std::process::exit(0);
+                    }
                 }
             }
         })
@@ -1397,6 +1511,156 @@ mod platform {
 
     fn stop_voice_client() -> bool {
         VOICE_CLIENT.request_stop()
+    }
+
+    fn x11_window(window: &Window) -> Option<X11Window> {
+        match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+            RawWindowHandle::Xlib(handle) => u32::try_from(handle.window).ok(),
+            RawWindowHandle::Xcb(handle) => Some(handle.window.get()),
+            _ => None,
+        }
+    }
+
+    fn set_x11_window_visible(window: X11Window, visible: bool) {
+        let Ok((connection, _)) = RustConnection::connect(None) else {
+            eprintln!("[linux-client] could not connect to X11 to update the overlay");
+            return;
+        };
+        let result = if visible {
+            connection.map_window(window)
+        } else {
+            connection.unmap_window(window)
+        };
+        if result.is_err() || connection.flush().is_err() {
+            eprintln!("[linux-client] could not update the X11 overlay visibility");
+        }
+    }
+
+    fn start_f13_hotkey_thread(x_window: X11Window, connection: RustConnection, keycode: Keycode) {
+        thread::spawn(move || {
+            if let Err(error) = listen_for_f13(x_window, connection, keycode) {
+                eprintln!("[linux-client] F13 listener stopped: {error}");
+                std::process::exit(1);
+            }
+        });
+    }
+
+    fn register_f13_hotkey() -> Result<(RustConnection, Keycode), String> {
+        let (connection, screen_number) =
+            RustConnection::connect(None).map_err(|error| error.to_string())?;
+        let root = connection.setup().roots[screen_number].root;
+        let keycode = keycode_for_keysym(&connection, F13_KEYSYM)?
+            .ok_or_else(|| "the active X11 keymap does not contain F13".to_string())?;
+        enable_detectable_auto_repeat(&connection)?;
+
+        connection
+            .change_window_attributes(
+                root,
+                &ChangeWindowAttributesAux::new()
+                    .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+            )
+            .map_err(|error| error.to_string())?
+            .check()
+            .map_err(|error| error.to_string())?;
+        connection
+            .grab_key(
+                false,
+                root,
+                ModMask::ANY,
+                keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            )
+            .map_err(|error| error.to_string())?
+            .check()
+            .map_err(|error| {
+                format!("could not register F13; it may already be in use: {error}")
+            })?;
+        connection.flush().map_err(|error| error.to_string())?;
+        Ok((connection, keycode))
+    }
+
+    fn enable_detectable_auto_repeat(connection: &RustConnection) -> Result<(), String> {
+        let extension = connection
+            .xkb_use_extension(1, 0)
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| error.to_string())?;
+        if !extension.supported {
+            return Err("the XKB extension is unavailable".to_string());
+        }
+
+        let detectable = PerClientFlag::DETECTABLE_AUTO_REPEAT;
+        let flags = connection
+            .xkb_per_client_flags(
+                ID::USE_CORE_KBD.into(),
+                detectable,
+                detectable,
+                BoolCtrl::default(),
+                BoolCtrl::default(),
+                BoolCtrl::default(),
+            )
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| error.to_string())?;
+        if u32::from(flags.value & detectable) == 0 {
+            return Err("the X server does not support detectable key repeat".to_string());
+        }
+        Ok(())
+    }
+
+    fn listen_for_f13(
+        x_window: X11Window,
+        connection: RustConnection,
+        keycode: Keycode,
+    ) -> Result<(), String> {
+        let mut f13_down = false;
+        loop {
+            let event = connection
+                .wait_for_event()
+                .map_err(|error| error.to_string())?;
+            match event {
+                Event::KeyPress(event) if event.detail == keycode && !f13_down => {
+                    f13_down = true;
+                    match voice_hotkey_action(overlay_phase()) {
+                        VoiceHotkeyAction::Begin => begin_input(Some(x_window)),
+                        VoiceHotkeyAction::Finish => {
+                            if stop_voice_client() {
+                                set_overlay_phase(OverlayPhase::Optimizing);
+                            }
+                        }
+                        VoiceHotkeyAction::Ignore => {}
+                    }
+                }
+                Event::KeyRelease(event) if event.detail == keycode => f13_down = false,
+                _ => {}
+            }
+        }
+    }
+
+    fn keycode_for_keysym(
+        connection: &RustConnection,
+        target_keysym: u32,
+    ) -> Result<Option<Keycode>, String> {
+        let setup = connection.setup();
+        let min_keycode = setup.min_keycode;
+        let keycode_count = u8::try_from(u16::from(setup.max_keycode) - u16::from(min_keycode) + 1)
+            .map_err(|_| "the X11 keycode range is too large".to_string())?;
+        let mapping = connection
+            .get_keyboard_mapping(min_keycode, keycode_count)
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| error.to_string())?;
+        let keysyms_per_keycode = usize::from(mapping.keysyms_per_keycode);
+        if keysyms_per_keycode == 0 {
+            return Err("the X11 keyboard mapping did not contain any keysyms".to_string());
+        }
+
+        Ok(mapping
+            .keysyms
+            .chunks(keysyms_per_keycode)
+            .position(|keysyms| keysyms.contains(&target_keysym))
+            .map(|offset| min_keycode + offset as u8))
     }
 }
 
