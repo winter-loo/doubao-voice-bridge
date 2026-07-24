@@ -1396,7 +1396,7 @@ mod platform {
     use std::{
         fs::{File, OpenOptions},
         path::PathBuf,
-        sync::OnceLock,
+        sync::{Mutex, OnceLock},
         thread,
     };
 
@@ -1426,6 +1426,7 @@ mod platform {
 
     const F13_KEYSYM: u32 = 0xffca;
     static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
+    static VOICE_ACTION_LOCK: Mutex<()> = Mutex::new(());
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
     #[derive(Clone, Copy)]
@@ -1661,6 +1662,10 @@ mod platform {
     }
 
     fn handle_voice_shortcut(mode: LinuxSessionMode) {
+        let Ok(_action) = VOICE_ACTION_LOCK.lock() else {
+            eprintln!("[linux-client] voice action lock is poisoned");
+            return;
+        };
         match voice_hotkey_action(overlay_phase()) {
             VoiceHotkeyAction::Begin => begin_input(mode),
             VoiceHotkeyAction::Finish => {
