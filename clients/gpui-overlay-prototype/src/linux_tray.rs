@@ -1,4 +1,12 @@
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
+    thread,
+    time::Duration,
+};
 
 use gtk::glib;
 use tray_icon::{
@@ -9,6 +17,7 @@ use tray_icon::{
 const TOGGLE_MENU_ID: &str = "toggle-voice-input";
 const QUIT_MENU_ID: &str = "quit";
 const TRAY_ICON_SIZE: u32 = 32;
+const TRAY_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayPhase {
@@ -24,11 +33,15 @@ pub fn start(
     on_quit: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let thread_cancelled = Arc::clone(&cancelled);
     thread::Builder::new()
         .name("doubao-linux-tray".to_string())
         .spawn(move || match initialize(phase, on_toggle, on_quit) {
             Ok(tray) => {
-                let _ = ready_tx.send(Ok(()));
+                if thread_cancelled.load(Ordering::Acquire) || ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
                 gtk::main();
                 drop(tray);
             }
@@ -38,9 +51,19 @@ pub fn start(
         })
         .map_err(|error| format!("could not start tray thread: {error}"))?;
 
-    ready_rx
-        .recv()
-        .map_err(|_| "tray thread stopped during initialization".to_string())?
+    match ready_rx.recv_timeout(TRAY_START_TIMEOUT) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            cancelled.store(true, Ordering::Release);
+            Err(format!(
+                "tray initialization timed out after {} seconds",
+                TRAY_START_TIMEOUT.as_secs()
+            ))
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("tray thread stopped during initialization".to_string())
+        }
+    }
 }
 
 fn initialize(
