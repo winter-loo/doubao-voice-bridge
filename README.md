@@ -123,14 +123,14 @@ cargo build --release
 DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
 ```
 
-In an X11 desktop session it waits in the background; press `F13` to start and
-press `F13` again to stop. On native Wayland it starts a one-shot recording
-session immediately because compositor-wide shortcuts require portal support.
-Click the overlay or press `Ctrl+C` to stop, wait for the final bridge result
-(with the latest committed text as a timeout fallback), and attempt to paste it
-into the previously focused application. See
+It waits in the background; press `F13` to start and press `F13` again to stop.
+X11 uses a direct XGrabKey registration, while Wayland and XWayland request the
+binding through the XDG Global Shortcuts Portal and may show an authorization
+dialog on first launch. Click the overlay or press `Ctrl+C` to stop, wait for
+the final bridge result (with the latest committed text as a timeout fallback),
+and attempt to paste it into the previously focused application. See
 [`clients/gpui-overlay-prototype/README.md`](clients/gpui-overlay-prototype/README.md)
-for Linux clipboard/input-tool requirements and current Wayland limitations.
+for portal availability checks and Linux clipboard/input-tool requirements.
 
 The Python client remains useful for protocol diagnostics:
 

@@ -36,7 +36,9 @@ windows = { version = "0.61", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.12.3", default-features = false, features = ["async-std"] }
 cpal = "0.17"
 ctrlc = { version = "3.4", features = ["termination"] }
+futures-lite = "2"
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "inspector", "wayland", "x11"] }
 x11rb = { version = "0.13", features = ["xkb"] }

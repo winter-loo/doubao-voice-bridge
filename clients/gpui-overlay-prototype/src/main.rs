@@ -18,6 +18,8 @@ use gpui::{
 mod client_core;
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod client_settings;
+#[cfg(target_os = "linux")]
+mod linux_global_shortcuts;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod native_voice;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -25,6 +27,7 @@ mod platform_paste;
 #[cfg(target_os = "windows")]
 mod windows_shell;
 
+const CLIENT_APP_ID: &str = "local.doubao.voicebridge";
 const BOTTOM_MARGIN: f32 = 22.0;
 const BAR_WIDTH: f32 = 2.0;
 const BAR_GAP: f32 = 2.0;
@@ -602,6 +605,7 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(overlay_bounds(cx))),
             titlebar: None,
+            app_id: cfg!(target_os = "linux").then(|| CLIENT_APP_ID.to_string()),
             focus: cfg!(not(target_os = "windows"))
                 && std::env::var_os("DOUBAO_OVERLAY_FOCUS").is_some(),
             kind: WindowKind::PopUp,
@@ -1406,6 +1410,22 @@ mod platform {
     const F13_KEYSYM: u32 = 0xffca;
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
+    #[derive(Clone, Copy)]
+    enum LinuxSessionMode {
+        OneShot,
+        X11(X11Window),
+        Portal(Option<X11Window>),
+    }
+
+    impl LinuxSessionMode {
+        fn x11_window(self) -> Option<X11Window> {
+            match self {
+                Self::X11(window) | Self::Portal(Some(window)) => Some(window),
+                Self::OneShot | Self::Portal(None) => None,
+            }
+        }
+    }
+
     pub fn configure_overlay(window: &Window) {
         if let Err(error) = ctrlc::set_handler(|| {
             if stop_voice_client() {
@@ -1419,11 +1439,7 @@ mod platform {
 
         match x11_window(window) {
             Some(_) if is_wayland_session() => {
-                eprintln!(
-                    "[linux-client] XWayland cannot register a compositor-wide F13 shortcut; \
-                     starting the legacy one-shot session"
-                );
-                begin_input(None);
+                start_portal_shortcut_listener(x11_window(window));
             }
             Some(x_window) => match register_f13_hotkey() {
                 Ok((connection, keycode)) => {
@@ -1438,17 +1454,29 @@ mod platform {
                         "[linux-client] could not register F13 ({error}); \
                          starting the legacy one-shot session"
                     );
-                    begin_input(None);
+                    begin_input(LinuxSessionMode::OneShot);
                 }
             },
             None => {
-                eprintln!(
-                    "[linux-client] native Wayland does not permit unprivileged global key \
-                     listeners; starting the legacy one-shot session"
-                );
-                begin_input(None);
+                start_portal_shortcut_listener(None);
             }
         }
+    }
+
+    fn start_portal_shortcut_listener(x_window: Option<X11Window>) {
+        clear_voice_activity();
+        set_overlay_phase(OverlayPhase::Hidden);
+        if let Some(x_window) = x_window {
+            set_x11_window_visible(x_window, false);
+        }
+        eprintln!("[linux-client] requesting F13 through XDG Global Shortcuts Portal");
+        super::linux_global_shortcuts::start(
+            move || handle_voice_shortcut(LinuxSessionMode::Portal(x_window)),
+            |error| {
+                eprintln!("[linux-client] {error}");
+                std::process::exit(1);
+            },
+        );
     }
 
     fn is_wayland_session() -> bool {
@@ -1464,22 +1492,22 @@ mod platform {
         }
     }
 
-    fn begin_input(x_window: Option<X11Window>) {
+    fn begin_input(mode: LinuxSessionMode) {
         clear_voice_activity();
         set_overlay_phase(OverlayPhase::Activating);
-        if let Some(x_window) = x_window {
+        if let Some(x_window) = mode.x11_window() {
             set_x11_window_visible(x_window, true);
         }
-        if let Err(error) = start_voice_client(x_window) {
+        if let Err(error) = start_voice_client(mode) {
             eprintln!("[linux-client] failed to start voice client: {error}");
             set_overlay_phase(OverlayPhase::Hidden);
-            if let Some(x_window) = x_window {
+            if let Some(x_window) = mode.x11_window() {
                 set_x11_window_visible(x_window, false);
             }
         }
     }
 
-    fn start_voice_client(x_window: Option<X11Window>) -> Result<(), String> {
+    fn start_voice_client(mode: LinuxSessionMode) -> Result<(), String> {
         let generation = next_overlay_generation();
         let config = NativeVoiceConfig::from_environment()?;
         VOICE_CLIENT.start(config, move |event| {
@@ -1497,12 +1525,15 @@ mod platform {
                 }
                 NativeVoiceEventOutcome::Finished => {
                     eprintln!("[linux-client] finished");
-                    if let Some(x_window) = x_window {
-                        clear_voice_activity();
-                        set_overlay_phase(OverlayPhase::Hidden);
-                        set_x11_window_visible(x_window, false);
-                    } else {
-                        std::process::exit(0);
+                    clear_voice_activity();
+                    set_overlay_phase(OverlayPhase::Hidden);
+                    match mode {
+                        LinuxSessionMode::OneShot => std::process::exit(0),
+                        LinuxSessionMode::X11(x_window)
+                        | LinuxSessionMode::Portal(Some(x_window)) => {
+                            set_x11_window_visible(x_window, false);
+                        }
+                        LinuxSessionMode::Portal(None) => {}
                     }
                 }
             }
@@ -1511,6 +1542,18 @@ mod platform {
 
     fn stop_voice_client() -> bool {
         VOICE_CLIENT.request_stop()
+    }
+
+    fn handle_voice_shortcut(mode: LinuxSessionMode) {
+        match voice_hotkey_action(overlay_phase()) {
+            VoiceHotkeyAction::Begin => begin_input(mode),
+            VoiceHotkeyAction::Finish => {
+                if stop_voice_client() {
+                    set_overlay_phase(OverlayPhase::Optimizing);
+                }
+            }
+            VoiceHotkeyAction::Ignore => {}
+        }
     }
 
     fn x11_window(window: &Window) -> Option<X11Window> {
@@ -1622,15 +1665,7 @@ mod platform {
             match event {
                 Event::KeyPress(event) if event.detail == keycode && !f13_down => {
                     f13_down = true;
-                    match voice_hotkey_action(overlay_phase()) {
-                        VoiceHotkeyAction::Begin => begin_input(Some(x_window)),
-                        VoiceHotkeyAction::Finish => {
-                            if stop_voice_client() {
-                                set_overlay_phase(OverlayPhase::Optimizing);
-                            }
-                        }
-                        VoiceHotkeyAction::Ignore => {}
-                    }
+                    handle_voice_shortcut(LinuxSessionMode::X11(x_window));
                 }
                 Event::KeyRelease(event) if event.detail == keycode => f13_down = false,
                 _ => {}
