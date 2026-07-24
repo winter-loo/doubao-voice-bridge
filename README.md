@@ -126,9 +126,11 @@ DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
 It waits in the background; press `F13` to start and press `F13` again to stop.
 X11 uses a direct XGrabKey registration, while Wayland and XWayland request the
 binding through the XDG Global Shortcuts Portal and may show an authorization
-dialog on first launch. Click the overlay or press `Ctrl+C` to stop, wait for
-the final bridge result (with the latest committed text as a timeout fallback),
-and attempt to paste it into the previously focused application. See
+dialog on first launch. The Linux system tray provides the same start/stop
+control plus a quit action and remains usable if portal authorization is
+cancelled. Click the overlay or press `Ctrl+C` to stop, wait for the final bridge
+result (with the latest committed text as a timeout fallback), and attempt to
+paste it into the previously focused application. See
 [`clients/gpui-overlay-prototype/README.md`](clients/gpui-overlay-prototype/README.md)
 for portal availability checks and Linux clipboard/input-tool requirements.
 

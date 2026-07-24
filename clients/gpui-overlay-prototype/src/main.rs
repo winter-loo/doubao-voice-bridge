@@ -20,6 +20,8 @@ mod client_core;
 mod client_settings;
 #[cfg(target_os = "linux")]
 mod linux_global_shortcuts;
+#[cfg(target_os = "linux")]
+mod linux_tray;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod native_voice;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1414,6 +1416,7 @@ mod platform {
         rust_connection::RustConnection,
     };
 
+    use super::linux_tray::TrayPhase;
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController, NativeVoiceEvent};
     use super::{
         NativeVoiceEventOutcome, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPhase, VoiceHotkeyAction,
@@ -1499,8 +1502,10 @@ mod platform {
         }
 
         match x11_window(window) {
-            Some(_) if is_wayland_session() => {
-                start_portal_shortcut_listener(x11_window(window));
+            Some(x_window) if is_wayland_session() => {
+                let mode = LinuxSessionMode::Portal(Some(x_window));
+                let tray_available = start_tray(mode);
+                start_portal_shortcut_listener(Some(x_window), tray_available);
             }
             Some(x_window) => match register_f13_hotkey() {
                 Ok((connection, keycode)) => {
@@ -1508,23 +1513,34 @@ mod platform {
                     set_overlay_phase(OverlayPhase::Hidden);
                     set_x11_window_visible(x_window, false);
                     start_f13_hotkey_thread(x_window, connection, keycode);
+                    start_tray(LinuxSessionMode::X11(x_window));
                     eprintln!("[linux-client] ready; press F13 to start or finish voice input");
                 }
                 Err(error) => {
                     eprintln!(
                         "[linux-client] could not register F13 ({error}); \
-                         starting the legacy one-shot session"
+                         falling back to tray controls"
                     );
-                    begin_input(LinuxSessionMode::OneShot);
+                    clear_voice_activity();
+                    set_overlay_phase(OverlayPhase::Hidden);
+                    set_x11_window_visible(x_window, false);
+                    if !start_tray(LinuxSessionMode::X11(x_window)) {
+                        eprintln!(
+                            "[linux-client] tray unavailable; starting the legacy one-shot session"
+                        );
+                        begin_input(LinuxSessionMode::OneShot);
+                    }
                 }
             },
             None => {
-                start_portal_shortcut_listener(None);
+                let mode = LinuxSessionMode::Portal(None);
+                let tray_available = start_tray(mode);
+                start_portal_shortcut_listener(None, tray_available);
             }
         }
     }
 
-    fn start_portal_shortcut_listener(x_window: Option<X11Window>) {
+    fn start_portal_shortcut_listener(x_window: Option<X11Window>, tray_available: bool) {
         clear_voice_activity();
         set_overlay_phase(OverlayPhase::Hidden);
         if let Some(x_window) = x_window {
@@ -1533,8 +1549,12 @@ mod platform {
         eprintln!("[linux-client] requesting F13 through XDG Global Shortcuts Portal");
         super::linux_global_shortcuts::start(
             move || handle_voice_shortcut(LinuxSessionMode::Portal(x_window)),
-            |error| {
+            move |error| {
                 eprintln!("[linux-client] {error}");
+                if tray_available {
+                    eprintln!("[linux-client] continuing with tray controls");
+                    return;
+                }
                 if overlay_phase() != OverlayPhase::Hidden {
                     set_overlay_phase(OverlayPhase::Optimizing);
                 }
@@ -1542,6 +1562,37 @@ mod platform {
                 std::process::exit(1);
             },
         );
+    }
+
+    fn start_tray(mode: LinuxSessionMode) -> bool {
+        match super::linux_tray::start(tray_phase, move || handle_voice_shortcut(mode), quit_client)
+        {
+            Ok(()) => {
+                eprintln!("[linux-client] system tray ready");
+                true
+            }
+            Err(error) => {
+                eprintln!("[linux-client] system tray unavailable: {error}");
+                false
+            }
+        }
+    }
+
+    fn tray_phase() -> TrayPhase {
+        match overlay_phase() {
+            OverlayPhase::Hidden => TrayPhase::Idle,
+            OverlayPhase::Activating => TrayPhase::Activating,
+            OverlayPhase::Listening => TrayPhase::Listening,
+            OverlayPhase::Optimizing => TrayPhase::Finishing,
+        }
+    }
+
+    fn quit_client() {
+        if overlay_phase() != OverlayPhase::Hidden {
+            set_overlay_phase(OverlayPhase::Optimizing);
+        }
+        VOICE_CLIENT.stop_and_wait();
+        std::process::exit(0);
     }
 
     fn is_wayland_session() -> bool {

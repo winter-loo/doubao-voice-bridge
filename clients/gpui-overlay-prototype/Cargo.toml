@@ -42,4 +42,6 @@ ctrlc = { version = "3.4", features = ["termination"] }
 fs2 = "0.4"
 futures-lite = "2"
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "inspector", "wayland", "x11"] }
+gtk = "0.18"
+tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
 x11rb = { version = "0.13", features = ["xkb"] }

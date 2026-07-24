@@ -7,11 +7,17 @@ and pastes the final text without launching Python or FFmpeg.
 
 ## Linux
 
-Install an X11 clipboard tool and input injector. On Arch Linux with GNOME
-Wayland/XWayland:
+Install GTK 3, an AppIndicator implementation, an X11 clipboard tool, and an
+input injector. On Arch Linux with GNOME Wayland/XWayland:
 
 ```bash
-sudo pacman -S xclip xdotool
+sudo pacman -S gtk3 libayatana-appindicator xclip xdotool
+```
+
+On Debian or Ubuntu:
+
+```bash
+sudo apt install libgtk-3-dev libayatana-appindicator3-dev xclip xdotool
 ```
 
 Build and start the client from an interactive desktop terminal. Keep the
@@ -30,6 +36,17 @@ latest committed text if needed, attempts to paste the result into the
 previously focused app, and returns to the background for the next session.
 Launching the binary again while it is already running exits without creating
 a second shortcut or recording session.
+
+The Linux client adds a system tray icon with a live status row, a
+**开始语音输入** / **结束语音输入** action, and **退出**. The tray action and
+`F13` use the same voice-session state machine, so either control can finish a
+session started by the other. If global-shortcut authorization is cancelled on
+Wayland, the client remains available through the tray. If `F13` is already
+claimed on X11, the tray becomes the fallback control.
+
+The desktop environment must support StatusNotifier/AppIndicator icons. GNOME
+Shell installations that do not display the icon may also need an AppIndicator
+shell extension enabled.
 
 On X11, the client registers `F13` directly with XGrabKey. On Wayland and
 XWayland, it requests `F13` through the XDG Global Shortcuts Portal. The first
@@ -74,7 +91,7 @@ On XWayland, the client writes the result with `xclip` (or `xsel`) and injects
 explicit input-device permissions. If injection is unavailable, the recognized
 text remains in the clipboard for manual paste.
 
-The Linux slice does not yet include a tray menu or settings window.
+The Linux slice does not yet include a settings window.
 
 ## Windows
 
