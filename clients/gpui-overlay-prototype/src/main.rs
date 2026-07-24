@@ -1513,8 +1513,8 @@ mod platform {
                     clear_voice_activity();
                     set_overlay_phase(OverlayPhase::Hidden);
                     set_x11_window_visible(x_window, false);
-                    start_f13_hotkey_thread(x_window, connection, keycode);
-                    start_tray(LinuxSessionMode::X11(x_window));
+                    let tray_available = start_tray(LinuxSessionMode::X11(x_window));
+                    start_f13_hotkey_thread(x_window, connection, keycode, tray_available);
                     eprintln!("[linux-client] ready; press F13 to start or finish voice input");
                 }
                 Err(error) => {
@@ -1700,10 +1700,23 @@ mod platform {
         }
     }
 
-    fn start_f13_hotkey_thread(x_window: X11Window, connection: RustConnection, keycode: Keycode) {
+    fn start_f13_hotkey_thread(
+        x_window: X11Window,
+        connection: RustConnection,
+        keycode: Keycode,
+        tray_available: bool,
+    ) {
         thread::spawn(move || {
             if let Err(error) = listen_for_f13(x_window, connection, keycode) {
                 eprintln!("[linux-client] F13 listener stopped: {error}");
+                if tray_available {
+                    eprintln!("[linux-client] continuing with tray controls");
+                    return;
+                }
+                if overlay_phase() != OverlayPhase::Hidden {
+                    set_overlay_phase(OverlayPhase::Optimizing);
+                }
+                VOICE_CLIENT.stop_and_wait();
                 std::process::exit(1);
             }
         });

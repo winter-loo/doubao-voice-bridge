@@ -66,7 +66,8 @@ gdbus introspect --session \
 
 If the interface is absent, install or update the portal backend for the
 desktop. If authorization is cancelled or the portal is unavailable, the
-client exits with an error instead of starting the microphone unexpectedly.
+client continues with tray controls. It exits with an error only if the tray is
+also unavailable, and never starts the microphone unexpectedly.
 
 For a stable host application identity, install the release binary and desktop
 entry under the same application ID:
