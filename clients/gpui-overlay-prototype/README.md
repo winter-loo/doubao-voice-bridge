@@ -14,9 +14,8 @@ Wayland/XWayland:
 sudo pacman -S xclip xdotool
 ```
 
-Build and start the client from an interactive desktop terminal. In an X11
-desktop session, keep the process running and press `F13` to start or finish
-each voice session:
+Build and start the client from an interactive desktop terminal. Keep the
+process running and press `F13` to start or finish each voice session:
 
 ```bash
 cd clients/gpui-overlay-prototype
@@ -24,21 +23,44 @@ cargo build --release
 DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
 ```
 
-In an X11 desktop session, the client registers `F13` as a global hotkey and
-waits in the background. The first press starts recording and opens the overlay
-near the bottom of the screen; the next press, an overlay click, or `Ctrl+C`
-finishes the session. The client waits up to eight seconds for the final bridge
-event, falls back to the latest committed text if needed, attempts to paste the
-result into the previously focused app, and returns to the background for the
-next session.
+The first press starts recording and opens the overlay near the bottom of the
+screen; the next press, an overlay click, or `Ctrl+C` finishes the session. The
+client waits up to eight seconds for the final bridge event, falls back to the
+latest committed text if needed, attempts to paste the result into the
+previously focused app, and returns to the background for the next session.
 
-Native Wayland does not allow ordinary clients (including XWayland clients) to
-register a compositor-wide unprivileged key listener. In that mode the client
-preserves the one-shot behavior: it starts recording when launched and stops
-when the overlay is clicked or the process receives `Ctrl+C`. A desktop
-environment shortcut can bind `F13` to launch that one-shot session, but a
-second press does not stop it. A true Wayland toggle requires compositor support
-through the XDG Global Shortcuts Portal.
+On X11, the client registers `F13` directly with XGrabKey. On Wayland and
+XWayland, it requests `F13` through the XDG Global Shortcuts Portal. The first
+Wayland launch may open a desktop authorization dialog. Approve the shortcut
+and keep the client running; some desktops may assign a different binding, and
+the accepted binding is printed as `global shortcut ready: ...`.
+
+Wayland support requires `xdg-desktop-portal` plus a desktop portal backend that
+implements `org.freedesktop.portal.GlobalShortcuts`. To check the active portal:
+
+```bash
+gdbus introspect --session \
+  --dest org.freedesktop.portal.Desktop \
+  --object-path /org/freedesktop/portal/desktop |
+  grep GlobalShortcuts
+```
+
+If the interface is absent, install or update the portal backend for the
+desktop. If authorization is cancelled or the portal is unavailable, the
+client exits with an error instead of starting the microphone unexpectedly.
+
+For a stable host application identity, install the release binary and desktop
+entry under the same application ID:
+
+```bash
+install -Dm755 target/release/DoubaoVoiceClient \
+  ~/.local/bin/DoubaoVoiceClient
+install -Dm644 ../../packaging/local.doubao.voicebridge.desktop \
+  ~/.local/share/applications/local.doubao.voicebridge.desktop
+```
+
+Ensure `~/.local/bin` is in `PATH`. The desktop entry basename intentionally
+matches the client's `local.doubao.voicebridge` application ID.
 
 The default PipeWire/PulseAudio microphone is selected automatically. Set
 `DOUBAO_VOICE_INPUT_DEVICE` to an exact CPAL device name to override it. The
@@ -50,9 +72,7 @@ On XWayland, the client writes the result with `xclip` (or `xsel`) and injects
 explicit input-device permissions. If injection is unavailable, the recognized
 text remains in the clipboard for manual paste.
 
-The Linux slice does not yet include a tray menu or settings window. A native
-Wayland global shortcut can be added later through the XDG Global Shortcuts
-Portal without changing the shared audio and bridge protocol core.
+The Linux slice does not yet include a tray menu or settings window.
 
 ## Windows
 
