@@ -1394,10 +1394,7 @@ mod platform {
     use std::{
         fs::{File, OpenOptions},
         path::PathBuf,
-        sync::{
-            OnceLock,
-            atomic::{AtomicBool, Ordering},
-        },
+        sync::OnceLock,
         thread,
     };
 
@@ -1426,7 +1423,6 @@ mod platform {
 
     const F13_KEYSYM: u32 = 0xffca;
     static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
-    static EXIT_AFTER_VOICE_SESSION: AtomicBool = AtomicBool::new(false);
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
     #[derive(Clone, Copy)]
@@ -1539,12 +1535,11 @@ mod platform {
             move || handle_voice_shortcut(LinuxSessionMode::Portal(x_window)),
             |error| {
                 eprintln!("[linux-client] {error}");
-                EXIT_AFTER_VOICE_SESSION.store(true, Ordering::Release);
-                if stop_voice_client() {
+                if overlay_phase() != OverlayPhase::Hidden {
                     set_overlay_phase(OverlayPhase::Optimizing);
-                } else {
-                    std::process::exit(1);
                 }
+                VOICE_CLIENT.stop_and_wait();
+                std::process::exit(1);
             },
         );
     }
@@ -1597,9 +1592,6 @@ mod platform {
                     eprintln!("[linux-client] finished");
                     clear_voice_activity();
                     set_overlay_phase(OverlayPhase::Hidden);
-                    if EXIT_AFTER_VOICE_SESSION.swap(false, Ordering::AcqRel) {
-                        std::process::exit(1);
-                    }
                     match mode {
                         LinuxSessionMode::OneShot => std::process::exit(0),
                         LinuxSessionMode::X11(x_window)

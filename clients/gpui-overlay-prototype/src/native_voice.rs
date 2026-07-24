@@ -146,6 +146,16 @@ impl NativeVoiceController {
         session.request_stop();
         true
     }
+
+    pub fn stop_and_wait(&self) -> bool {
+        let session = {
+            let Ok(mut active) = self.active.lock() else {
+                return false;
+            };
+            active.take()
+        };
+        session.is_some_and(NativeVoiceSession::stop_and_wait)
+    }
 }
 
 impl NativeVoiceSession {
@@ -173,6 +183,15 @@ impl NativeVoiceSession {
 
     fn is_finished(&self) -> bool {
         self.worker.is_finished()
+    }
+
+    fn stop_and_wait(self) -> bool {
+        let was_active = !self.is_finished();
+        if was_active {
+            self.request_stop();
+        }
+        let _ = self.worker.join();
+        was_active
     }
 }
 
