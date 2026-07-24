@@ -32,7 +32,7 @@ pub fn start(
     on_toggle: impl Fn() + Send + Sync + 'static,
     on_quit: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), String> {
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
     let cancelled = Arc::new(AtomicBool::new(false));
     let thread_cancelled = Arc::clone(&cancelled);
     thread::Builder::new()
