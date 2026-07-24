@@ -28,6 +28,8 @@ screen; the next press, an overlay click, or `Ctrl+C` finishes the session. The
 client waits up to eight seconds for the final bridge event, falls back to the
 latest committed text if needed, attempts to paste the result into the
 previously focused app, and returns to the background for the next session.
+Launching the binary again while it is already running exits without creating
+a second shortcut or recording session.
 
 On X11, the client registers `F13` directly with XGrabKey. On Wayland and
 XWayland, it requests `F13` through the XDG Global Shortcuts Portal. The first

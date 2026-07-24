@@ -556,7 +556,11 @@ fn optimizing_capsule(delta: f32) -> impl IntoElement {
 struct VoiceOverlay;
 
 impl Render for VoiceOverlay {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let phase = overlay_phase();
+        #[cfg(target_os = "linux")]
+        platform::sync_overlay_window(window, phase);
+
         div()
             .size_full()
             .flex()
@@ -565,8 +569,8 @@ impl Render for VoiceOverlay {
             .with_animation(
                 "overlay-clock",
                 Animation::new(Duration::from_millis(1_120)).repeat(),
-                |root, delta| {
-                    let content = match overlay_phase() {
+                move |root, delta| {
+                    let content = match phase {
                         OverlayPhase::Hidden => div().into_any_element(),
                         OverlayPhase::Activating => activating_capsule(delta).into_any_element(),
                         OverlayPhase::Listening => listening_capsule(delta).into_any_element(),
@@ -597,6 +601,10 @@ fn overlay_bounds(cx: &App) -> Bounds<gpui::Pixels> {
 
 fn main() {
     #[cfg(target_os = "windows")]
+    if !platform::claim_single_instance() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
     if !platform::claim_single_instance() {
         return;
     }
@@ -1383,8 +1391,17 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::thread;
+    use std::{
+        fs::{File, OpenOptions},
+        path::PathBuf,
+        sync::{
+            OnceLock,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+    };
 
+    use fs2::FileExt as _;
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use x11rb::{
@@ -1402,12 +1419,14 @@ mod platform {
 
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController, NativeVoiceEvent};
     use super::{
-        NativeVoiceEventOutcome, OverlayPhase, VoiceHotkeyAction, apply_native_voice_event,
-        clear_voice_activity, next_overlay_generation, overlay_generation, overlay_phase,
-        set_overlay_phase, voice_hotkey_action,
+        NativeVoiceEventOutcome, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPhase, VoiceHotkeyAction,
+        apply_native_voice_event, clear_voice_activity, next_overlay_generation,
+        overlay_generation, overlay_phase, px, set_overlay_phase, size, voice_hotkey_action,
     };
 
     const F13_KEYSYM: u32 = 0xffca;
+    static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
+    static EXIT_AFTER_VOICE_SESSION: AtomicBool = AtomicBool::new(false);
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
     #[derive(Clone, Copy)]
@@ -1423,6 +1442,52 @@ mod platform {
                 Self::X11(window) | Self::Portal(Some(window)) => Some(window),
                 Self::OneShot | Self::Portal(None) => None,
             }
+        }
+    }
+
+    pub fn claim_single_instance() -> bool {
+        let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+            eprintln!("[linux-client] XDG_RUNTIME_DIR is not set; refusing to run without a lock");
+            return false;
+        };
+        let lock_path = runtime_dir.join("doubao-voice-client.lock");
+        let file = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "[linux-client] could not open instance lock {}: {error}",
+                    lock_path.display()
+                );
+                return false;
+            }
+        };
+        if let Err(error) = file.try_lock_exclusive() {
+            eprintln!("[linux-client] another client instance is already running: {error}");
+            return false;
+        }
+        INSTANCE_LOCK.set(file).is_ok()
+    }
+
+    pub fn sync_overlay_window(window: &mut Window, phase: OverlayPhase) {
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return;
+        };
+        if !matches!(handle.as_raw(), RawWindowHandle::Wayland(_)) {
+            return;
+        }
+        let desired_size = if phase == OverlayPhase::Hidden {
+            size(px(1.0), px(1.0))
+        } else {
+            size(px(OVERLAY_WIDTH), px(OVERLAY_HEIGHT))
+        };
+        if window.bounds().size != desired_size {
+            window.resize(desired_size);
         }
     }
 
@@ -1474,7 +1539,12 @@ mod platform {
             move || handle_voice_shortcut(LinuxSessionMode::Portal(x_window)),
             |error| {
                 eprintln!("[linux-client] {error}");
-                std::process::exit(1);
+                EXIT_AFTER_VOICE_SESSION.store(true, Ordering::Release);
+                if stop_voice_client() {
+                    set_overlay_phase(OverlayPhase::Optimizing);
+                } else {
+                    std::process::exit(1);
+                }
             },
         );
     }
@@ -1527,6 +1597,9 @@ mod platform {
                     eprintln!("[linux-client] finished");
                     clear_voice_activity();
                     set_overlay_phase(OverlayPhase::Hidden);
+                    if EXIT_AFTER_VOICE_SESSION.swap(false, Ordering::AcqRel) {
+                        std::process::exit(1);
+                    }
                     match mode {
                         LinuxSessionMode::OneShot => std::process::exit(0),
                         LinuxSessionMode::X11(x_window)
