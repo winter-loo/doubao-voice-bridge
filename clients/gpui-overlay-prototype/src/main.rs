@@ -20,6 +20,8 @@ mod client_core;
 mod client_settings;
 #[cfg(target_os = "linux")]
 mod linux_global_shortcuts;
+#[cfg(any(target_os = "linux", test))]
+mod linux_shortcut;
 #[cfg(target_os = "linux")]
 mod linux_tray;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1279,7 +1281,7 @@ mod tests {
     };
 
     #[test]
-    fn f13_starts_only_from_hidden_state() {
+    fn voice_shortcut_starts_only_from_hidden_state() {
         assert_eq!(
             voice_hotkey_action(OverlayPhase::Hidden),
             VoiceHotkeyAction::Begin
@@ -1291,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn f13_finishes_activation_or_recording() {
+    fn voice_shortcut_finishes_activation_or_recording() {
         assert_eq!(
             voice_hotkey_action(OverlayPhase::Activating),
             VoiceHotkeyAction::Finish
@@ -1415,7 +1417,9 @@ mod platform {
         },
         rust_connection::RustConnection,
     };
+    use xkbcommon::xkb::keysyms;
 
+    use super::linux_shortcut::{LinuxShortcut, ShortcutModifiers};
     use super::linux_tray::TrayPhase;
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController, NativeVoiceEvent};
     use super::{
@@ -1424,7 +1428,6 @@ mod platform {
         overlay_generation, overlay_phase, px, set_overlay_phase, size, voice_hotkey_action,
     };
 
-    const F13_KEYSYM: u32 = 0xffca;
     static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
     static VOICE_ACTION_LOCK: Mutex<()> = Mutex::new(());
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
@@ -1502,53 +1505,105 @@ mod platform {
             eprintln!("[linux-client] could not install signal handler: {error}");
         }
 
-        match x11_window(window) {
+        let x_window = x11_window(window);
+        let shortcut = match LinuxShortcut::from_environment() {
+            Ok(shortcut) => shortcut,
+            Err(error) => {
+                eprintln!("[linux-client] {error}; global shortcut disabled");
+                let mode = match x_window {
+                    Some(x_window) if !is_wayland_session() => LinuxSessionMode::X11(x_window),
+                    x_window => LinuxSessionMode::Portal(x_window),
+                };
+                fall_back_to_tray(mode, false);
+                return;
+            }
+        };
+
+        match x_window {
             Some(x_window) if is_wayland_session() => {
                 let mode = LinuxSessionMode::Portal(Some(x_window));
                 let tray_available = start_tray(mode);
-                start_portal_shortcut_listener(Some(x_window), tray_available);
+                start_portal_shortcut_listener(
+                    Some(x_window),
+                    shortcut.trigger().to_string(),
+                    tray_available,
+                );
             }
-            Some(x_window) => match register_f13_hotkey() {
+            Some(x_window) => match register_x11_hotkey(&shortcut) {
                 Ok((connection, keycode)) => {
                     clear_voice_activity();
                     set_overlay_phase(OverlayPhase::Hidden);
                     set_x11_window_visible(x_window, false);
                     let tray_available = start_tray(LinuxSessionMode::X11(x_window));
-                    start_f13_hotkey_thread(x_window, connection, keycode, tray_available);
-                    eprintln!("[linux-client] ready; press F13 to start or finish voice input");
+                    start_x11_hotkey_thread(
+                        x_window,
+                        connection,
+                        keycode,
+                        shortcut.trigger().to_string(),
+                        tray_available,
+                    );
+                    eprintln!(
+                        "[linux-client] ready; press {} to start or finish voice input",
+                        shortcut.trigger()
+                    );
                 }
                 Err(error) => {
                     eprintln!(
-                        "[linux-client] could not register F13 ({error}); \
-                         falling back to tray controls"
+                        "[linux-client] could not register {} ({error}); \
+                         falling back to tray controls",
+                        shortcut.trigger()
                     );
-                    clear_voice_activity();
-                    set_overlay_phase(OverlayPhase::Hidden);
-                    set_x11_window_visible(x_window, false);
-                    if !start_tray(LinuxSessionMode::X11(x_window)) {
-                        eprintln!(
-                            "[linux-client] tray unavailable; starting the legacy one-shot session"
-                        );
-                        begin_input(LinuxSessionMode::OneShot);
-                    }
+                    fall_back_to_tray(
+                        LinuxSessionMode::X11(x_window),
+                        error.allows_legacy_one_shot(),
+                    );
                 }
             },
             None => {
                 let mode = LinuxSessionMode::Portal(None);
                 let tray_available = start_tray(mode);
-                start_portal_shortcut_listener(None, tray_available);
+                start_portal_shortcut_listener(
+                    None,
+                    shortcut.trigger().to_string(),
+                    tray_available,
+                );
             }
         }
     }
 
-    fn start_portal_shortcut_listener(x_window: Option<X11Window>, tray_available: bool) {
+    fn fall_back_to_tray(mode: LinuxSessionMode, allow_legacy_one_shot: bool) {
+        clear_voice_activity();
+        set_overlay_phase(OverlayPhase::Hidden);
+        if let Some(x_window) = mode.x11_window() {
+            set_x11_window_visible(x_window, false);
+        }
+        if start_tray(mode) {
+            return;
+        }
+        if allow_legacy_one_shot {
+            eprintln!("[linux-client] tray unavailable; starting the legacy one-shot session");
+            begin_input(LinuxSessionMode::OneShot);
+        } else {
+            eprintln!("[linux-client] tray unavailable; exiting without starting the microphone");
+            std::process::exit(1);
+        }
+    }
+
+    fn start_portal_shortcut_listener(
+        x_window: Option<X11Window>,
+        preferred_trigger: String,
+        tray_available: bool,
+    ) {
         clear_voice_activity();
         set_overlay_phase(OverlayPhase::Hidden);
         if let Some(x_window) = x_window {
             set_x11_window_visible(x_window, false);
         }
-        eprintln!("[linux-client] requesting F13 through XDG Global Shortcuts Portal");
+        eprintln!(
+            "[linux-client] requesting {preferred_trigger} through XDG Global Shortcuts Portal"
+        );
         super::linux_global_shortcuts::start(
+            preferred_trigger,
             move || handle_voice_shortcut(LinuxSessionMode::Portal(x_window)),
             move |error| {
                 eprintln!("[linux-client] {error}");
@@ -1700,15 +1755,16 @@ mod platform {
         }
     }
 
-    fn start_f13_hotkey_thread(
+    fn start_x11_hotkey_thread(
         x_window: X11Window,
         connection: RustConnection,
         keycode: Keycode,
+        trigger: String,
         tray_available: bool,
     ) {
         thread::spawn(move || {
-            if let Err(error) = listen_for_f13(x_window, connection, keycode) {
-                eprintln!("[linux-client] F13 listener stopped: {error}");
+            if let Err(error) = listen_for_x11_hotkey(x_window, connection, keycode) {
+                eprintln!("[linux-client] {trigger} listener stopped: {error}");
                 if tray_available {
                     eprintln!("[linux-client] continuing with tray controls");
                     return;
@@ -1722,13 +1778,78 @@ mod platform {
         });
     }
 
-    fn register_f13_hotkey() -> Result<(RustConnection, Keycode), String> {
+    enum X11HotkeyError {
+        Configuration(String),
+        Operational(String),
+    }
+
+    impl X11HotkeyError {
+        fn configuration(error: impl Into<String>) -> Self {
+            Self::Configuration(error.into())
+        }
+
+        fn operational(error: impl ToString) -> Self {
+            Self::Operational(error.to_string())
+        }
+
+        fn allows_legacy_one_shot(&self) -> bool {
+            matches!(self, Self::Operational(_))
+        }
+    }
+
+    impl std::fmt::Display for X11HotkeyError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Configuration(error) | Self::Operational(error) => formatter.write_str(error),
+            }
+        }
+    }
+
+    fn register_x11_hotkey(
+        shortcut: &LinuxShortcut,
+    ) -> Result<(RustConnection, Keycode), X11HotkeyError> {
         let (connection, screen_number) =
-            RustConnection::connect(None).map_err(|error| error.to_string())?;
+            RustConnection::connect(None).map_err(X11HotkeyError::operational)?;
         let root = connection.setup().roots[screen_number].root;
-        let keycode = keycode_for_keysym(&connection, F13_KEYSYM)?
-            .ok_or_else(|| "the active X11 keymap does not contain F13".to_string())?;
-        enable_detectable_auto_repeat(&connection)?;
+        let keysym = shortcut.keysym().map_err(X11HotkeyError::configuration)?;
+        let keymap = X11Keymap::load(&connection).map_err(X11HotkeyError::operational)?;
+        let keycode = keymap
+            .keycode_for_primary_group_base_keysym(keysym)
+            .ok_or_else(|| {
+                X11HotkeyError::configuration(
+                    match keymap.keycode_for_keysym_at_any_level(keysym) {
+                        Some(_) => format!(
+                    "{} is not on the primary X11 keymap group's base layer; use the base key name and add SHIFT if needed",
+                    shortcut.key_name()
+                ),
+                        None => format!(
+                            "the primary X11 keymap group does not contain {}",
+                            shortcut.key_name()
+                        ),
+                    },
+                )
+            })?;
+        let modifier_map = connection
+            .get_modifier_mapping()
+            .map_err(X11HotkeyError::operational)?
+            .reply()
+            .map_err(X11HotkeyError::operational)?;
+        let modifiers = shortcut.modifiers();
+        let alt_mask = modifier_mask_for_keysyms(
+            &modifier_map.keycodes,
+            &keymap,
+            &[keysyms::KEY_Alt_L, keysyms::KEY_Alt_R],
+        );
+        let num_mask =
+            modifier_mask_for_keysyms(&modifier_map.keycodes, &keymap, &[keysyms::KEY_Num_Lock]);
+        let logo_mask = modifier_mask_for_keysyms(
+            &modifier_map.keycodes,
+            &keymap,
+            &[keysyms::KEY_Super_L, keysyms::KEY_Super_R],
+        );
+        let required_mask = required_modifier_mask(modifiers, alt_mask, num_mask, logo_mask)
+            .map_err(X11HotkeyError::configuration)?;
+        enable_detectable_auto_repeat(&connection).map_err(X11HotkeyError::operational)?;
 
         connection
             .change_window_attributes(
@@ -1736,25 +1857,87 @@ mod platform {
                 &ChangeWindowAttributesAux::new()
                     .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
             )
-            .map_err(|error| error.to_string())?
+            .map_err(X11HotkeyError::operational)?
             .check()
-            .map_err(|error| error.to_string())?;
-        connection
-            .grab_key(
-                false,
-                root,
-                ModMask::ANY,
-                keycode,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            )
-            .map_err(|error| error.to_string())?
-            .check()
-            .map_err(|error| {
-                format!("could not register F13; it may already be in use: {error}")
-            })?;
-        connection.flush().map_err(|error| error.to_string())?;
+            .map_err(X11HotkeyError::operational)?;
+        for mask in grab_masks(
+            required_mask,
+            (!modifiers.num).then_some(num_mask).flatten(),
+        ) {
+            connection
+                .grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC)
+                .map_err(X11HotkeyError::operational)?
+                .check()
+                .map_err(|error| {
+                    X11HotkeyError::operational(format!(
+                        "could not register {}; it may already be in use: {error}",
+                        shortcut.trigger()
+                    ))
+                })?;
+        }
+        connection.flush().map_err(X11HotkeyError::operational)?;
         Ok((connection, keycode))
+    }
+
+    fn required_modifier_mask(
+        modifiers: ShortcutModifiers,
+        alt_mask: Option<ModMask>,
+        num_mask: Option<ModMask>,
+        logo_mask: Option<ModMask>,
+    ) -> Result<ModMask, String> {
+        let mut mask = ModMask::default();
+        if modifiers.control {
+            mask |= ModMask::CONTROL;
+        }
+        if modifiers.shift {
+            mask |= ModMask::SHIFT;
+        }
+        if modifiers.alt {
+            mask |= alt_mask.ok_or_else(|| {
+                "the active X11 keymap does not define an Alt modifier".to_string()
+            })?;
+        }
+        if modifiers.num {
+            mask |= num_mask.ok_or_else(|| {
+                "the active X11 keymap does not define a Num Lock modifier".to_string()
+            })?;
+        }
+        if modifiers.logo {
+            mask |= logo_mask.ok_or_else(|| {
+                "the active X11 keymap does not define a Logo/Super modifier".to_string()
+            })?;
+        }
+        Ok(mask)
+    }
+
+    fn modifier_mask_for_keysyms(
+        modifier_keycodes: &[Keycode],
+        keymap: &X11Keymap,
+        target_keysyms: &[u32],
+    ) -> Option<ModMask> {
+        let keycodes_per_modifier = modifier_keycodes.len().checked_div(8)?;
+        if keycodes_per_modifier == 0 {
+            return None;
+        }
+        modifier_keycodes
+            .chunks(keycodes_per_modifier)
+            .position(|keycodes| {
+                keycodes.iter().any(|keycode| {
+                    *keycode != 0 && keymap.keycode_contains_any(*keycode, target_keysyms)
+                })
+            })
+            .map(|index| ModMask::from(1_u16 << index))
+    }
+
+    fn grab_masks(required: ModMask, num_lock: Option<ModMask>) -> Vec<ModMask> {
+        let mut masks = vec![required, required | ModMask::LOCK];
+        if let Some(num_lock) = num_lock {
+            masks.push(required | num_lock);
+            masks.push(required | num_lock | ModMask::LOCK);
+        }
+        masks.sort_by_key(|mask| u16::from(*mask));
+        masks.dedup();
+        masks
     }
 
     fn enable_detectable_auto_repeat(connection: &RustConnection) -> Result<(), String> {
@@ -1786,50 +1969,85 @@ mod platform {
         Ok(())
     }
 
-    fn listen_for_f13(
+    fn listen_for_x11_hotkey(
         x_window: X11Window,
         connection: RustConnection,
         keycode: Keycode,
     ) -> Result<(), String> {
-        let mut f13_down = false;
+        let mut shortcut_down = false;
         loop {
             let event = connection
                 .wait_for_event()
                 .map_err(|error| error.to_string())?;
             match event {
-                Event::KeyPress(event) if event.detail == keycode && !f13_down => {
-                    f13_down = true;
+                Event::KeyPress(event) if event.detail == keycode && !shortcut_down => {
+                    shortcut_down = true;
                     handle_voice_shortcut(LinuxSessionMode::X11(x_window));
                 }
-                Event::KeyRelease(event) if event.detail == keycode => f13_down = false,
+                Event::KeyRelease(event) if event.detail == keycode => shortcut_down = false,
+                Event::MappingNotify(_) => {
+                    return Err(
+                        "the keyboard mapping changed; restart the client to re-register the shortcut"
+                            .to_string(),
+                    );
+                }
                 _ => {}
             }
         }
     }
 
-    fn keycode_for_keysym(
-        connection: &RustConnection,
-        target_keysym: u32,
-    ) -> Result<Option<Keycode>, String> {
-        let setup = connection.setup();
-        let min_keycode = setup.min_keycode;
-        let keycode_count = u8::try_from(u16::from(setup.max_keycode) - u16::from(min_keycode) + 1)
-            .map_err(|_| "the X11 keycode range is too large".to_string())?;
-        let mapping = connection
-            .get_keyboard_mapping(min_keycode, keycode_count)
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?;
-        let keysyms_per_keycode = usize::from(mapping.keysyms_per_keycode);
-        if keysyms_per_keycode == 0 {
-            return Err("the X11 keyboard mapping did not contain any keysyms".to_string());
+    struct X11Keymap {
+        min_keycode: Keycode,
+        keysyms_per_keycode: usize,
+        keysyms: Vec<u32>,
+    }
+
+    impl X11Keymap {
+        fn load(connection: &RustConnection) -> Result<Self, String> {
+            let setup = connection.setup();
+            let min_keycode = setup.min_keycode;
+            let keycode_count =
+                u8::try_from(u16::from(setup.max_keycode) - u16::from(min_keycode) + 1)
+                    .map_err(|_| "the X11 keycode range is too large".to_string())?;
+            let mapping = connection
+                .get_keyboard_mapping(min_keycode, keycode_count)
+                .map_err(|error| error.to_string())?
+                .reply()
+                .map_err(|error| error.to_string())?;
+            let keysyms_per_keycode = usize::from(mapping.keysyms_per_keycode);
+            if keysyms_per_keycode == 0 {
+                return Err("the X11 keyboard mapping did not contain any keysyms".to_string());
+            }
+            Ok(Self {
+                min_keycode,
+                keysyms_per_keycode,
+                keysyms: mapping.keysyms,
+            })
         }
 
-        Ok(mapping
-            .keysyms
-            .chunks(keysyms_per_keycode)
-            .position(|keysyms| keysyms.contains(&target_keysym))
-            .map(|offset| min_keycode + offset as u8))
+        fn keycode_for_primary_group_base_keysym(&self, target_keysym: u32) -> Option<Keycode> {
+            self.keysyms
+                .chunks(self.keysyms_per_keycode)
+                .position(|keysyms| keysyms.first() == Some(&target_keysym))
+                .map(|offset| self.min_keycode + offset as u8)
+        }
+
+        fn keycode_for_keysym_at_any_level(&self, target_keysym: u32) -> Option<Keycode> {
+            self.keysyms
+                .chunks(self.keysyms_per_keycode)
+                .position(|keysyms| keysyms.contains(&target_keysym))
+                .map(|offset| self.min_keycode + offset as u8)
+        }
+
+        fn keycode_contains_any(&self, keycode: Keycode, target_keysyms: &[u32]) -> bool {
+            let Some(offset) = keycode.checked_sub(self.min_keycode).map(usize::from) else {
+                return false;
+            };
+            let start = offset.saturating_mul(self.keysyms_per_keycode);
+            self.keysyms
+                .get(start..start + self.keysyms_per_keycode)
+                .is_some_and(|keysyms| keysyms.iter().any(|keysym| target_keysyms.contains(keysym)))
+        }
     }
 }
 

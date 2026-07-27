@@ -10,6 +10,7 @@ pub struct ClientSettings {
     pub audio_port: u16,
     pub token: Option<String>,
     pub input_device_id: Option<String>,
+    pub voice_shortcut: String,
     pub start_with_windows: bool,
     pub setup_completed: bool,
 }
@@ -21,6 +22,7 @@ impl Default for ClientSettings {
             audio_port: 5004,
             token: None,
             input_device_id: None,
+            voice_shortcut: "F13".to_string(),
             start_with_windows: true,
             setup_completed: false,
         }
@@ -82,6 +84,7 @@ mod tests {
 
         assert_eq!(settings.server, "mac:4387");
         assert_eq!(settings.audio_port, 5004);
+        assert_eq!(settings.voice_shortcut, "F13");
         assert!(settings.start_with_windows);
         assert!(!settings.setup_completed);
     }

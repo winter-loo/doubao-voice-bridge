@@ -45,3 +45,4 @@ gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "
 gtk = "0.18"
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
 x11rb = { version = "0.13", features = ["xkb"] }
+xkbcommon = "0.8"

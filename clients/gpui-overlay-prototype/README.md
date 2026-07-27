@@ -21,13 +21,39 @@ sudo apt install libgtk-3-dev libayatana-appindicator3-dev xclip xdotool
 ```
 
 Build and start the client from an interactive desktop terminal. Keep the
-process running and press `F13` to start or finish each voice session:
+process running and press the configured global shortcut to start or finish
+each voice session (`F13` by default):
 
 ```bash
 cd clients/gpui-overlay-prototype
 cargo build --release
-DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
+DOUBAO_BRIDGE_SERVER=MAC_IP:4387 \
+DOUBAO_VOICE_SHORTCUT='CTRL+ALT+v' \
+  ./target/release/DoubaoVoiceClient
 ```
+
+Set `DOUBAO_VOICE_SHORTCUT` to a shortcut written in the
+[XDG Shortcuts syntax](https://specifications.freedesktop.org/shortcuts/latest/):
+join zero or more `CTRL`, `ALT`, `SHIFT`, `NUM`, or `LOGO` modifiers and an XKB
+key name with `+`. Examples include `F8`, `CTRL+ALT+v`, and
+`CTRL+SHIFT+space`. Modifier names are case-insensitive. The key name follows
+XKB naming, so names such as `Return`, `Page_Down`, and `XF86AudioPlay` are
+also accepted when present in the primary keymap group's base layer. Express
+shifted symbols with their base key plus `SHIFT` (for example,
+`CTRL+SHIFT+equal`) instead of a shifted symbol name such as `plus`.
+
+For a persistent setting, add `voice_shortcut` to
+`~/.config/DoubaoVoiceBridge/client.json`:
+
+```json
+{
+  "voice_shortcut": "CTRL+ALT+v"
+}
+```
+
+The environment variable overrides the JSON setting. Invalid values disable
+the keyboard shortcut and leave the tray available instead of silently
+grabbing `F13`.
 
 The first press starts recording and opens the overlay near the bottom of the
 screen; the next press, an overlay click, or `Ctrl+C` finishes the session. The
@@ -39,20 +65,29 @@ a second shortcut or recording session.
 
 The Linux client adds a system tray icon with a live status row, a
 **开始语音输入** / **结束语音输入** action, and **退出**. The tray action and
-`F13` use the same voice-session state machine, so either control can finish a
-session started by the other. If global-shortcut authorization is cancelled on
-Wayland, the client remains available through the tray. If `F13` is already
-claimed on X11, the tray becomes the fallback control.
+the configured shortcut use the same voice-session state machine, so either
+control can finish a session started by the other. If global-shortcut
+authorization is cancelled on Wayland, the client remains available through
+the tray. If the shortcut is already claimed on X11, the tray becomes the
+fallback control.
 
 The desktop environment must support StatusNotifier/AppIndicator icons. GNOME
 Shell installations that do not display the icon may also need an AppIndicator
 shell extension enabled.
 
-On X11, the client registers `F13` directly with XGrabKey. On Wayland and
-XWayland, it requests `F13` through the XDG Global Shortcuts Portal. The first
-Wayland launch may open a desktop authorization dialog. Approve the shortcut
-and keep the client running; some desktops may assign a different binding, and
-the accepted binding is printed as `global shortcut ready: ...`.
+On X11, the client resolves the configured XKB key from the primary keymap
+group's base layer, maps logical modifiers from the active keymap, and registers
+the resulting physical-key combination directly with XGrabKey. Switching an
+XKB layout group therefore keeps the shortcut on the same physical key. Caps
+Lock, and Num Lock when `NUM` is not explicitly configured, do not prevent the
+shortcut from working. If the X11 keyboard map changes while the client is
+running, restart the client to register against the new map; tray controls
+remain available in the meantime. On Wayland and XWayland, the client submits
+the configured value as the preferred trigger through the XDG Global Shortcuts
+Portal. The first Wayland launch may open a desktop authorization dialog.
+Approve or change the shortcut there and keep the client running; the desktop
+has the final say, and the accepted binding is printed as
+`global shortcut ready: ...`.
 
 Wayland support requires `xdg-desktop-portal` plus a desktop portal backend that
 implements `org.freedesktop.portal.GlobalShortcuts`. To check the active portal:

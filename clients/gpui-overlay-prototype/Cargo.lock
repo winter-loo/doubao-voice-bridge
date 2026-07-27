@@ -2543,6 +2543,7 @@ dependencies = [
  "tray-icon",
  "windows 0.61.3",
  "x11rb",
+ "xkbcommon",
 ]
 
 [[package]]
