@@ -123,16 +123,27 @@ cargo build --release
 DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
 ```
 
-It waits in the background; press `F13` to start and press `F13` again to stop.
-X11 uses a direct XGrabKey registration, while Wayland and XWayland request the
-binding through the XDG Global Shortcuts Portal and may show an authorization
-dialog on first launch. The Linux system tray provides the same start/stop
-control plus a quit action and remains usable if portal authorization is
-cancelled. Click the overlay or press `Ctrl+C` to stop, wait for the final bridge
-result (with the latest committed text as a timeout fallback), and attempt to
-paste it into the previously focused application. See
+It waits in the background; `F13` is the default start/stop shortcut. Ordinary
+keyboards can use a custom XDG shortcut such as `CTRL+ALT+v`:
+
+```bash
+DOUBAO_BRIDGE_SERVER=MAC_IP:4387 \
+DOUBAO_VOICE_SHORTCUT='CTRL+ALT+v' \
+  ./target/release/DoubaoVoiceClient
+```
+
+The same value can be stored as `voice_shortcut` in
+`~/.config/DoubaoVoiceBridge/client.json`. X11 registers the configured
+combination directly, while Wayland and XWayland send it to the XDG Global
+Shortcuts Portal as the preferred binding and may show an authorization dialog
+on first launch. The Linux system tray provides the same start/stop control
+plus a quit action and remains usable if portal authorization is cancelled.
+Click the overlay or press `Ctrl+C` to stop, wait for the final bridge result
+(with the latest committed text as a timeout fallback), and attempt to paste it
+into the previously focused application. See
 [`clients/gpui-overlay-prototype/README.md`](clients/gpui-overlay-prototype/README.md)
-for portal availability checks and Linux clipboard/input-tool requirements.
+for the supported shortcut syntax, portal availability checks, and Linux
+clipboard/input-tool requirements.
 
 The Python client remains useful for protocol diagnostics:
 

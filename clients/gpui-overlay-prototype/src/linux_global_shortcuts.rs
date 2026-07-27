@@ -14,8 +14,6 @@ use crate::CLIENT_APP_ID;
 
 const VOICE_SHORTCUT_ID: &str = "toggle-voice-input";
 const VOICE_SHORTCUT_DESCRIPTION: &str = "切换豆包语音输入";
-const VOICE_SHORTCUT_TRIGGER: &str = "F13";
-
 #[derive(Debug)]
 pub enum PortalShortcutError {
     Cancelled,
@@ -36,27 +34,28 @@ impl std::fmt::Display for PortalShortcutError {
 }
 
 pub fn start(
+    preferred_trigger: String,
     on_activated: impl Fn() + Send + 'static,
     on_error: impl FnOnce(PortalShortcutError) + Send + 'static,
 ) {
     thread::Builder::new()
         .name("doubao-global-shortcuts-portal".to_string())
         .spawn(move || {
-            if let Err(error) = future::block_on(run(on_activated)) {
+            if let Err(error) = future::block_on(run(&preferred_trigger, on_activated)) {
                 on_error(error);
             }
         })
         .expect("failed to start global shortcuts portal thread");
 }
 
-async fn run(on_activated: impl Fn()) -> Result<(), PortalShortcutError> {
+async fn run(preferred_trigger: &str, on_activated: impl Fn()) -> Result<(), PortalShortcutError> {
     register_application_id().await;
 
     let portal = GlobalShortcuts::new().await.map_err(classify_error)?;
     let mut activated = portal.receive_activated().await.map_err(classify_error)?;
     let session = portal.create_session().await.map_err(classify_error)?;
     let shortcut = NewShortcut::new(VOICE_SHORTCUT_ID, VOICE_SHORTCUT_DESCRIPTION)
-        .preferred_trigger(VOICE_SHORTCUT_TRIGGER);
+        .preferred_trigger(preferred_trigger);
     let request = portal
         .bind_shortcuts(&session, &[shortcut], None)
         .await
