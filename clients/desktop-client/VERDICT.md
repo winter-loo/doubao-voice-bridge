@@ -1,4 +1,4 @@
-# GPUI Windows Overlay Prototype Verdict
+# Windows Overlay Technical Validation
 
 ## Question
 

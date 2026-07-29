@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::{
@@ -20,6 +21,7 @@ const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
 const AUDIO_START_DELAY: Duration = Duration::from_millis(200);
 const AUDIO_STOP_SILENCE: Duration = Duration::from_millis(500);
+const ARMING_PREROLL_BYTES: usize = 48_000 * 2 * 5;
 
 const fn auto_paste_enabled() -> bool {
     cfg!(target_os = "windows")
@@ -207,6 +209,53 @@ struct AudioChunk {
     peak_dbfs: f32,
 }
 
+struct PrerollAudio {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    limit: usize,
+    recording: bool,
+}
+
+impl PrerollAudio {
+    fn new(limit: usize) -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            bytes: 0,
+            limit,
+            recording: false,
+        }
+    }
+
+    fn push(&mut self, pcm: Vec<u8>) -> Vec<Vec<u8>> {
+        if self.recording {
+            return vec![pcm];
+        }
+
+        self.bytes += pcm.len();
+        self.chunks.push_back(pcm);
+        while self.bytes > self.limit {
+            let excess = self.bytes - self.limit;
+            let Some(front) = self.chunks.front_mut() else {
+                break;
+            };
+            if front.len() <= excess {
+                self.bytes -= front.len();
+                self.chunks.pop_front();
+            } else {
+                front.drain(..excess);
+                self.bytes -= excess;
+            }
+        }
+        Vec::new()
+    }
+
+    fn start_recording(&mut self) -> Vec<Vec<u8>> {
+        self.recording = true;
+        self.bytes = 0;
+        self.chunks.drain(..).collect()
+    }
+}
+
 fn run_session<F>(
     config: NativeVoiceConfig,
     stop_rx: &Receiver<()>,
@@ -242,14 +291,19 @@ where
             .set_nodelay(true)
             .map_err(|error| format!("could not configure audio socket: {error}"))?;
 
-        let (audio_tx, audio_rx) = mpsc::sync_channel(32);
+        let (audio_tx, audio_rx) = mpsc::sync_channel(512);
         let (audio_error_tx, audio_error_rx) = mpsc::channel();
         let stream = start_microphone(config.input_device.as_deref(), audio_tx, audio_error_tx)?;
         let mut latest_text = String::new();
         let mut final_text = String::new();
+        let mut audio_forwarding = PrerollAudio::new(ARMING_PREROLL_BYTES);
 
         loop {
-            drain_bridge_events(&bridge_rx, notify, &mut latest_text, &mut final_text)?;
+            if drain_bridge_events(&bridge_rx, notify, &mut latest_text, &mut final_text)? {
+                for pcm in audio_forwarding.start_recording() {
+                    write_realtime_audio(&mut audio_socket, &pcm)?;
+                }
+            }
             if let Ok(error) = audio_error_rx.try_recv() {
                 return Err(error);
             }
@@ -263,9 +317,9 @@ where
                         rms_dbfs: chunk.rms_dbfs,
                         peak_dbfs: chunk.peak_dbfs,
                     });
-                    audio_socket
-                        .write_all(&chunk.pcm)
-                        .map_err(|error| format!("audio connection failed: {error}"))?;
+                    for pcm in audio_forwarding.push(chunk.pcm) {
+                        write_realtime_audio(&mut audio_socket, &pcm)?;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -276,8 +330,7 @@ where
 
         drop(stream);
         while let Ok(chunk) = audio_rx.try_recv() {
-            audio_socket
-                .write_all(&chunk.pcm)
+            write_realtime_audio(&mut audio_socket, &chunk.pcm)
                 .map_err(|error| format!("audio connection failed while stopping: {error}"))?;
         }
         write_command(&mut control, "stop")?;
@@ -338,14 +391,21 @@ fn drain_bridge_events<F>(
     notify: &F,
     latest_text: &mut String,
     final_text: &mut String,
-) -> Result<(), String>
+) -> Result<bool, String>
 where
     F: Fn(NativeVoiceEvent),
 {
+    let mut recording_started = false;
     loop {
         match events.try_recv() {
-            Ok(event) => handle_bridge_event(event, notify, latest_text, final_text)?,
-            Err(TryRecvError::Empty) => return Ok(()),
+            Ok(event) => {
+                recording_started |= matches!(
+                    &event,
+                    Ok(BridgeEvent::Phase(phase)) if phase == "recording"
+                );
+                handle_bridge_event(event, notify, latest_text, final_text)?;
+            }
+            Err(TryRecvError::Empty) => return Ok(recording_started),
             Err(TryRecvError::Disconnected) => {
                 return Err("bridge connection closed".to_string());
             }
@@ -384,9 +444,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeVoiceEvent, auto_paste_enabled, handle_bridge_event};
+    use super::{
+        NativeVoiceEvent, PrerollAudio, auto_paste_enabled, handle_bridge_event,
+        pcm_playback_duration,
+    };
     use crate::client_core::BridgeEvent;
-    use std::sync::Mutex;
+    use std::{sync::Mutex, time::Duration};
 
     #[test]
     fn bridge_text_events_are_delivered_to_the_ui() {
@@ -431,6 +494,31 @@ mod tests {
     #[test]
     fn linux_voice_result_is_not_automatically_pasted() {
         assert!(!auto_paste_enabled());
+    }
+
+    #[test]
+    fn audio_spoken_during_arming_is_forwarded_when_recording_starts() {
+        let mut audio = PrerollAudio::new(8);
+
+        assert!(audio.push(vec![1, 2, 3]).is_empty());
+        assert!(audio.push(vec![4, 5]).is_empty());
+        assert_eq!(audio.start_recording(), vec![vec![1, 2, 3], vec![4, 5]]);
+        assert_eq!(audio.push(vec![6, 7]), vec![vec![6, 7]]);
+    }
+
+    #[test]
+    fn arming_audio_keeps_only_the_configured_preroll_tail() {
+        let mut audio = PrerollAudio::new(5);
+
+        audio.push(vec![1, 2, 3]);
+        audio.push(vec![4, 5, 6, 7]);
+
+        assert_eq!(audio.start_recording(), vec![vec![3], vec![4, 5, 6, 7]]);
+    }
+
+    #[test]
+    fn pcm_playback_duration_uses_48khz_mono_s16le_rate() {
+        assert_eq!(pcm_playback_duration(96_000), Duration::from_secs(1));
     }
 }
 
@@ -587,6 +675,19 @@ fn write_command(stream: &mut TcpStream, command: &str) -> Result<(), String> {
     stream
         .write_all(format!("{command}\n").as_bytes())
         .map_err(|error| format!("could not send bridge command: {error}"))
+}
+
+fn pcm_playback_duration(bytes: usize) -> Duration {
+    Duration::from_secs_f64(bytes as f64 / (48_000.0 * 2.0))
+}
+
+fn write_realtime_audio(stream: &mut TcpStream, pcm: &[u8]) -> Result<(), String> {
+    let started = Instant::now();
+    stream
+        .write_all(pcm)
+        .map_err(|error| format!("audio connection failed: {error}"))?;
+    thread::sleep(pcm_playback_duration(pcm.len()).saturating_sub(started.elapsed()));
+    Ok(())
 }
 
 fn send_silence(stream: &mut TcpStream, duration: Duration) -> Result<(), String> {
