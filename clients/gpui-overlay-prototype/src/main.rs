@@ -1078,11 +1078,11 @@ mod platform {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindow,
-        GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE, SW_SHOW,
-        SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER,
-        WS_DISABLED, WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
-        WS_THICKFRAME,
+        GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IsWindowVisible, MB_ICONERROR, MB_OK, MSG,
+        MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+        WM_HOTKEY, WS_BORDER, WS_DISABLED, WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
     };
     use windows::core::{BOOL, w};
 
@@ -1655,8 +1655,22 @@ mod platform {
     fn start_hotkey_thread(hwnd_value: isize) {
         thread::spawn(move || unsafe {
             let hwnd = HWND(hwnd_value as *mut c_void);
-            RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_SPACE.0 as u32)
-                .expect("failed to register Ctrl+Alt+Space");
+            if RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_SPACE.0 as u32).is_err() {
+                append_voice_client_log(
+                    "[gpui] could not register Ctrl+Alt+Space; another application may own it\n",
+                );
+                let _ = MessageBoxW(
+                    None,
+                    w!(
+                        "Could not register Ctrl+Alt+Space. Another application may already use \
+                         this shortcut. Close the conflicting application, then restart Doubao \
+                         Voice Client."
+                    ),
+                    w!("Doubao Voice Client"),
+                    MB_OK | MB_ICONERROR,
+                );
+                return;
+            }
 
             let mut message = MSG::default();
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
