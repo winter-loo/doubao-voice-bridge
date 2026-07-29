@@ -1,36 +1,36 @@
+use std::ffi::c_void;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::{
-    Mutex,
-    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{FromSample, I24, Sample as _, SampleFormat, SizedSample, Stream, StreamConfig, U24};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL,
+};
 
 use crate::client_core::{
     BridgeEvent, PcmNormalizer, decode_bridge_event, encode_s16le, pcm_level,
 };
 use crate::client_settings::ClientSettings;
-use crate::platform_paste::{PasteTarget, paste_text};
 
 const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
 const AUDIO_START_DELAY: Duration = Duration::from_millis(200);
 const AUDIO_STOP_SILENCE: Duration = Duration::from_millis(500);
+const CF_UNICODETEXT: u32 = 13;
 
-const fn auto_paste_enabled() -> bool {
-    cfg!(target_os = "windows")
-}
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum NativeVoiceEvent {
     Phase(String),
     Partial(String),
-    Committed(String),
-    Final(String),
     AudioLevel { rms_dbfs: f32, peak_dbfs: f32 },
     Error(String),
     Finished,
@@ -42,7 +42,7 @@ pub struct NativeVoiceConfig {
     pub audio_port: u16,
     pub token: Option<String>,
     pub input_device: Option<String>,
-    paste_target: PasteTarget,
+    pub clipboard_owner: isize,
 }
 
 impl NativeVoiceConfig {
@@ -66,25 +66,17 @@ impl NativeVoiceConfig {
             input_device: std::env::var("DOUBAO_VOICE_INPUT_DEVICE")
                 .ok()
                 .or(settings.input_device_id),
-            paste_target: PasteTarget::default(),
+            clipboard_owner: 0,
         })
-    }
-
-    #[cfg(target_os = "windows")]
-    pub fn with_paste_target(mut self, paste_target: PasteTarget) -> Self {
-        self.paste_target = paste_target;
-        self
     }
 }
 
-#[cfg(target_os = "windows")]
 #[derive(Clone, Debug)]
 pub struct InputDeviceInfo {
     pub id: String,
     pub name: String,
 }
 
-#[cfg(target_os = "windows")]
 pub fn input_devices() -> Result<Vec<InputDeviceInfo>, String> {
     cpal::default_host()
         .input_devices()
@@ -104,68 +96,13 @@ pub fn input_devices() -> Result<Vec<InputDeviceInfo>, String> {
         .collect()
 }
 
-struct NativeVoiceSession {
+pub struct NativeVoiceSession {
     stop: SyncSender<()>,
     worker: JoinHandle<()>,
 }
 
-pub struct NativeVoiceController {
-    active: Mutex<Option<NativeVoiceSession>>,
-}
-
-impl NativeVoiceController {
-    pub const fn new() -> Self {
-        Self {
-            active: Mutex::new(None),
-        }
-    }
-
-    pub fn start<F>(&self, config: NativeVoiceConfig, notify: F) -> Result<(), String>
-    where
-        F: Fn(NativeVoiceEvent) + Send + 'static,
-    {
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| "voice client lock is poisoned".to_string())?;
-        if active
-            .as_ref()
-            .is_some_and(|session| !session.is_finished())
-        {
-            return Err("voice session is already active".to_string());
-        }
-        active.take();
-        *active = Some(NativeVoiceSession::start(config, notify)?);
-        Ok(())
-    }
-
-    pub fn request_stop(&self) -> bool {
-        let Ok(active) = self.active.lock() else {
-            return false;
-        };
-        let Some(session) = active.as_ref() else {
-            return false;
-        };
-        if session.is_finished() {
-            return false;
-        }
-        session.request_stop();
-        true
-    }
-
-    pub fn stop_and_wait(&self) -> bool {
-        let session = {
-            let Ok(mut active) = self.active.lock() else {
-                return false;
-            };
-            active.take()
-        };
-        session.is_some_and(NativeVoiceSession::stop_and_wait)
-    }
-}
-
 impl NativeVoiceSession {
-    fn start<F>(config: NativeVoiceConfig, notify: F) -> Result<Self, String>
+    pub fn start<F>(config: NativeVoiceConfig, notify: F) -> Result<Self, String>
     where
         F: Fn(NativeVoiceEvent) + Send + 'static,
     {
@@ -183,21 +120,12 @@ impl NativeVoiceSession {
         Ok(Self { stop, worker })
     }
 
-    fn request_stop(&self) {
+    pub fn request_stop(&self) {
         let _ = self.stop.try_send(());
     }
 
-    fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.worker.is_finished()
-    }
-
-    fn stop_and_wait(self) -> bool {
-        let was_active = !self.is_finished();
-        if was_active {
-            self.request_stop();
-        }
-        let _ = self.worker.join();
-        was_active
     }
 }
 
@@ -299,8 +227,8 @@ where
         } else {
             final_text
         };
-        if auto_paste_enabled() && !text.is_empty() {
-            paste_text(&text, config.paste_target)?;
+        if !text.is_empty() {
+            paste_text(&text, config.clipboard_owner)?;
         }
         Ok(())
     })();
@@ -365,14 +293,8 @@ where
     match event? {
         BridgeEvent::Phase(phase) => notify(NativeVoiceEvent::Phase(phase)),
         BridgeEvent::Partial(text) => notify(NativeVoiceEvent::Partial(text)),
-        BridgeEvent::Text(text) => {
-            *latest_text = text.clone();
-            notify(NativeVoiceEvent::Committed(text));
-        }
-        BridgeEvent::Final(text) => {
-            *final_text = text.clone();
-            notify(NativeVoiceEvent::Final(text));
-        }
+        BridgeEvent::Text(text) => *latest_text = text,
+        BridgeEvent::Final(text) => *final_text = text,
         BridgeEvent::Error { phase, message } => {
             let context = phase.map(|phase| format!("{phase}: ")).unwrap_or_default();
             return Err(format!("{context}{message}"));
@@ -380,58 +302,6 @@ where
         BridgeEvent::Other => {}
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{NativeVoiceEvent, auto_paste_enabled, handle_bridge_event};
-    use crate::client_core::BridgeEvent;
-    use std::sync::Mutex;
-
-    #[test]
-    fn bridge_text_events_are_delivered_to_the_ui() {
-        let received = Mutex::new(Vec::new());
-        let notify = |event| received.lock().unwrap().push(event);
-        let mut latest_text = String::new();
-        let mut final_text = String::new();
-
-        handle_bridge_event(
-            Ok(BridgeEvent::Partial("你".to_string())),
-            &notify,
-            &mut latest_text,
-            &mut final_text,
-        )
-        .unwrap();
-        handle_bridge_event(
-            Ok(BridgeEvent::Text("你好".to_string())),
-            &notify,
-            &mut latest_text,
-            &mut final_text,
-        )
-        .unwrap();
-        handle_bridge_event(
-            Ok(BridgeEvent::Final("你好世界".to_string())),
-            &notify,
-            &mut latest_text,
-            &mut final_text,
-        )
-        .unwrap();
-
-        assert_eq!(
-            received.into_inner().unwrap(),
-            vec![
-                NativeVoiceEvent::Partial("你".to_string()),
-                NativeVoiceEvent::Committed("你好".to_string()),
-                NativeVoiceEvent::Final("你好世界".to_string()),
-            ]
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_voice_result_is_not_automatically_pasted() {
-        assert!(!auto_paste_enabled());
-    }
 }
 
 fn start_microphone(
@@ -453,7 +323,7 @@ fn start_microphone(
             .ok_or_else(|| format!("microphone not found: {requested}"))?
     } else {
         host.default_input_device()
-            .ok_or_else(|| "no default microphone is available".to_string())?
+            .ok_or_else(|| "Windows has no default microphone".to_string())?
     };
     let supported = device
         .default_input_config()
@@ -599,4 +469,73 @@ fn send_silence(stream: &mut TcpStream, duration: Duration) -> Result<(), String
         thread::sleep(Duration::from_millis(20));
     }
     Ok(())
+}
+
+fn paste_text(text: &str, clipboard_owner: isize) -> Result<(), String> {
+    set_clipboard_text(text, clipboard_owner)?;
+    let inputs = [
+        keyboard_input(VK_CONTROL, false),
+        keyboard_input(VIRTUAL_KEY(b'V' as u16), false),
+        keyboard_input(VIRTUAL_KEY(b'V' as u16), true),
+        keyboard_input(VK_CONTROL, true),
+    ];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent != inputs.len() as u32 {
+        return Err("Windows blocked the paste shortcut; the text remains on the clipboard".into());
+    }
+    Ok(())
+}
+
+fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key,
+                dwFlags: if key_up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            },
+        },
+    }
+}
+
+fn set_clipboard_text(text: &str, clipboard_owner: isize) -> Result<(), String> {
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let owner = Some(HWND(clipboard_owner as *mut c_void));
+        let mut clipboard_open = false;
+        for _ in 0..10 {
+            if OpenClipboard(owner).is_ok() {
+                clipboard_open = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !clipboard_open {
+            return Err("could not open clipboard after 10 attempts".to_string());
+        }
+        let result = (|| {
+            EmptyClipboard().map_err(|error| format!("could not clear clipboard: {error}"))?;
+            let memory = GlobalAlloc(GMEM_MOVEABLE, utf16.len() * std::mem::size_of::<u16>())
+                .map_err(|error| format!("could not allocate clipboard memory: {error}"))?;
+            let pointer = GlobalLock(memory);
+            if pointer.is_null() {
+                let _ = GlobalFree(Some(memory));
+                return Err("could not lock clipboard memory".to_string());
+            }
+            std::ptr::copy_nonoverlapping(utf16.as_ptr(), pointer.cast::<u16>(), utf16.len());
+            let _ = GlobalUnlock(memory);
+            if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(memory.0))).is_err() {
+                let _ = GlobalFree(Some(memory));
+                return Err("could not set clipboard text".to_string());
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
 }

@@ -7,17 +7,17 @@ and pastes the final text without launching Python or FFmpeg.
 
 ## Linux
 
-Install GTK 3, an AppIndicator implementation, an X11 clipboard tool, and an
-input injector. On Arch Linux with GNOME Wayland/XWayland:
+Install a clipboard tool and an input injector. On Arch Linux with GNOME
+Wayland/XWayland:
 
 ```bash
-sudo pacman -S gtk3 libayatana-appindicator xclip xdotool
+sudo pacman -S xclip xdotool
 ```
 
 On Debian or Ubuntu:
 
 ```bash
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev xclip xdotool
+sudo apt install xclip xdotool
 ```
 
 Build and start the client from an interactive desktop terminal. Keep the
@@ -55,13 +55,23 @@ The environment variable overrides the JSON setting. Invalid values disable
 the keyboard shortcut and leave the tray available instead of silently
 grabbing `F13`.
 
-The first press starts recording and opens the overlay near the bottom of the
-screen; the next press, an overlay click, or `Ctrl+C` finishes the session. The
-client waits up to eight seconds for the final bridge event, falls back to the
-latest committed text if needed, attempts to paste the result into the
-previously focused app, and returns to the background for the next session.
-Launching the binary again while it is already running exits without creating
-a second shortcut or recording session.
+The first shortcut press starts recording and shows both the original compact
+overlay near the bottom of the screen and a separate, resizable Linux text
+window. Its text area is a GPUI `EntityInputHandler`: partial recognition
+appears there live, committed or final text replaces the partial result, and
+the result can then be selected or edited with the keyboard. The **复制** button
+copies the editor's complete current contents. Before the first voice session,
+no editor window is created at all. The first voice activation asks the GPUI
+main thread to create it, horizontally centered 14 logical px above the compact
+overlay. It remains visible after the session finishes so the result can be
+reviewed, edited, and copied; the next session clears and reuses the same
+editor. This does not replace or resize the compact overlay. The next shortcut
+press, an overlay click, or `Ctrl+C` finishes the session. The client waits up
+to eight seconds for the final bridge event and falls back to the latest
+committed text if needed. On Linux the result stays in the GPUI editor and is
+never automatically pasted with `Ctrl+V`; use the **复制** button when clipboard
+output is wanted. Launching the binary again while it is already running exits
+without creating a second shortcut or recording session.
 
 The Linux client adds a system tray icon with a live status row, a
 **开始语音输入** / **结束语音输入** action, and **退出**. The tray action and
@@ -71,9 +81,9 @@ authorization is cancelled on Wayland, the client remains available through
 the tray. If the shortcut is already claimed on X11, the tray becomes the
 fallback control.
 
-The desktop environment must support StatusNotifier/AppIndicator icons. GNOME
-Shell installations that do not display the icon may also need an AppIndicator
-shell extension enabled.
+The tray uses the freedesktop StatusNotifierItem protocol. GNOME Shell
+installations without a StatusNotifier host can still use the global shortcut,
+but need a compatible shell extension if a tray icon is required.
 
 On X11, the client resolves the configured XKB key from the primary keymap
 group's base layer, maps logical modifiers from the active keymap, and registers
@@ -82,12 +92,18 @@ XKB layout group therefore keeps the shortcut on the same physical key. Caps
 Lock, and Num Lock when `NUM` is not explicitly configured, do not prevent the
 shortcut from working. If the X11 keyboard map changes while the client is
 running, restart the client to register against the new map; tray controls
-remain available in the meantime. On Wayland and XWayland, the client submits
-the configured value as the preferred trigger through the XDG Global Shortcuts
-Portal. The first Wayland launch may open a desktop authorization dialog.
-Approve or change the shortcut there and keep the client running; the desktop
-has the final say, and the accepted binding is printed as
-`global shortcut ready: ...`.
+remain available in the meantime. On GNOME Wayland, the client installs a
+dedicated GNOME custom keybinding that forwards activation to the already
+running process over a private socket in `XDG_RUNTIME_DIR`. This avoids the
+GNOME 50 GlobalShortcuts provider crash when rebinding a previously saved
+shortcut. The binding is stored under
+`/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/doubao-voice-client/`.
+
+On other Wayland desktops, the client submits the configured value as the
+preferred trigger through the XDG Global Shortcuts Portal. The first launch may
+open a desktop authorization dialog. Approve or change the shortcut there and
+keep the client running; the desktop has the final say, and the accepted
+binding is printed as `global shortcut ready: ...`.
 
 Wayland support requires `xdg-desktop-portal` plus a desktop portal backend that
 implements `org.freedesktop.portal.GlobalShortcuts`. To check the active portal:
