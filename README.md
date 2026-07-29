@@ -118,7 +118,7 @@ The GPUI Linux client now implements the native microphone-to-bridge path and
 does not require Python or FFmpeg at runtime. From an interactive Linux desktop:
 
 ```bash
-cd clients/gpui-overlay-prototype
+cd clients/desktop-client
 cargo build --release
 DOUBAO_BRIDGE_SERVER=MAC_IP:4387 ./target/release/DoubaoVoiceClient
 ```
@@ -141,7 +141,7 @@ plus a quit action and remains usable if portal authorization is cancelled.
 Click the overlay or press `Ctrl+C` to stop, wait for the final bridge result
 (with the latest committed text as a timeout fallback), and attempt to paste it
 into the previously focused application. See
-[`clients/gpui-overlay-prototype/README.md`](clients/gpui-overlay-prototype/README.md)
+[`clients/desktop-client/README.md`](clients/desktop-client/README.md)
 for the supported shortcut syntax, portal availability checks, and Linux
 clipboard/input-tool requirements.
 
@@ -184,7 +184,7 @@ the Windows default microphone through WASAPI and does not require Python or
 FFmpeg at runtime:
 
 ```powershell
-cd clients\gpui-overlay-prototype
+cd clients\desktop-client
 cargo build --release
 $env:DOUBAO_BRIDGE_SERVER = "MAC_IP:4387"
 Start-Process .\target\release\DoubaoVoiceClient.exe

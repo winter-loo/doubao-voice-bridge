@@ -1,4 +1,4 @@
-# GPUI Voice Client
+# Doubao Voice Desktop Client
 
 The release executable contains the native Rust voice client for Windows and
 Linux. It captures the selected microphone through CPAL, normalizes audio to
@@ -25,7 +25,7 @@ process running and press the configured global shortcut to start or finish
 each voice session (`F13` by default):
 
 ```bash
-cd clients/gpui-overlay-prototype
+cd clients/desktop-client
 cargo build --release
 DOUBAO_BRIDGE_SERVER=MAC_IP:4387 \
 DOUBAO_VOICE_SHORTCUT='CTRL+ALT+v' \

@@ -189,7 +189,7 @@ CPAL device name or stable device ID before launching the client.
 Build the release executable once:
 
 ```powershell
-cd D:\proj\doubao-voice-bridge\clients\gpui-overlay-prototype
+cd D:\proj\doubao-voice-bridge\clients\desktop-client
 cargo build --release
 ```
 

@@ -2371,7 +2371,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-overlay-prototype"
+name = "doubao-voice-desktop-client"
 version = "0.1.0"
 dependencies = [
  "ashpd 0.12.3",
