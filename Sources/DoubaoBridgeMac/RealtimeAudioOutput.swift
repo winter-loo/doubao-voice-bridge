@@ -8,6 +8,7 @@ final class RealtimePCMBuffer {
     private var readIndex = 0
     private var writeIndex = 0
     private var availableFrames = 0
+    private var pendingLowByte: UInt8?
     private var lock = os_unfair_lock_s()
 
     init(capacityFrames: Int) {
@@ -20,22 +21,40 @@ final class RealtimePCMBuffer {
         data.withUnsafeBytes { rawBytes in
             let bytes = rawBytes.bindMemory(to: UInt8.self)
             var offset = 0
-            while offset + 1 < bytes.count {
-                let bits = UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
-                let sample = Float32(Int16(bitPattern: bits)) / 32_768
-                if availableFrames == samples.count {
-                    readIndex = (readIndex + 1) % samples.count
-                    availableFrames -= 1
+            if let pendingLowByte, !bytes.isEmpty {
+                let bits = UInt16(pendingLowByte) | UInt16(bytes[0]) << 8
+                if enqueueLocked(bits: bits) {
                     droppedFrames += 1
                 }
-                samples[writeIndex] = sample
-                writeIndex = (writeIndex + 1) % samples.count
-                availableFrames += 1
+                self.pendingLowByte = nil
+                offset = 1
+            }
+            while offset + 1 < bytes.count {
+                let bits = UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
+                if enqueueLocked(bits: bits) {
+                    droppedFrames += 1
+                }
                 offset += 2
+            }
+            if offset < bytes.count {
+                pendingLowByte = bytes[offset]
             }
         }
         os_unfair_lock_unlock(&lock)
         return droppedFrames * 2
+    }
+
+    private func enqueueLocked(bits: UInt16) -> Bool {
+        var droppedFrame = false
+        if availableFrames == samples.count {
+            readIndex = (readIndex + 1) % samples.count
+            availableFrames -= 1
+            droppedFrame = true
+        }
+        samples[writeIndex] = Float32(Int16(bitPattern: bits)) / 32_768
+        writeIndex = (writeIndex + 1) % samples.count
+        availableFrames += 1
+        return droppedFrame
     }
 
     func dequeue(frameCount: Int) -> [Float32] {

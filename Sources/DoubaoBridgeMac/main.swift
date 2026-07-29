@@ -27,9 +27,11 @@ struct Config {
     var finalDelay: TimeInterval = 1.8
     var showWindow = false
 
-    static func parse() throws -> Config {
+    static func parse(
+        arguments: [String] = Array(CommandLine.arguments.dropFirst()),
+        preferences: AppPreferences = AppPreferences(defaults: .standard)
+    ) throws -> Config {
         var config = Config()
-        let preferences = AppPreferences(defaults: .standard)
         config.port = UInt16(exactly: preferences.controlPort) ?? config.port
         config.udpPort = UInt16(exactly: preferences.audioPort) ?? config.udpPort
         config.audioDeviceName = preferences.virtualAudioDevice
@@ -37,7 +39,7 @@ struct Config {
         config.restoreDefaultInput = preferences.restoreDefaultInput
         config.showWindow = preferences.showCaptureWindow
         config.ffmpegPath = ExecutableResolver.resolve(config.ffmpegPath)
-        var args = Array(CommandLine.arguments.dropFirst())
+        var args = arguments
 
         func takeValue(after option: String) throws -> String {
             guard !args.isEmpty else {
@@ -57,6 +59,7 @@ struct Config {
                 config.audioTransport = try takeValue(after: option)
             case "--audio-device-index":
                 config.audioDeviceIndex = Int(try takeValue(after: option)) ?? config.audioDeviceIndex
+                config.audioDeviceName = nil
             case "--audio-device-name":
                 config.audioDeviceName = try takeValue(after: option)
             case "--ffmpeg":
