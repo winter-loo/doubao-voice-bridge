@@ -1,23 +1,13 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, RecvTimeoutError},
-    },
-    thread,
-    time::Duration,
+use std::sync::{Arc, Mutex, OnceLock};
+
+use ksni::{
+    Icon, MenuItem, ToolTip, Tray,
+    blocking::{Handle, TrayMethods as _},
+    menu::StandardItem,
 };
 
-use gtk::glib;
-use tray_icon::{
-    Icon, TrayIcon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-};
-
-const TOGGLE_MENU_ID: &str = "toggle-voice-input";
-const QUIT_MENU_ID: &str = "quit";
 const TRAY_ICON_SIZE: u32 = 32;
-const TRAY_START_TIMEOUT: Duration = Duration::from_secs(5);
+static TRAY_HANDLE: OnceLock<Mutex<Option<Handle<VoiceTray>>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayPhase {
@@ -27,84 +17,110 @@ pub enum TrayPhase {
     Finishing,
 }
 
+struct VoiceTray {
+    phase: fn() -> TrayPhase,
+    on_toggle: Arc<dyn Fn() + Send + Sync>,
+    on_quit: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Tray for VoiceTray {
+    const MENU_ON_ACTIVATE: bool = true;
+
+    fn id(&self) -> String {
+        "doubao-voice-client".to_string()
+    }
+
+    fn title(&self) -> String {
+        "Doubao Voice Client".to_string()
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        vec![Icon {
+            width: TRAY_ICON_SIZE as i32,
+            height: TRAY_ICON_SIZE as i32,
+            data: tray_icon_argb(TRAY_ICON_SIZE),
+        }]
+    }
+
+    fn tool_tip(&self) -> ToolTip {
+        ToolTip {
+            title: self.title(),
+            description: tray_labels((self.phase)()).status.to_string(),
+            icon_pixmap: self.icon_pixmap(),
+            ..Default::default()
+        }
+    }
+
+    fn menu(&self) -> Vec<MenuItem<Self>> {
+        let labels = tray_labels((self.phase)());
+        let on_toggle = Arc::clone(&self.on_toggle);
+        let on_quit = Arc::clone(&self.on_quit);
+
+        vec![
+            StandardItem {
+                label: labels.status.to_string(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: labels.toggle.to_string(),
+                enabled: labels.can_toggle,
+                activate: Box::new(move |_| on_toggle()),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "退出".to_string(),
+                icon_name: "application-exit".to_string(),
+                activate: Box::new(move |_| on_quit()),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
 pub fn start(
     phase: fn() -> TrayPhase,
     on_toggle: impl Fn() + Send + Sync + 'static,
     on_quit: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), String> {
-    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let thread_cancelled = Arc::clone(&cancelled);
-    thread::Builder::new()
-        .name("doubao-linux-tray".to_string())
-        .spawn(move || match initialize(phase, on_toggle, on_quit) {
-            Ok(tray) => {
-                if thread_cancelled.load(Ordering::Acquire) || ready_tx.send(Ok(())).is_err() {
-                    return;
-                }
-                gtk::main();
-                drop(tray);
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
-            }
-        })
-        .map_err(|error| format!("could not start tray thread: {error}"))?;
+    let tray = VoiceTray {
+        phase,
+        on_toggle: Arc::new(on_toggle),
+        on_quit: Arc::new(on_quit),
+    };
+    let handle = tray
+        .spawn()
+        .map_err(|error| format!("could not register StatusNotifierItem: {error}"))?;
 
-    match ready_rx.recv_timeout(TRAY_START_TIMEOUT) {
-        Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => {
-            cancelled.store(true, Ordering::Release);
-            Err(format!(
-                "tray initialization timed out after {} seconds",
-                TRAY_START_TIMEOUT.as_secs()
-            ))
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            Err("tray thread stopped during initialization".to_string())
-        }
-    }
+    let slot = TRAY_HANDLE.get_or_init(|| Mutex::new(None));
+    *slot
+        .lock()
+        .map_err(|_| "system tray handle lock is poisoned".to_string())? = Some(handle);
+    Ok(())
 }
 
-fn initialize(
-    phase: fn() -> TrayPhase,
-    on_toggle: impl Fn() + Send + Sync + 'static,
-    on_quit: impl Fn() + Send + Sync + 'static,
-) -> Result<TrayIcon, String> {
-    gtk::init().map_err(|error| format!("could not initialize GTK: {error}"))?;
-
-    let menu = Menu::new();
-    let labels = tray_labels(phase());
-    let status_item = MenuItem::new(labels.status, false, None);
-    let toggle_item = MenuItem::with_id(TOGGLE_MENU_ID, labels.toggle, labels.can_toggle, None);
-    let separator = PredefinedMenuItem::separator();
-    let quit_item = MenuItem::with_id(QUIT_MENU_ID, "退出", true, None);
-    menu.append_items(&[&status_item, &toggle_item, &separator, &quit_item])
-        .map_err(|error| format!("could not build tray menu: {error}"))?;
-
-    let tray = TrayIconBuilder::new()
-        .with_id("doubao-voice-client")
-        .with_menu(Box::new(menu))
-        .with_icon(tray_icon()?)
-        .with_tooltip("Doubao Voice Client")
-        .build()
-        .map_err(|error| format!("could not create tray icon: {error}"))?;
-
-    MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id().as_ref() {
-        TOGGLE_MENU_ID => on_toggle(),
-        QUIT_MENU_ID => on_quit(),
-        _ => {}
-    }));
-
-    glib::timeout_add_local(Duration::from_millis(150), move || {
-        let labels = tray_labels(phase());
-        status_item.set_text(labels.status);
-        toggle_item.set_text(labels.toggle);
-        toggle_item.set_enabled(labels.can_toggle);
-        glib::ControlFlow::Continue
+/// Tell StatusNotifier hosts that the dynamic labels and enabled state changed.
+pub fn refresh() {
+    if TRAY_HANDLE.get().is_none() {
+        return;
+    }
+    // A phase change can originate inside a tray activation callback. Updating
+    // synchronously there would wait on the same service thread.
+    std::thread::spawn(|| {
+        let Some(slot) = TRAY_HANDLE.get() else {
+            return;
+        };
+        let Ok(handle) = slot.lock() else {
+            return;
+        };
+        if let Some(handle) = handle.as_ref() {
+            let _ = handle.update(|_| {});
+        }
     });
-
-    Ok(tray)
 }
 
 struct TrayLabels {
@@ -138,17 +154,8 @@ fn tray_labels(phase: TrayPhase) -> TrayLabels {
     }
 }
 
-fn tray_icon() -> Result<Icon, String> {
-    Icon::from_rgba(
-        tray_icon_rgba(TRAY_ICON_SIZE),
-        TRAY_ICON_SIZE,
-        TRAY_ICON_SIZE,
-    )
-    .map_err(|error| format!("could not create tray icon pixels: {error}"))
-}
-
-fn tray_icon_rgba(size: u32) -> Vec<u8> {
-    let mut rgba = vec![0; (size * size * 4) as usize];
+fn tray_icon_argb(size: u32) -> Vec<u8> {
+    let mut argb = vec![0; (size * size * 4) as usize];
     let center = (size as f32 - 1.0) / 2.0;
     let radius = size as f32 * 0.47;
 
@@ -158,7 +165,7 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
             let dx = x as f32 - center;
             let dy = y as f32 - center;
             if dx * dx + dy * dy <= radius * radius {
-                rgba[offset..offset + 4].copy_from_slice(&[44, 153, 255, 255]);
+                argb[offset..offset + 4].copy_from_slice(&[255, 44, 153, 255]);
             }
 
             let microphone = (x >= size * 11 / 32 && x <= size * 20 / 32)
@@ -170,12 +177,12 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
             let foot = (x >= size * 11 / 32 && x <= size * 21 / 32)
                 && (y >= size * 24 / 32 && y <= size * 26 / 32);
             if microphone || microphone_base || stem || foot {
-                rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+                argb[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
             }
         }
     }
 
-    rgba
+    argb
 }
 
 #[cfg(test)]
@@ -201,9 +208,31 @@ mod tests {
     }
 
     #[test]
-    fn generated_icon_has_the_expected_rgba_shape() {
-        let pixels = tray_icon_rgba(TRAY_ICON_SIZE);
+    fn tray_labels_return_to_idle_between_repeated_sessions() {
+        let phases = [
+            TrayPhase::Activating,
+            TrayPhase::Finishing,
+            TrayPhase::Idle,
+            TrayPhase::Activating,
+            TrayPhase::Listening,
+            TrayPhase::Finishing,
+            TrayPhase::Idle,
+        ];
+        let toggles: Vec<_> = phases
+            .into_iter()
+            .map(|phase| tray_labels(phase).toggle)
+            .collect();
+
+        assert_eq!(toggles[2], "开始语音输入");
+        assert_eq!(toggles[3], "取消语音输入");
+        assert_eq!(toggles[6], "开始语音输入");
+    }
+
+    #[test]
+    fn status_notifier_icon_uses_argb_byte_order() {
+        let pixels = tray_icon_argb(TRAY_ICON_SIZE);
+
         assert_eq!(pixels.len(), (TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4) as usize);
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0] == 255));
     }
 }

@@ -91,6 +91,25 @@ impl LinuxShortcut {
     pub fn modifiers(&self) -> ShortcutModifiers {
         self.modifiers
     }
+
+    pub fn gtk_accelerator(&self) -> String {
+        let mut accelerator = String::new();
+        for (enabled, name) in [
+            (self.modifiers.control, "Control"),
+            (self.modifiers.alt, "Alt"),
+            (self.modifiers.shift, "Shift"),
+            (self.modifiers.num, "Mod2"),
+            (self.modifiers.logo, "Super"),
+        ] {
+            if enabled {
+                accelerator.push('<');
+                accelerator.push_str(name);
+                accelerator.push('>');
+            }
+        }
+        accelerator.push_str(&self.key_name);
+        accelerator
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -132,6 +151,7 @@ mod tests {
         let shortcut = LinuxShortcut::parse("ALT+CTRL+V").unwrap();
 
         assert_eq!(shortcut.trigger(), "CTRL+ALT+v");
+        assert_eq!(shortcut.gtk_accelerator(), "<Control><Alt>v");
         assert_eq!(shortcut.key_name(), "v");
         assert_eq!(
             shortcut.modifiers(),
