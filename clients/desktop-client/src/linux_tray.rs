@@ -20,6 +20,7 @@ pub enum TrayPhase {
 struct VoiceTray {
     phase: fn() -> TrayPhase,
     on_toggle: Arc<dyn Fn() + Send + Sync>,
+    on_settings: Arc<dyn Fn() + Send + Sync>,
     on_quit: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -54,6 +55,7 @@ impl Tray for VoiceTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let labels = tray_labels((self.phase)());
         let on_toggle = Arc::clone(&self.on_toggle);
+        let on_settings = Arc::clone(&self.on_settings);
         let on_quit = Arc::clone(&self.on_quit);
 
         vec![
@@ -67,6 +69,13 @@ impl Tray for VoiceTray {
                 label: labels.toggle.to_string(),
                 enabled: labels.can_toggle,
                 activate: Box::new(move |_| on_toggle()),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "打开设置".to_string(),
+                icon_name: "preferences-system".to_string(),
+                activate: Box::new(move |_| on_settings()),
                 ..Default::default()
             }
             .into(),
@@ -85,11 +94,13 @@ impl Tray for VoiceTray {
 pub fn start(
     phase: fn() -> TrayPhase,
     on_toggle: impl Fn() + Send + Sync + 'static,
+    on_settings: impl Fn() + Send + Sync + 'static,
     on_quit: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), String> {
     let tray = VoiceTray {
         phase,
         on_toggle: Arc::new(on_toggle),
+        on_settings: Arc::new(on_settings),
         on_quit: Arc::new(on_quit),
     };
     let handle = tray

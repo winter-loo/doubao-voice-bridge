@@ -37,6 +37,8 @@ mod linux_tray;
 mod native_voice;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod platform_paste;
+#[cfg(target_os = "linux")]
+mod settings_gui;
 #[cfg(target_os = "windows")]
 mod windows_shell;
 
@@ -939,6 +941,12 @@ fn overlay_bounds(cx: &App) -> Bounds<gpui::Pixels> {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--settings") {
+        settings_gui::run();
+        return;
+    }
+
     #[cfg(target_os = "linux")]
     if linux_gnome_shortcuts::forward_toggle_invocation() {
         return;
@@ -2274,8 +2282,12 @@ mod platform {
     }
 
     fn start_tray(mode: LinuxSessionMode) -> bool {
-        match super::linux_tray::start(tray_phase, move || handle_voice_shortcut(mode), quit_client)
-        {
+        match super::linux_tray::start(
+            tray_phase,
+            move || handle_voice_shortcut(mode),
+            open_settings,
+            quit_client,
+        ) {
             Ok(()) => {
                 eprintln!("[linux-client] system tray ready");
                 true
@@ -2302,6 +2314,19 @@ mod platform {
         }
         VOICE_CLIENT.stop_and_wait();
         std::process::exit(0);
+    }
+
+    fn open_settings() {
+        let Ok(executable) = std::env::current_exe() else {
+            eprintln!("[linux-client] could not locate executable for settings window");
+            return;
+        };
+        if let Err(error) = std::process::Command::new(executable)
+            .arg("--settings")
+            .spawn()
+        {
+            eprintln!("[linux-client] could not open settings window: {error}");
+        }
     }
 
     fn is_wayland_session() -> bool {

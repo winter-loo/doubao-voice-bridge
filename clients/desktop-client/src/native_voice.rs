@@ -671,6 +671,16 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
     }
 }
 
+/// Performs a lightweight TCP connectivity check against the bridge control
+/// endpoint. The bridge protocol is line-oriented, so a successful TCP
+/// handshake is enough to validate the address without starting a voice
+/// session or opening the microphone.
+pub fn test_connection(server: &str) -> Result<(), String> {
+    let (host, port) = parse_server(server)?;
+    let _stream = connect_with_timeout(&host, port, Duration::from_secs(3))?;
+    Ok(())
+}
+
 fn write_command(stream: &mut TcpStream, command: &str) -> Result<(), String> {
     stream
         .write_all(format!("{command}\n").as_bytes())

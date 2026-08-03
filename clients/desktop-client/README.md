@@ -143,7 +143,15 @@ On XWayland, the client writes the result with `xclip` (or `xsel`) and injects
 explicit input-device permissions. If injection is unavailable, the recognized
 text remains in the clipboard for manual paste.
 
-The Linux slice does not yet include a settings window.
+The Linux client includes a small GPUI settings window. Open it from the
+system-tray **打开设置** action, or launch `DoubaoVoiceClient --settings`.
+It edits the server address, audio port, and voice shortcut in
+`~/.config/DoubaoVoiceBridge/client.json`; environment variables still take
+precedence. The shortcut registration is initialized at client startup, so
+restart the client after changing the shortcut. The **测试连接** action checks
+the bridge control endpoint without starting the microphone. Clicking the
+shortcut field and pressing a key combination records it automatically (for
+example `CTRL+ALT+v`).
 
 ## Windows
 

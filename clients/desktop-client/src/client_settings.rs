@@ -42,7 +42,7 @@ impl ClientSettings {
             .map_err(|error| format!("invalid settings in {}: {error}", path.display()))
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub fn save(&self) -> Result<(), String> {
         let path = settings_path()?;
         if let Some(parent) = path.parent() {
