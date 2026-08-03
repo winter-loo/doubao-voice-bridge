@@ -2,8 +2,9 @@ use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::{
-    Mutex,
-    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,6 +23,8 @@ const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
 const AUDIO_START_DELAY: Duration = Duration::from_millis(200);
 const AUDIO_STOP_SILENCE: Duration = Duration::from_millis(500);
 const ARMING_PREROLL_BYTES: usize = 48_000 * 2 * 5;
+const AUDIO_BACKLOG_BYTES: usize = 48_000 * 2 * 10;
+const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const fn auto_paste_enabled() -> bool {
     cfg!(target_os = "windows")
@@ -212,29 +215,41 @@ struct AudioChunk {
 struct PrerollAudio {
     chunks: VecDeque<Vec<u8>>,
     bytes: usize,
-    limit: usize,
+    preroll_limit: usize,
+    backlog_limit: usize,
     recording: bool,
+    next_write_at: Option<Instant>,
 }
 
 impl PrerollAudio {
-    fn new(limit: usize) -> Self {
+    fn new(preroll_limit: usize, backlog_limit: usize) -> Self {
         Self {
             chunks: VecDeque::new(),
             bytes: 0,
-            limit,
+            preroll_limit,
+            backlog_limit,
             recording: false,
+            next_write_at: None,
         }
     }
 
-    fn push(&mut self, pcm: Vec<u8>) -> Vec<Vec<u8>> {
+    fn push(&mut self, pcm: Vec<u8>) -> Result<(), String> {
         if self.recording {
-            return vec![pcm];
+            if self.bytes.saturating_add(pcm.len()) > self.backlog_limit {
+                return Err("microphone audio backlog exceeded its 10-second safety limit".into());
+            }
+            if self.chunks.is_empty() {
+                self.next_write_at = Some(Instant::now());
+            }
+            self.bytes += pcm.len();
+            self.chunks.push_back(pcm);
+            return Ok(());
         }
 
         self.bytes += pcm.len();
         self.chunks.push_back(pcm);
-        while self.bytes > self.limit {
-            let excess = self.bytes - self.limit;
+        while self.bytes > self.preroll_limit {
+            let excess = self.bytes - self.preroll_limit;
             let Some(front) = self.chunks.front_mut() else {
                 break;
             };
@@ -246,14 +261,123 @@ impl PrerollAudio {
                 self.bytes -= excess;
             }
         }
-        Vec::new()
+        Ok(())
     }
 
-    fn start_recording(&mut self) -> Vec<Vec<u8>> {
+    fn start_recording(&mut self, now: Instant) {
         self.recording = true;
-        self.bytes = 0;
-        self.chunks.drain(..).collect()
+        self.next_write_at = (!self.chunks.is_empty()).then_some(now);
     }
+
+    fn take_ready(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if !self.recording || self.next_write_at.is_some_and(|deadline| deadline > now) {
+            return None;
+        }
+        let pcm = self.chunks.pop_front()?;
+        self.bytes -= pcm.len();
+        self.next_write_at = if self.chunks.is_empty() {
+            None
+        } else {
+            Some(now + pcm_playback_duration(pcm.len()))
+        };
+        Some(pcm)
+    }
+
+    fn wait_duration(&self, now: Instant, maximum: Duration) -> Duration {
+        self.next_write_at
+            .map(|deadline| deadline.saturating_duration_since(now).min(maximum))
+            .unwrap_or(maximum)
+    }
+
+    fn is_recording(&self) -> bool {
+        self.recording
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioQueueSendError {
+    Full,
+    Disconnected,
+}
+
+#[derive(Clone)]
+struct AudioQueueSender {
+    sender: mpsc::Sender<AudioChunk>,
+    queued_bytes: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+struct AudioQueueReceiver {
+    receiver: Receiver<AudioChunk>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl AudioQueueSender {
+    fn send(&self, chunk: AudioChunk) -> Result<(), AudioQueueSendError> {
+        let bytes = chunk.pcm.len();
+        let mut queued = self.queued_bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = queued.checked_add(bytes) else {
+                return Err(AudioQueueSendError::Full);
+            };
+            if next > self.limit {
+                return Err(AudioQueueSendError::Full);
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                queued,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => queued = actual,
+            }
+        }
+
+        if self.sender.send(chunk).is_err() {
+            self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(AudioQueueSendError::Disconnected);
+        }
+        Ok(())
+    }
+}
+
+impl AudioQueueReceiver {
+    fn recv_timeout(&self, timeout: Duration) -> Result<AudioChunk, mpsc::RecvTimeoutError> {
+        self.receiver
+            .recv_timeout(timeout)
+            .map(|chunk| self.release(chunk))
+    }
+
+    fn try_recv(&self) -> Result<AudioChunk, TryRecvError> {
+        self.receiver.try_recv().map(|chunk| self.release(chunk))
+    }
+
+    fn release(&self, chunk: AudioChunk) -> AudioChunk {
+        self.queued_bytes
+            .fetch_sub(chunk.pcm.len(), Ordering::AcqRel);
+        chunk
+    }
+}
+
+fn audio_channel(limit: usize) -> (AudioQueueSender, AudioQueueReceiver) {
+    let (sender, receiver) = mpsc::channel();
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    (
+        AudioQueueSender {
+            sender,
+            queued_bytes: queued_bytes.clone(),
+            limit,
+        },
+        AudioQueueReceiver {
+            receiver,
+            queued_bytes,
+        },
+    )
 }
 
 fn run_session<F>(
@@ -290,19 +414,20 @@ where
         audio_socket
             .set_nodelay(true)
             .map_err(|error| format!("could not configure audio socket: {error}"))?;
+        audio_socket
+            .set_write_timeout(Some(AUDIO_WRITE_TIMEOUT))
+            .map_err(|error| format!("could not configure audio write timeout: {error}"))?;
 
-        let (audio_tx, audio_rx) = mpsc::sync_channel(512);
-        let (audio_error_tx, audio_error_rx) = mpsc::channel();
+        let (audio_tx, audio_rx) = audio_channel(AUDIO_BACKLOG_BYTES);
+        let (audio_error_tx, audio_error_rx) = mpsc::sync_channel(1);
         let stream = start_microphone(config.input_device.as_deref(), audio_tx, audio_error_tx)?;
         let mut latest_text = String::new();
         let mut final_text = String::new();
-        let mut audio_forwarding = PrerollAudio::new(ARMING_PREROLL_BYTES);
+        let mut audio_forwarding = PrerollAudio::new(ARMING_PREROLL_BYTES, AUDIO_BACKLOG_BYTES);
 
         loop {
             if drain_bridge_events(&bridge_rx, notify, &mut latest_text, &mut final_text)? {
-                for pcm in audio_forwarding.start_recording() {
-                    write_realtime_audio(&mut audio_socket, &pcm)?;
-                }
+                audio_forwarding.start_recording(Instant::now());
             }
             if let Ok(error) = audio_error_rx.try_recv() {
                 return Err(error);
@@ -311,15 +436,18 @@ where
                 break;
             }
 
-            match audio_rx.recv_timeout(Duration::from_millis(20)) {
+            if let Some(pcm) = audio_forwarding.take_ready(Instant::now()) {
+                write_audio(&mut audio_socket, &pcm)?;
+            }
+
+            let wait = audio_forwarding.wait_duration(Instant::now(), Duration::from_millis(20));
+            match audio_rx.recv_timeout(wait) {
                 Ok(chunk) => {
                     notify(NativeVoiceEvent::AudioLevel {
                         rms_dbfs: chunk.rms_dbfs,
                         peak_dbfs: chunk.peak_dbfs,
                     });
-                    for pcm in audio_forwarding.push(chunk.pcm) {
-                        write_realtime_audio(&mut audio_socket, &pcm)?;
-                    }
+                    audio_forwarding.push(chunk.pcm)?;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -330,8 +458,16 @@ where
 
         drop(stream);
         while let Ok(chunk) = audio_rx.try_recv() {
-            write_realtime_audio(&mut audio_socket, &chunk.pcm)
-                .map_err(|error| format!("audio connection failed while stopping: {error}"))?;
+            audio_forwarding.push(chunk.pcm)?;
+        }
+        while audio_forwarding.is_recording() && !audio_forwarding.is_empty() {
+            let now = Instant::now();
+            if let Some(pcm) = audio_forwarding.take_ready(now) {
+                write_audio(&mut audio_socket, &pcm)
+                    .map_err(|error| format!("audio connection failed while stopping: {error}"))?;
+            } else {
+                thread::sleep(audio_forwarding.wait_duration(now, Duration::from_millis(20)));
+            }
         }
         write_command(&mut control, "stop")?;
         stop_sent = true;
@@ -445,11 +581,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeVoiceEvent, PrerollAudio, auto_paste_enabled, handle_bridge_event,
-        pcm_playback_duration,
+        AudioChunk, AudioQueueSendError, NativeVoiceEvent, PrerollAudio, audio_channel,
+        auto_paste_enabled, handle_bridge_event, pcm_playback_duration,
     };
     use crate::client_core::BridgeEvent;
-    use std::{sync::Mutex, time::Duration};
+    use std::{
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn bridge_text_events_are_delivered_to_the_ui() {
@@ -498,22 +637,70 @@ mod tests {
 
     #[test]
     fn audio_spoken_during_arming_is_forwarded_when_recording_starts() {
-        let mut audio = PrerollAudio::new(8);
+        let mut audio = PrerollAudio::new(8, 12);
+        let started = Instant::now();
 
-        assert!(audio.push(vec![1, 2, 3]).is_empty());
-        assert!(audio.push(vec![4, 5]).is_empty());
-        assert_eq!(audio.start_recording(), vec![vec![1, 2, 3], vec![4, 5]]);
-        assert_eq!(audio.push(vec![6, 7]), vec![vec![6, 7]]);
+        audio.push(vec![1, 2, 3, 4]).unwrap();
+        audio.push(vec![5, 6]).unwrap();
+        audio.start_recording(started);
+        assert_eq!(audio.take_ready(started), Some(vec![1, 2, 3, 4]));
+
+        // Live capture must remain buffered while the preroll is paced instead
+        // of waiting in a fixed-size callback-count channel.
+        audio.push(vec![7, 8]).unwrap();
+        assert_eq!(audio.take_ready(started), None);
+
+        let second = started + pcm_playback_duration(4);
+        assert_eq!(audio.take_ready(second), Some(vec![5, 6]));
+        let live = second + pcm_playback_duration(2);
+        assert_eq!(audio.take_ready(live), Some(vec![7, 8]));
     }
 
     #[test]
     fn arming_audio_keeps_only_the_configured_preroll_tail() {
-        let mut audio = PrerollAudio::new(5);
+        let mut audio = PrerollAudio::new(5, 8);
+        let started = Instant::now();
 
-        audio.push(vec![1, 2, 3]);
-        audio.push(vec![4, 5, 6, 7]);
+        audio.push(vec![1, 2, 3]).unwrap();
+        audio.push(vec![4, 5, 6, 7]).unwrap();
+        audio.start_recording(started);
 
-        assert_eq!(audio.start_recording(), vec![vec![3], vec![4, 5, 6, 7]]);
+        assert_eq!(audio.take_ready(started), Some(vec![3]));
+        assert_eq!(
+            audio.take_ready(started + pcm_playback_duration(1)),
+            Some(vec![4, 5, 6, 7])
+        );
+    }
+
+    #[test]
+    fn capture_channel_enforces_a_pcm_byte_budget_and_recovers_after_receive() {
+        let (audio_tx, audio_rx) = audio_channel(4);
+        let chunk = || AudioChunk {
+            pcm: vec![1, 2],
+            rms_dbfs: -20.0,
+            peak_dbfs: -10.0,
+        };
+
+        audio_tx.send(chunk()).unwrap();
+        audio_tx.send(chunk()).unwrap();
+        assert_eq!(audio_tx.send(chunk()), Err(AudioQueueSendError::Full));
+
+        audio_rx.recv_timeout(Duration::ZERO).unwrap();
+        audio_tx.send(chunk()).unwrap();
+    }
+
+    #[test]
+    fn paced_audio_fails_explicitly_when_combined_backlog_exceeds_its_byte_budget() {
+        let mut audio = PrerollAudio::new(4, 6);
+        let started = Instant::now();
+
+        audio.push(vec![1, 2, 3, 4]).unwrap();
+        audio.start_recording(started);
+        audio.push(vec![5, 6]).unwrap();
+        assert!(audio.push(vec![7, 8]).is_err());
+
+        assert_eq!(audio.take_ready(started), Some(vec![1, 2, 3, 4]));
+        audio.push(vec![7, 8]).unwrap();
     }
 
     #[test]
@@ -524,8 +711,8 @@ mod tests {
 
 fn start_microphone(
     requested_device: Option<&str>,
-    audio: SyncSender<AudioChunk>,
-    errors: mpsc::Sender<String>,
+    audio: AudioQueueSender,
+    errors: SyncSender<String>,
 ) -> Result<Stream, String> {
     let host = cpal::default_host();
     let device = if let Some(requested) = requested_device {
@@ -600,14 +787,15 @@ fn build_stream<T>(
     config: &StreamConfig,
     sample_rate: u32,
     channels: u16,
-    audio: SyncSender<AudioChunk>,
-    errors: mpsc::Sender<String>,
+    audio: AudioQueueSender,
+    errors: SyncSender<String>,
 ) -> Result<Stream, String>
 where
     T: SizedSample + Copy,
     f32: FromSample<T>,
 {
     let mut normalizer = PcmNormalizer::new(sample_rate, channels)?;
+    let capture_errors = errors.clone();
     device
         .build_input_stream(
             config,
@@ -623,14 +811,16 @@ where
                         rms_dbfs,
                         peak_dbfs,
                     };
-                    match audio.try_send(chunk) {
-                        Ok(()) | Err(TrySendError::Full(_)) => {}
-                        Err(TrySendError::Disconnected(_)) => {}
+                    if audio.send(chunk) == Err(AudioQueueSendError::Full) {
+                        let _ = capture_errors.try_send(
+                            "microphone audio backlog exceeded its 10-second safety limit"
+                                .to_string(),
+                        );
                     }
                 }
             },
             move |error| {
-                let _ = errors.send(format!("microphone stream failed: {error}"));
+                let _ = errors.try_send(format!("microphone stream failed: {error}"));
             },
             None,
         )
@@ -691,13 +881,10 @@ fn pcm_playback_duration(bytes: usize) -> Duration {
     Duration::from_secs_f64(bytes as f64 / (48_000.0 * 2.0))
 }
 
-fn write_realtime_audio(stream: &mut TcpStream, pcm: &[u8]) -> Result<(), String> {
-    let started = Instant::now();
+fn write_audio(stream: &mut TcpStream, pcm: &[u8]) -> Result<(), String> {
     stream
         .write_all(pcm)
-        .map_err(|error| format!("audio connection failed: {error}"))?;
-    thread::sleep(pcm_playback_duration(pcm.len()).saturating_sub(started.elapsed()));
-    Ok(())
+        .map_err(|error| format!("audio connection failed: {error}"))
 }
 
 fn send_silence(stream: &mut TcpStream, duration: Duration) -> Result<(), String> {

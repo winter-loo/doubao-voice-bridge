@@ -15,6 +15,27 @@ struct SettingsWindow {
     port: Entity<TranscriptInput>,
     shortcut: Entity<ShortcutCapture>,
     status: String,
+    connection_tests: ConnectionTestTracker,
+}
+
+#[derive(Default)]
+struct ConnectionTestTracker {
+    generation: u64,
+}
+
+impl ConnectionTestTracker {
+    fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
 }
 
 struct ShortcutCapture {
@@ -161,6 +182,21 @@ fn normal_shortcut_key(raw: &str) -> Option<String> {
         .then_some(key)
 }
 
+fn parse_audio_port(value: &str) -> Result<u16, &'static str> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or("音频端口必须是 1–65535")
+}
+
+fn connection_status(server: &str, result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!("连接成功：{server}"),
+        Err(error) => format!("连接失败：{error}"),
+    }
+}
+
 impl Focusable for ShortcutCapture {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -170,29 +206,44 @@ impl Focusable for ShortcutCapture {
 impl SettingsWindow {
     fn test_connection(&mut self, cx: &mut Context<Self>) {
         let server = self.server.read(cx).content().trim().to_string();
+        let generation = self.connection_tests.begin();
         self.status = "正在测试连接…".to_string();
         cx.notify();
-        self.status = match native_voice::test_connection(&server) {
-            Ok(()) => format!("连接成功：{server}"),
-            Err(error) => format!("连接失败：{error}"),
-        };
-        cx.notify();
+
+        let connection_test = cx.background_spawn(async move {
+            let result = native_voice::test_connection(&server);
+            (server, result)
+        });
+        cx.spawn(async move |this, cx| {
+            let (server, result) = connection_test.await;
+            this.update(cx, |this, cx| {
+                if !this.connection_tests.is_current(generation) {
+                    return;
+                }
+                this.status = connection_status(&server, result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
+        self.connection_tests.invalidate();
         let server = self.server.read(cx).content().trim().to_string();
         let port_text = self.port.read(cx).content().trim().to_string();
         let shortcut = self.shortcut.read(cx).committed.trim().to_string();
         let mut settings = ClientSettings::load().unwrap_or_default();
+        let audio_port = parse_audio_port(&port_text);
         if server.is_empty() {
             self.status = "服务器地址不能为空".to_string();
-        } else if port_text.parse::<u16>().is_err() {
-            self.status = "音频端口必须是 1–65535".to_string();
+        } else if let Err(error) = audio_port {
+            self.status = error.to_string();
         } else if linux_shortcut::LinuxShortcut::parse(&shortcut).is_err() {
             self.status = "快捷键格式无效，例如 CTRL+ALT+v".to_string();
         } else {
             settings.server = server;
-            settings.audio_port = port_text.parse().unwrap();
+            settings.audio_port = audio_port.expect("audio port was validated");
             settings.voice_shortcut = shortcut;
             settings.setup_completed = true;
             self.status = match settings.save() {
@@ -439,8 +490,46 @@ pub fn run() {
                 port,
                 shortcut,
                 status: String::new(),
+                connection_tests: ConnectionTestTracker::default(),
             })
         })
         .expect("failed to open settings window");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionTestTracker, connection_status, parse_audio_port};
+
+    #[test]
+    fn audio_port_zero_is_rejected() {
+        assert_eq!(parse_audio_port("0"), Err("音频端口必须是 1–65535"));
+        assert_eq!(parse_audio_port("1"), Ok(1));
+        assert_eq!(parse_audio_port("65535"), Ok(65_535));
+    }
+
+    #[test]
+    fn connection_result_is_formatted_after_the_worker_finishes() {
+        assert_eq!(
+            connection_status("bridge.local:5003", Ok(())),
+            "连接成功：bridge.local:5003"
+        );
+        assert_eq!(
+            connection_status("bridge.local:5003", Err("timed out".to_string())),
+            "连接失败：timed out"
+        );
+    }
+
+    #[test]
+    fn only_the_latest_connection_test_can_publish_its_result() {
+        let mut tests = ConnectionTestTracker::default();
+
+        let first = tests.begin();
+        let second = tests.begin();
+        assert!(!tests.is_current(first));
+        assert!(tests.is_current(second));
+
+        tests.invalidate();
+        assert!(!tests.is_current(second));
+    }
 }
