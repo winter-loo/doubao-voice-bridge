@@ -3,11 +3,10 @@
     windows_subsystem = "windows"
 )]
 
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
 use std::{
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -73,6 +72,7 @@ enum OverlayPhase {
     Optimizing,
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct VoiceTranscript {
     partial: String,
@@ -80,6 +80,7 @@ struct VoiceTranscript {
     final_text: String,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl VoiceTranscript {
     fn begin_session(&mut self) {
         self.partial.clear();
@@ -112,6 +113,7 @@ impl VoiceTranscript {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn transcript_presentation(phase: OverlayPhase, text: &str) -> (&'static str, &str) {
     if text.is_empty() {
         let label = match phase {
@@ -416,11 +418,15 @@ fn apply_native_voice_event(event: native_voice::NativeVoiceEvent) -> NativeVoic
         NativeVoiceEvent::Committed(text) => {
             #[cfg(target_os = "linux")]
             with_voice_transcript(|transcript| transcript.committed(text));
+            #[cfg(target_os = "windows")]
+            let _ = text;
             NativeVoiceEventOutcome::Continue
         }
         NativeVoiceEvent::Final(text) => {
             #[cfg(target_os = "linux")]
             with_voice_transcript(|transcript| transcript.final_text(text));
+            #[cfg(target_os = "windows")]
+            let _ = text;
             NativeVoiceEventOutcome::Continue
         }
         NativeVoiceEvent::AudioLevel {
@@ -885,7 +891,7 @@ fn open_transcript_window(cx: &mut App) {
 struct VoiceOverlay;
 
 impl Render for VoiceOverlay {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
         let phase = overlay_phase();
         #[cfg(target_os = "linux")]
@@ -898,7 +904,7 @@ impl Render for VoiceOverlay {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                cx.defer(open_transcript_window);
+                _cx.defer(open_transcript_window);
             }
         }
 

@@ -3,7 +3,9 @@
 The release executable contains the native Rust voice client for Windows and
 Linux. It captures the selected microphone through CPAL, normalizes audio to
 48 kHz mono s16le PCM, streams it to the Mac bridge, receives bridge events,
-and pastes the final text without launching Python or FFmpeg.
+and delivers recognized text without launching Python or FFmpeg. Windows writes
+live recognition into the focused application; Linux keeps it in its dedicated
+GPUI transcript editor.
 
 ## Linux
 
@@ -176,6 +178,15 @@ The default Windows microphone is selected automatically. To select a stable
 CPAL device ID or exact device name explicitly, set `DOUBAO_VOICE_INPUT_DEVICE`.
 The bridge address remains configurable through `DOUBAO_BRIDGE_SERVER`; the
 audio port can be overridden with `DOUBAO_BRIDGE_AUDIO_PORT`.
+
+Windows sends each live recognition snapshot directly to the application that
+had focus when voice input started. Growing snapshots append only their new
+suffix; when Doubao revises the end of a phrase, the client erases only that
+changed tail and writes its replacement with Unicode keyboard input. There is no
+separate transcript window and the clipboard is not overwritten for routine live
+updates. Keep the caret in place while speaking. If another application takes
+focus, injection pauses rather than writing into the wrong window; if the final
+update still cannot be delivered, the completed text is left on the clipboard.
 
 The client opens a transparent voice capsule near the bottom of the primary
 display. Its 20 cyan-to-blue waveform bars are drawn in one Canvas from one

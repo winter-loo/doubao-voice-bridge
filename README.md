@@ -14,7 +14,8 @@ Linux/Windows client
   -> Mac bridge writes PCM to BlackHole through CoreAudio
   -> Doubao IME listens to BlackHole
   -> Doubao commits text into a dedicated capture NSTextView
-  -> Mac bridge streams text/final events back to the client
+  -> Mac bridge streams partial/text/final events back to the client
+  -> Windows revises text in place; Linux shows it in a transcript editor
 ```
 
 ## Mac Setup
