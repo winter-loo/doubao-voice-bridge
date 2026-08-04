@@ -2,8 +2,8 @@
 
 This tutorial explains how to use a Mac running Doubao IME as the speech
 recognition server for a Windows computer. The Windows microphone is streamed to
-the Mac, Doubao recognizes the speech, and the final text is pasted back into the
-Windows application that had focus.
+the Mac, Doubao recognizes the speech, and live text is written into the Windows
+application that had focus.
 
 ## How It Works
 
@@ -15,7 +15,7 @@ Windows microphone
   -> Doubao IME on the Mac
   -> Doubao Voice Bridge capture window
   -> recognized text over TCP port 4387
-  -> paste into the focused Windows application
+  -> live Unicode input into the focused Windows application
 ```
 
 Both computers must be online and able to reach each other. A trusted local
@@ -224,11 +224,11 @@ before launching the executable directly from File Explorer.
 2. Press **Ctrl+Alt+Space** once.
 3. The compact overlay first displays `激活中` while the Mac switches to
    BlackHole, focuses the capture window, and activates Doubao voice input.
-4. Wait until the overlay changes to the animated waveform, then speak.
+4. Wait until the overlay changes to the animated waveform, then speak. The
+   recognized text appears and is revised in place at the current caret.
 5. Press **Ctrl+Alt+Space** again to finish.
 6. The overlay displays `优化识别中` while Doubao commits the final result.
-7. The final text is pasted into the Windows application that was focused before
-   activation.
+7. The last live preview is replaced by the final result in the same input field.
 
 Speech made while `激活中` is displayed is not recognized yet. Start speaking
 only after the waveform appears.

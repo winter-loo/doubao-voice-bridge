@@ -16,7 +16,7 @@ use crate::client_core::{
     BridgeEvent, PcmNormalizer, decode_bridge_event, encode_s16le, pcm_level,
 };
 use crate::client_settings::ClientSettings;
-use crate::platform_paste::{PasteTarget, paste_text};
+use crate::platform_paste::{PasteTarget, RealtimeTextOutput};
 
 const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
@@ -25,10 +25,6 @@ const AUDIO_STOP_SILENCE: Duration = Duration::from_millis(500);
 const ARMING_PREROLL_BYTES: usize = 48_000 * 2 * 5;
 const AUDIO_BACKLOG_BYTES: usize = 48_000 * 2 * 10;
 const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-
-const fn auto_paste_enabled() -> bool {
-    cfg!(target_os = "windows")
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeVoiceEvent {
@@ -158,6 +154,7 @@ impl NativeVoiceController {
         true
     }
 
+    #[cfg(target_os = "linux")]
     pub fn stop_and_wait(&self) -> bool {
         let session = {
             let Ok(mut active) = self.active.lock() else {
@@ -196,6 +193,7 @@ impl NativeVoiceSession {
         self.worker.is_finished()
     }
 
+    #[cfg(target_os = "linux")]
     fn stop_and_wait(self) -> bool {
         let was_active = !self.is_finished();
         if was_active {
@@ -400,6 +398,7 @@ where
             .map_err(|error| format!("could not clone bridge socket: {error}"))?,
         bridge_tx,
     )?;
+    let realtime_text = RealtimeTextOutput::new(config.paste_target);
 
     if let Some(token) = &config.token {
         write_command(&mut control, &format!("token {token}"))?;
@@ -426,7 +425,13 @@ where
         let mut audio_forwarding = PrerollAudio::new(ARMING_PREROLL_BYTES, AUDIO_BACKLOG_BYTES);
 
         loop {
-            if drain_bridge_events(&bridge_rx, notify, &mut latest_text, &mut final_text)? {
+            if drain_bridge_events(
+                &bridge_rx,
+                notify,
+                &realtime_text,
+                &mut latest_text,
+                &mut final_text,
+            )? {
                 audio_forwarding.start_recording(Instant::now());
             }
             if let Ok(error) = audio_error_rx.try_recv() {
@@ -477,7 +482,13 @@ where
         let deadline = Instant::now() + FINAL_TIMEOUT;
         while Instant::now() < deadline && final_text.is_empty() {
             match bridge_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(event) => handle_bridge_event(event, notify, &mut latest_text, &mut final_text)?,
+                Ok(event) => handle_bridge_event(
+                    event,
+                    notify,
+                    &realtime_text,
+                    &mut latest_text,
+                    &mut final_text,
+                )?,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -488,8 +499,8 @@ where
         } else {
             final_text
         };
-        if auto_paste_enabled() && !text.is_empty() {
-            paste_text(&text, config.paste_target)?;
+        if !text.is_empty() {
+            realtime_text.finish(&text)?;
         }
         Ok(())
     })();
@@ -525,6 +536,7 @@ fn start_bridge_reader(
 fn drain_bridge_events<F>(
     events: &Receiver<Result<BridgeEvent, String>>,
     notify: &F,
+    realtime_text: &RealtimeTextOutput,
     latest_text: &mut String,
     final_text: &mut String,
 ) -> Result<bool, String>
@@ -539,7 +551,7 @@ where
                     &event,
                     Ok(BridgeEvent::Phase(phase)) if phase == "recording"
                 );
-                handle_bridge_event(event, notify, latest_text, final_text)?;
+                handle_bridge_event(event, notify, realtime_text, latest_text, final_text)?;
             }
             Err(TryRecvError::Empty) => return Ok(recording_started),
             Err(TryRecvError::Disconnected) => {
@@ -552,6 +564,7 @@ where
 fn handle_bridge_event<F>(
     event: Result<BridgeEvent, String>,
     notify: &F,
+    realtime_text: &RealtimeTextOutput,
     latest_text: &mut String,
     final_text: &mut String,
 ) -> Result<(), String>
@@ -560,12 +573,17 @@ where
 {
     match event? {
         BridgeEvent::Phase(phase) => notify(NativeVoiceEvent::Phase(phase)),
-        BridgeEvent::Partial(text) => notify(NativeVoiceEvent::Partial(text)),
+        BridgeEvent::Partial(text) => {
+            let _ = realtime_text.update(&text);
+            notify(NativeVoiceEvent::Partial(text));
+        }
         BridgeEvent::Text(text) => {
+            let _ = realtime_text.update(&text);
             *latest_text = text.clone();
             notify(NativeVoiceEvent::Committed(text));
         }
         BridgeEvent::Final(text) => {
+            let _ = realtime_text.update(&text);
             *final_text = text.clone();
             notify(NativeVoiceEvent::Final(text));
         }
@@ -579,12 +597,14 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         AudioChunk, AudioQueueSendError, NativeVoiceEvent, PrerollAudio, audio_channel,
-        auto_paste_enabled, handle_bridge_event, pcm_playback_duration,
+        handle_bridge_event, pcm_playback_duration,
     };
     use crate::client_core::BridgeEvent;
+    use crate::platform_paste::{PasteTarget, RealtimeTextOutput};
     use std::{
         sync::Mutex,
         time::{Duration, Instant},
@@ -596,10 +616,12 @@ mod tests {
         let notify = |event| received.lock().unwrap().push(event);
         let mut latest_text = String::new();
         let mut final_text = String::new();
+        let realtime_text = RealtimeTextOutput::new(PasteTarget::default());
 
         handle_bridge_event(
             Ok(BridgeEvent::Partial("你".to_string())),
             &notify,
+            &realtime_text,
             &mut latest_text,
             &mut final_text,
         )
@@ -607,6 +629,7 @@ mod tests {
         handle_bridge_event(
             Ok(BridgeEvent::Text("你好".to_string())),
             &notify,
+            &realtime_text,
             &mut latest_text,
             &mut final_text,
         )
@@ -614,6 +637,7 @@ mod tests {
         handle_bridge_event(
             Ok(BridgeEvent::Final("你好世界".to_string())),
             &notify,
+            &realtime_text,
             &mut latest_text,
             &mut final_text,
         )
@@ -627,12 +651,6 @@ mod tests {
                 NativeVoiceEvent::Final("你好世界".to_string()),
             ]
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_voice_result_is_not_automatically_pasted() {
-        assert!(!auto_paste_enabled());
     }
 
     #[test]
@@ -865,6 +883,7 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
 /// endpoint. The bridge protocol is line-oriented, so a successful TCP
 /// handshake is enough to validate the address without starting a voice
 /// session or opening the microphone.
+#[cfg(target_os = "linux")]
 pub fn test_connection(server: &str) -> Result<(), String> {
     let (host, port) = parse_server(server)?;
     let _stream = connect_with_timeout(&host, port, Duration::from_secs(3))?;
