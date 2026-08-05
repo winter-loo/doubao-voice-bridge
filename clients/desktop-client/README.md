@@ -187,6 +187,9 @@ separate transcript window and the clipboard is not overwritten for routine live
 updates. Keep the caret in place while speaking. If another application takes
 focus, injection pauses rather than writing into the wrong window; if the final
 update still cannot be delivered, the completed text is left on the clipboard.
+Windows controls disagree on whether one Backspace deletes a whole emoji or
+combining sequence, so a revision that would need to erase one pauses before
+changing the field; the completed final text is then left on the clipboard.
 
 The client opens a transparent voice capsule near the bottom of the primary
 display. Its 20 cyan-to-blue waveform bars are drawn in one Canvas from one
