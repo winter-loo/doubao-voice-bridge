@@ -82,7 +82,7 @@ mod implementation {
             if state.current_text == text {
                 return Ok(());
             }
-            let replacement = plan_replacement(&state.current_text, text);
+            let replacement = plan_replacement(&state.current_text, text)?;
             if let Err(error) = send_replacement(replacement) {
                 state.desynchronized = true;
                 return Err(error);
@@ -111,11 +111,11 @@ mod implementation {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct TextReplacement<'a> {
-        erase_graphemes: usize,
+        erase_keypresses: usize,
         insert: &'a str,
     }
 
-    fn plan_replacement<'a>(current: &str, next: &'a str) -> TextReplacement<'a> {
+    fn plan_replacement<'a>(current: &str, next: &'a str) -> Result<TextReplacement<'a>, String> {
         let mut common_prefix_bytes = 0;
         for (current_grapheme, next_grapheme) in current.graphemes(true).zip(next.graphemes(true)) {
             if current_grapheme != next_grapheme {
@@ -123,16 +123,31 @@ mod implementation {
             }
             common_prefix_bytes += current_grapheme.len();
         }
-        TextReplacement {
-            erase_graphemes: current[common_prefix_bytes..].graphemes(true).count(),
-            insert: &next[common_prefix_bytes..],
+
+        let obsolete_suffix = &current[common_prefix_bytes..];
+        // Text controls disagree on whether Backspace consumes a grapheme,
+        // scalar value, or UTF-16 unit. Only emit deletion input when all
+        // three counts are identical, and validate before sending any key.
+        if obsolete_suffix
+            .graphemes(true)
+            .any(|grapheme| grapheme.encode_utf16().count() != 1)
+        {
+            return Err(
+                "the changed live-text suffix contains Unicode that this Windows control may not erase atomically"
+                    .to_string(),
+            );
         }
+
+        Ok(TextReplacement {
+            erase_keypresses: obsolete_suffix.encode_utf16().count(),
+            insert: &next[common_prefix_bytes..],
+        })
     }
 
     fn send_replacement(replacement: TextReplacement<'_>) -> Result<(), String> {
         let utf16_length = replacement.insert.encode_utf16().count();
-        let mut inputs = Vec::with_capacity((replacement.erase_graphemes + utf16_length) * 2);
-        for _ in 0..replacement.erase_graphemes {
+        let mut inputs = Vec::with_capacity((replacement.erase_keypresses + utf16_length) * 2);
+        for _ in 0..replacement.erase_keypresses {
             inputs.push(keyboard_input(VK_BACK, false));
             inputs.push(keyboard_input(VK_BACK, true));
         }
@@ -232,9 +247,9 @@ mod implementation {
         #[test]
         fn growing_snapshot_only_appends_the_new_suffix() {
             assert_eq!(
-                plan_replacement("你好", "你好世界"),
+                plan_replacement("你好", "你好世界").unwrap(),
                 TextReplacement {
-                    erase_graphemes: 0,
+                    erase_keypresses: 0,
                     insert: "世界",
                 }
             );
@@ -243,31 +258,30 @@ mod implementation {
         #[test]
         fn revised_snapshot_replaces_only_the_changed_tail() {
             assert_eq!(
-                plan_replacement("今天天气晴", "今天天气很好"),
+                plan_replacement("今天天气晴", "今天天气很好").unwrap(),
                 TextReplacement {
-                    erase_graphemes: 1,
+                    erase_keypresses: 1,
                     insert: "很好",
                 }
             );
         }
 
         #[test]
-        fn replacement_counts_joined_emoji_as_one_cursor_step() {
-            assert_eq!(
-                plan_replacement("家庭👨‍👩‍👧", "家庭🙂"),
-                TextReplacement {
-                    erase_graphemes: 1,
-                    insert: "🙂",
-                }
-            );
+        fn joined_emoji_revision_is_rejected_before_input() {
+            assert!(plan_replacement("家庭👨‍👩‍👧", "家庭🙂").is_err());
+        }
+
+        #[test]
+        fn combining_sequence_revision_is_rejected_before_input() {
+            assert!(plan_replacement("cafe\u{301}", "cafe").is_err());
         }
 
         #[test]
         fn shorter_snapshot_erases_the_obsolete_suffix() {
             assert_eq!(
-                plan_replacement("hello world", "hello"),
+                plan_replacement("hello world", "hello").unwrap(),
                 TextReplacement {
-                    erase_graphemes: 6,
+                    erase_keypresses: 6,
                     insert: "",
                 }
             );
