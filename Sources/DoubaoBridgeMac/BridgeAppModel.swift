@@ -60,6 +60,10 @@ struct AppReadiness: Equatable {
     }
 }
 
+struct TranscriptPanelSession: Equatable, Identifiable {
+    let id: Int
+}
+
 @MainActor
 final class BridgeAppModel: ObservableObject {
     @Published private(set) var phase: BridgeAppPhase = .starting
@@ -69,7 +73,7 @@ final class BridgeAppModel: ObservableObject {
     @Published private(set) var restartRequired = false
     @Published private(set) var statusMessage = "Starting the bridge"
     @Published private(set) var transcriptText = ""
-    @Published private(set) var isTranscriptPanelVisible = false
+    @Published private(set) var transcriptPanelSession: TranscriptPanelSession?
 
     var testDoubaoAction: (() -> Void)?
     var openDoubaoSettingsAction: (() -> Void)?
@@ -78,20 +82,23 @@ final class BridgeAppModel: ObservableObject {
     private let audioDeviceManager: CoreAudioDeviceManager
     private let controller: DoubaoController
     private let ffmpegPath: String
-    private var transcriptHideWorkItem: DispatchWorkItem?
+    private let transcriptDismissDelay: TimeInterval
+    private var transcriptEndWorkItem: DispatchWorkItem?
 
     init(
         preferences: AppPreferences,
         defaults: UserDefaults = .standard,
         audioDeviceManager: CoreAudioDeviceManager,
         controller: DoubaoController,
-        ffmpegPath: String
+        ffmpegPath: String,
+        transcriptDismissDelay: TimeInterval = 2.5
     ) {
         self.preferences = preferences
         self.defaults = defaults
         self.audioDeviceManager = audioDeviceManager
         self.controller = controller
         self.ffmpegPath = ffmpegPath
+        self.transcriptDismissDelay = transcriptDismissDelay
 
         if Bundle.main.bundleURL.pathExtension == "app" {
             self.preferences.launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -158,17 +165,21 @@ final class BridgeAppModel: ObservableObject {
 
     func handleBridgeEvent(_ object: [String: Any]) {
         let type = object["type"] as? String
+        let sessionID = Self.sessionID(in: object)
         if type == "error" {
+            guard sessionID == nil || eventBelongsToCurrentTranscriptSession(sessionID) else {
+                return
+            }
             let message = object["message"] as? String ?? "Unknown bridge error"
             phase = .error(message)
             statusMessage = message
-            hideTranscriptPanel()
+            endTranscriptPanelSession()
             return
         }
 
         if type == "final" {
-            updateTranscript(object["text"] as? String ?? "")
-            isTranscriptPanelVisible = true
+            guard let sessionID else { return }
+            updateTranscript(object["text"] as? String ?? "", sessionID: sessionID)
             return
         }
 
@@ -178,37 +189,41 @@ final class BridgeAppModel: ObservableObject {
 
         switch value {
         case "arming":
-            showTranscriptPanel(resetText: true)
+            guard let sessionID else { return }
+            beginTranscriptPanelSession(sessionID: sessionID)
             phase = .activating
             statusMessage = "Preparing Doubao voice input"
         case "voice_retry":
-            showTranscriptPanel()
+            guard ensureTranscriptPanelSession(sessionID: sessionID) else { return }
             phase = .activating
             statusMessage = "Preparing Doubao voice input"
         case "recording":
-            showTranscriptPanel()
+            guard ensureTranscriptPanelSession(sessionID: sessionID) else { return }
             phase = .listening
             statusMessage = "Receiving microphone audio from Windows"
         case "optimizing":
-            showTranscriptPanel()
+            guard ensureTranscriptPanelSession(sessionID: sessionID) else { return }
             phase = .optimizing
             statusMessage = "Waiting for Doubao to commit the final text"
         case "idle":
+            guard eventBelongsToCurrentTranscriptSession(sessionID) else { return }
             phase = readiness.isReady ? .ready : .error("Setup is incomplete")
             statusMessage = connectedClientCount == 0
                 ? "Waiting for a Windows client"
                 : connectionSummary
-            scheduleTranscriptHide()
+            scheduleTranscriptEnd()
         default:
             break
         }
     }
 
-    func updateTranscript(_ text: String) {
-        transcriptText = text
-        if !text.isEmpty, phase == .activating || phase == .listening || phase == .optimizing {
-            showTranscriptPanel()
+    func updateTranscript(_ text: String, sessionID: Int) {
+        guard let transcriptPanelSession,
+              transcriptPanelSession.id == sessionID
+        else {
+            return
         }
+        transcriptText = text
     }
 
     func serverStateChanged(_ state: String) {
@@ -303,31 +318,68 @@ final class BridgeAppModel: ObservableObject {
         NSApp.terminate(nil)
     }
 
-    private func scheduleTranscriptHide() {
-        cancelTranscriptHide()
+    private func scheduleTranscriptEnd() {
+        cancelTranscriptEnd()
+        guard let session = transcriptPanelSession else {
+            return
+        }
         let workItem = DispatchWorkItem { [weak self] in
-            self?.isTranscriptPanelVisible = false
+            guard let self, self.transcriptPanelSession == session else {
+                return
+            }
+            self.transcriptPanelSession = nil
+            self.transcriptEndWorkItem = nil
         }
-        transcriptHideWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: workItem)
+        transcriptEndWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + transcriptDismissDelay, execute: workItem)
     }
 
-    private func hideTranscriptPanel() {
-        cancelTranscriptHide()
-        isTranscriptPanelVisible = false
+    private func endTranscriptPanelSession() {
+        cancelTranscriptEnd()
+        transcriptPanelSession = nil
     }
 
-    private func showTranscriptPanel(resetText: Bool = false) {
-        cancelTranscriptHide()
-        if resetText {
-            transcriptText = ""
+    private func beginTranscriptPanelSession(sessionID: Int) {
+        cancelTranscriptEnd()
+        if transcriptPanelSession?.id == sessionID {
+            return
         }
-        isTranscriptPanelVisible = true
+
+        // Publishing nil first lets MenuBarController close and release the
+        // previous NSPanel before this session's empty transcript is published.
+        if transcriptPanelSession != nil {
+            transcriptPanelSession = nil
+        }
+        transcriptText = ""
+        transcriptPanelSession = TranscriptPanelSession(id: sessionID)
     }
 
-    private func cancelTranscriptHide() {
-        transcriptHideWorkItem?.cancel()
-        transcriptHideWorkItem = nil
+    @discardableResult
+    private func ensureTranscriptPanelSession(sessionID: Int?) -> Bool {
+        guard let sessionID, transcriptPanelSession?.id == sessionID else {
+            return false
+        }
+        cancelTranscriptEnd()
+        return true
+    }
+
+    private func eventBelongsToCurrentTranscriptSession(_ sessionID: Int?) -> Bool {
+        guard let sessionID else {
+            return transcriptPanelSession == nil
+        }
+        return transcriptPanelSession?.id == sessionID
+    }
+
+    private func cancelTranscriptEnd() {
+        transcriptEndWorkItem?.cancel()
+        transcriptEndWorkItem = nil
+    }
+
+    private static func sessionID(in object: [String: Any]) -> Int? {
+        if let sessionID = object["session_id"] as? Int {
+            return sessionID
+        }
+        return (object["session_id"] as? NSNumber)?.intValue
     }
 
     private func runtimeSettingsChanged(

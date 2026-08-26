@@ -24,7 +24,7 @@ final class MenuBarController: NSObject {
     private let model: BridgeAppModel
     private let statusItem: NSStatusItem
     private var observations = Set<AnyCancellable>()
-    private var transcriptPanelController: TranscriptPanelController!
+    private var transcriptPanelController: TranscriptPanelController?
     private var setupWindow: NSWindow?
     private var settingsWindow: NSWindow?
 
@@ -32,11 +32,6 @@ final class MenuBarController: NSObject {
         self.model = model
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
-
-        transcriptPanelController = TranscriptPanelController(
-            model: model,
-            statusButton: statusItem.button
-        )
 
         model.$phase
             .combineLatest(model.$connectedClientCount, model.$preferences)
@@ -52,14 +47,10 @@ final class MenuBarController: NSObject {
             }
             .store(in: &observations)
 
-        model.$isTranscriptPanelVisible
+        model.$transcriptPanelSession
             .removeDuplicates()
-            .sink { [weak self] isVisible in
-                if isVisible {
-                    self?.transcriptPanelController.show()
-                } else {
-                    self?.transcriptPanelController.hide()
-                }
+            .sink { [weak self] session in
+                self?.replaceTranscriptPanel(for: session)
             }
             .store(in: &observations)
 
@@ -68,6 +59,22 @@ final class MenuBarController: NSObject {
                 self?.showSetupAssistant()
             }
         }
+    }
+
+    private func replaceTranscriptPanel(for session: TranscriptPanelSession?) {
+        transcriptPanelController?.close()
+        transcriptPanelController = nil
+
+        guard session != nil else {
+            return
+        }
+
+        let controller = TranscriptPanelController(
+            model: model,
+            statusButton: statusItem.button
+        )
+        transcriptPanelController = controller
+        controller.show()
     }
 
     private func refreshMenu(snapshot: MenuBarSnapshot) {

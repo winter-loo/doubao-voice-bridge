@@ -1628,6 +1628,9 @@ final class Bridge {
     private let defaultInputRecoveryStore: DefaultInputRecoveryStore
     private var savedDefaultInputDevice: AudioDeviceID?
     private var sessionCreatedRecoveryRecord = false
+    private var nextSessionID = 0
+    private(set) var currentSessionID: Int?
+    private var finalizationWorkItem: DispatchWorkItem?
     private var voiceActivationGeneration = 0
     private var voiceActivationAttempt = 0
     private var audioLevelGeneration = 0
@@ -1676,8 +1679,19 @@ final class Bridge {
     }
 
     func startSession() {
+        discardPendingFinalization()
+        nextSessionID += 1
+        let sessionID = nextSessionID
+        currentSessionID = sessionID
+        emit?([
+            "type": "status",
+            "recording": true,
+            "phase": "arming",
+            "session_id": sessionID
+        ])
+
         do {
-            print("[session] start requested")
+            print("[session] start requested id=\(sessionID)")
             voiceActivationGeneration += 1
             audioLevelGeneration += 1
             voiceActivationAttempt = 0
@@ -1691,23 +1705,38 @@ final class Bridge {
             try controller.switchToDoubao()
             logDiagnostics("after switchToDoubao")
             emitVoiceState("after switchToDoubao")
-            emit?(["type": "status", "recording": true, "phase": "arming"])
 
             let generation = voiceActivationGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + config.startupDelay) { [weak self] in
                 self?.beginVoiceActivation(generation: generation)
             }
         } catch {
+            audioReceiver.stop()
             restoreDefaultInputIfNeeded()
-            fputs("[session] start failed: \(error)\n", stderr)
-            emit?(["type": "error", "message": "\(error)"])
+            fputs("[session] start failed id=\(sessionID): \(error)\n", stderr)
+            emit?([
+                "type": "error",
+                "message": "\(error)",
+                "session_id": sessionID
+            ])
+            if currentSessionID == sessionID {
+                currentSessionID = nil
+            }
         }
     }
 
     func stopSession() {
-        print("[session] stop requested")
+        guard let sessionID = currentSessionID else {
+            return
+        }
+        print("[session] stop requested id=\(sessionID)")
         if isRecording {
-            emit?(["type": "status", "recording": false, "phase": "optimizing"])
+            emit?([
+                "type": "status",
+                "recording": false,
+                "phase": "optimizing",
+                "session_id": sessionID
+            ])
         }
         voiceActivationGeneration += 1
         audioLevelGeneration += 1
@@ -1726,20 +1755,36 @@ final class Bridge {
             emitFocusState("after stop shortcut")
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + config.finalDelay) { [weak self] in
-            guard let self else { return }
+        finalizationWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.currentSessionID == sessionID else { return }
             self.logDiagnostics("before final emit")
             self.emitVoiceState("before final emit")
             self.emitFocusState("before final emit")
             self.emitAudioLevel(label: "before final emit", reset: false)
             self.audioReceiver.stop()
             self.restoreDefaultInputIfNeeded()
-            self.emit?(["type": "final", "text": self.captureWindow.currentText()])
-            self.emit?(["type": "status", "recording": false, "phase": "idle"])
+            self.emit?([
+                "type": "final",
+                "text": self.captureWindow.currentText(),
+                "session_id": sessionID
+            ])
+            self.emit?([
+                "type": "status",
+                "recording": false,
+                "phase": "idle",
+                "session_id": sessionID
+            ])
+            self.currentSessionID = nil
+            self.finalizationWorkItem = nil
         }
+        finalizationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + config.finalDelay, execute: workItem)
     }
 
     func prepareForTermination() {
+        finalizationWorkItem?.cancel()
+        finalizationWorkItem = nil
         voiceActivationGeneration += 1
         audioLevelGeneration += 1
         if isRecording {
@@ -1752,6 +1797,7 @@ final class Bridge {
         isRecording = false
         audioReceiver.stop()
         restoreDefaultInputIfNeeded()
+        currentSessionID = nil
     }
 
     func toggleSession() {
@@ -1763,7 +1809,26 @@ final class Bridge {
     }
 
     func status() {
-        emit?(["type": "status", "recording": isRecording, "phase": isRecording ? "recording" : "idle"])
+        var object: [String: Any] = [
+            "type": "status",
+            "recording": isRecording,
+            "phase": isRecording ? "recording" : "idle"
+        ]
+        if let currentSessionID {
+            object["session_id"] = currentSessionID
+        }
+        emit?(object)
+    }
+
+    private func discardPendingFinalization() {
+        guard finalizationWorkItem != nil else {
+            return
+        }
+        finalizationWorkItem?.cancel()
+        finalizationWorkItem = nil
+        audioReceiver.stop()
+        restoreDefaultInputIfNeeded()
+        currentSessionID = nil
     }
 
     func diagnose() {
@@ -1923,7 +1988,14 @@ final class Bridge {
             captureFocused: captureWindow.isReadyForVoiceInput
         ) {
             captureRecoveryInProgress = false
-            emit?(["type": "status", "recording": true, "phase": "recording"])
+            if let currentSessionID {
+                emit?([
+                    "type": "status",
+                    "recording": true,
+                    "phase": "recording",
+                    "session_id": currentSessionID
+                ])
+            }
             startAudioLevelReporting(generation: generation)
             return
         }
@@ -1931,13 +2003,16 @@ final class Bridge {
         if voiceActivationAttempt < config.voiceActivationRetries {
             voiceActivationAttempt += 1
             print("[voice-state] voice input not ready doubaoUI=\(doubaoUIActive) captureFocused=\(captureWindow.isReadyForVoiceInput); retry \(voiceActivationAttempt)/\(config.voiceActivationRetries)")
-            emit?([
-                "type": "status",
-                "recording": true,
-                "phase": "voice_retry",
-                "attempt": voiceActivationAttempt,
-                "maxAttempts": config.voiceActivationRetries
-            ])
+            if let currentSessionID {
+                emit?([
+                    "type": "status",
+                    "recording": true,
+                    "phase": "voice_retry",
+                    "attempt": voiceActivationAttempt,
+                    "maxAttempts": config.voiceActivationRetries,
+                    "session_id": currentSessionID
+                ])
+            }
             releaseVoiceShortcutIfNeeded()
 
             DispatchQueue.main.asyncAfter(deadline: .now() + config.voiceActivationRetryDelay) { [weak self] in
@@ -1950,12 +2025,21 @@ final class Bridge {
         releaseVoiceShortcutIfNeeded()
         audioReceiver.stop()
         restoreDefaultInputIfNeeded()
-        emit?([
-            "type": "error",
-            "message": "Doubao voice UI did not become active",
-            "phase": "voice_activation_failed"
-        ])
-        emit?(["type": "status", "recording": false, "phase": "idle"])
+        if let currentSessionID {
+            emit?([
+                "type": "error",
+                "message": "Doubao voice UI did not become active",
+                "phase": "voice_activation_failed",
+                "session_id": currentSessionID
+            ])
+            emit?([
+                "type": "status",
+                "recording": false,
+                "phase": "idle",
+                "session_id": currentSessionID
+            ])
+            self.currentSessionID = nil
+        }
     }
 
     private func releaseVoiceShortcutIfNeeded() {
@@ -2009,7 +2093,14 @@ final class Bridge {
         captureRecoveryInProgress = true
         let generation = voiceActivationGeneration
         print("[voice-ui] capture focus lost reason=\(reason); rearming voice input")
-        emit?(["type": "status", "recording": true, "phase": "arming"])
+        if let currentSessionID {
+            emit?([
+                "type": "status",
+                "recording": true,
+                "phase": "arming",
+                "session_id": currentSessionID
+            ])
+        }
         captureWindow.ensureVoiceInputUIActive(reason: reason)
         scheduleCaptureRecovery(generation: generation, attempt: 0)
     }
@@ -2035,12 +2126,21 @@ final class Bridge {
                 self.captureRecoveryInProgress = false
                 self.audioReceiver.stop()
                 self.restoreDefaultInputIfNeeded()
-                self.emit?([
-                    "type": "error",
-                    "message": "Voice input capture window could not regain focus",
-                    "phase": "voice_activation_failed"
-                ])
-                self.emit?(["type": "status", "recording": false, "phase": "idle"])
+                if let currentSessionID = self.currentSessionID {
+                    self.emit?([
+                        "type": "error",
+                        "message": "Voice input capture window could not regain focus",
+                        "phase": "voice_activation_failed",
+                        "session_id": currentSessionID
+                    ])
+                    self.emit?([
+                        "type": "status",
+                        "recording": false,
+                        "phase": "idle",
+                        "session_id": currentSessionID
+                    ])
+                    self.currentSessionID = nil
+                }
                 return
             }
 
@@ -2352,20 +2452,40 @@ func runApplication() throws {
 
     bridge.emit = { object in
         server.broadcast(object)
-        DispatchQueue.main.async {
-            appModel.handleBridgeEvent(object)
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                appModel.handleBridgeEvent(object)
+            }
+        } else {
+            DispatchQueue.main.async {
+                appModel.handleBridgeEvent(object)
+            }
         }
     }
     captureWindow.onChange = { text, delta in
-        server.broadcast(["type": "text", "text": text, "delta": delta])
-        DispatchQueue.main.async {
-            appModel.updateTranscript(text)
+        let sessionID = bridge.currentSessionID
+        var object: [String: Any] = ["type": "text", "text": text, "delta": delta]
+        if let sessionID {
+            object["session_id"] = sessionID
+        }
+        server.broadcast(object)
+        if let sessionID {
+            DispatchQueue.main.async {
+                appModel.updateTranscript(text, sessionID: sessionID)
+            }
         }
     }
     captureWindow.onPartial = { text in
-        server.broadcast(["type": "partial", "text": text])
-        DispatchQueue.main.async {
-            appModel.updateTranscript(text)
+        let sessionID = bridge.currentSessionID
+        var object: [String: Any] = ["type": "partial", "text": text]
+        if let sessionID {
+            object["session_id"] = sessionID
+        }
+        server.broadcast(object)
+        if let sessionID {
+            DispatchQueue.main.async {
+                appModel.updateTranscript(text, sessionID: sessionID)
+            }
         }
     }
 

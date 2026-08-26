@@ -134,8 +134,11 @@ final class TranscriptPanelController {
         panel.orderFrontRegardless()
     }
 
-    func hide() {
+    func close() {
+        observations.removeAll()
         panel.orderOut(nil)
+        panel.close()
+        panel.contentViewController = nil
     }
 
     private func updateLayout(_ layout: TranscriptPanelLayout) {
