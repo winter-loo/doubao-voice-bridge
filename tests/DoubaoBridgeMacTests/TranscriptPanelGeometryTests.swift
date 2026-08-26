@@ -78,4 +78,19 @@ final class TranscriptPanelGeometryTests: XCTestCase {
 
         XCTAssertEqual(compact.maxY, expanded.maxY, accuracy: 0.001)
     }
+
+    func testStableAnimationCanvasKeepsBothLayoutsCenteredAtTheSameTopAnchor() {
+        XCTAssertEqual(
+            TranscriptPanelGeometry.animationCanvasSize,
+            NSSize(width: 420, height: 104)
+        )
+
+        let compact = TranscriptPanelGeometry.contentFrame(layout: .compact)
+        let expanded = TranscriptPanelGeometry.contentFrame(layout: .expanded)
+
+        XCTAssertEqual(compact, NSRect(x: 120, y: 66, width: 180, height: 38))
+        XCTAssertEqual(expanded, NSRect(x: 0, y: 0, width: 420, height: 104))
+        XCTAssertEqual(compact.midX, expanded.midX, accuracy: 0.001)
+        XCTAssertEqual(compact.maxY, expanded.maxY, accuracy: 0.001)
+    }
 }

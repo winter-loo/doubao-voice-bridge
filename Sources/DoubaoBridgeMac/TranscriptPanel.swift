@@ -1,6 +1,5 @@
 import AppKit
 import Combine
-import QuartzCore
 import SwiftUI
 
 struct TranscriptPanelMetrics: Equatable {
@@ -62,6 +61,17 @@ enum TranscriptPanelLayout: Equatable {
 struct TranscriptPanelGeometry {
     static let edgeInset: CGFloat = 8
     static let anchorGap = TranscriptPanelStyle.anchorGap
+    static let animationCanvasSize = TranscriptPanelLayout.expanded.size
+
+    static func contentFrame(layout: TranscriptPanelLayout) -> NSRect {
+        let size = layout.size
+        return NSRect(
+            x: (animationCanvasSize.width - size.width) / 2,
+            y: animationCanvasSize.height - size.height,
+            width: size.width,
+            height: size.height
+        )
+    }
 
     static func frame(anchor: NSRect, visibleFrame: NSRect, size: NSSize) -> NSRect {
         let preferredX = anchor.midX - size.width / 2
@@ -100,7 +110,7 @@ final class TranscriptPanelController {
         let initialLayout = TranscriptPanelLayout.resolve(transcriptText: model.transcriptText)
         presentation = TranscriptPanelPresentation(layout: initialLayout)
         panel = TranscriptPanel(
-            contentRect: NSRect(origin: .zero, size: initialLayout.size),
+            contentRect: NSRect(origin: .zero, size: TranscriptPanelGeometry.animationCanvasSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -130,7 +140,7 @@ final class TranscriptPanelController {
     }
 
     func show() {
-        positionBelowStatusItem(layout: presentation.layout, animated: false)
+        positionBelowStatusItem()
         panel.orderFrontRegardless()
     }
 
@@ -147,10 +157,9 @@ final class TranscriptPanelController {
         }
 
         presentation.layout = layout
-        positionBelowStatusItem(layout: layout, animated: panel.isVisible)
     }
 
-    private func positionBelowStatusItem(layout: TranscriptPanelLayout, animated: Bool) {
+    private func positionBelowStatusItem() {
         guard let button = statusButton,
               let buttonWindow = button.window
         else {
@@ -168,18 +177,9 @@ final class TranscriptPanelController {
         let frame = TranscriptPanelGeometry.frame(
             anchor: anchorRect,
             visibleFrame: screen.visibleFrame,
-            size: layout.size
+            size: TranscriptPanelGeometry.animationCanvasSize
         )
-
-        if animated {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.24
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                panel.animator().setFrame(frame, display: true)
-            }
-        } else {
-            panel.setFrame(frame, display: true)
-        }
+        panel.setFrame(frame, display: true)
     }
 }
 
@@ -193,6 +193,10 @@ private struct TranscriptIslandView: View {
 
     private var metrics: TranscriptPanelMetrics {
         presentation.layout.metrics
+    }
+
+    private var canvasContentFrame: NSRect {
+        TranscriptPanelGeometry.contentFrame(layout: presentation.layout)
     }
 
     var body: some View {
@@ -247,11 +251,20 @@ private struct TranscriptIslandView: View {
                 }
         }
         .clipShape(RoundedRectangle(cornerRadius: metrics.cornerRadius, style: .continuous))
-        .animation(.easeInOut(duration: 0.22), value: presentation.layout)
-        .preferredColorScheme(.dark)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("豆包语音输入")
         .accessibilityValue(displayedText)
+        .offset(
+            x: canvasContentFrame.minX,
+            y: TranscriptPanelGeometry.animationCanvasSize.height - canvasContentFrame.maxY
+        )
+        .frame(
+            width: TranscriptPanelGeometry.animationCanvasSize.width,
+            height: TranscriptPanelGeometry.animationCanvasSize.height,
+            alignment: .topLeading
+        )
+        .animation(.easeInOut(duration: 0.22), value: presentation.layout)
+        .preferredColorScheme(.dark)
     }
 }
 
