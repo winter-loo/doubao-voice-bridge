@@ -68,6 +68,8 @@ final class BridgeAppModel: ObservableObject {
     @Published private(set) var preferences: AppPreferences
     @Published private(set) var restartRequired = false
     @Published private(set) var statusMessage = "Starting the bridge"
+    @Published private(set) var transcriptText = ""
+    @Published private(set) var isTranscriptPanelVisible = false
 
     var testDoubaoAction: (() -> Void)?
     var openDoubaoSettingsAction: (() -> Void)?
@@ -76,6 +78,7 @@ final class BridgeAppModel: ObservableObject {
     private let audioDeviceManager: CoreAudioDeviceManager
     private let controller: DoubaoController
     private let ffmpegPath: String
+    private var transcriptHideWorkItem: DispatchWorkItem?
 
     init(
         preferences: AppPreferences,
@@ -115,6 +118,21 @@ final class BridgeAppModel: ObservableObject {
         NetworkAddressProvider.ipv4Addresses()
     }
 
+    var transcriptStatus: String {
+        switch phase {
+        case .activating:
+            return "正在启动语音输入"
+        case .listening:
+            return transcriptText.isEmpty ? "正在聆听" : "实时转写"
+        case .optimizing:
+            return "正在整理识别结果"
+        case .starting, .ready:
+            return transcriptText.isEmpty ? "语音输入" : "识别结果"
+        case .error:
+            return "语音输入遇到问题"
+        }
+    }
+
     func refreshReadiness() {
         let virtualAudioAvailable = (
             try? (
@@ -144,6 +162,13 @@ final class BridgeAppModel: ObservableObject {
             let message = object["message"] as? String ?? "Unknown bridge error"
             phase = .error(message)
             statusMessage = message
+            hideTranscriptPanel()
+            return
+        }
+
+        if type == "final" {
+            updateTranscript(object["text"] as? String ?? "")
+            isTranscriptPanelVisible = true
             return
         }
 
@@ -152,13 +177,20 @@ final class BridgeAppModel: ObservableObject {
         }
 
         switch value {
-        case "arming", "voice_retry":
+        case "arming":
+            showTranscriptPanel(resetText: true)
+            phase = .activating
+            statusMessage = "Preparing Doubao voice input"
+        case "voice_retry":
+            showTranscriptPanel()
             phase = .activating
             statusMessage = "Preparing Doubao voice input"
         case "recording":
+            showTranscriptPanel()
             phase = .listening
             statusMessage = "Receiving microphone audio from Windows"
         case "optimizing":
+            showTranscriptPanel()
             phase = .optimizing
             statusMessage = "Waiting for Doubao to commit the final text"
         case "idle":
@@ -166,8 +198,16 @@ final class BridgeAppModel: ObservableObject {
             statusMessage = connectedClientCount == 0
                 ? "Waiting for a Windows client"
                 : connectionSummary
+            scheduleTranscriptHide()
         default:
             break
+        }
+    }
+
+    func updateTranscript(_ text: String) {
+        transcriptText = text
+        if !text.isEmpty, phase == .activating || phase == .listening || phase == .optimizing {
+            showTranscriptPanel()
         }
     }
 
@@ -261,6 +301,33 @@ final class BridgeAppModel: ObservableObject {
         ]
         try process.run()
         NSApp.terminate(nil)
+    }
+
+    private func scheduleTranscriptHide() {
+        cancelTranscriptHide()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.isTranscriptPanelVisible = false
+        }
+        transcriptHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: workItem)
+    }
+
+    private func hideTranscriptPanel() {
+        cancelTranscriptHide()
+        isTranscriptPanelVisible = false
+    }
+
+    private func showTranscriptPanel(resetText: Bool = false) {
+        cancelTranscriptHide()
+        if resetText {
+            transcriptText = ""
+        }
+        isTranscriptPanelVisible = true
+    }
+
+    private func cancelTranscriptHide() {
+        transcriptHideWorkItem?.cancel()
+        transcriptHideWorkItem = nil
     }
 
     private func runtimeSettingsChanged(

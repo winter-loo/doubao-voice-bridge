@@ -2,11 +2,29 @@ import AppKit
 import Combine
 import SwiftUI
 
+struct MenuBarSnapshot: Equatable {
+    let phase: BridgeAppPhase
+    let connectedClientCount: Int
+    let launchAtLogin: Bool
+
+    var connectionSummary: String {
+        switch connectedClientCount {
+        case 0:
+            return "No Windows clients"
+        case 1:
+            return "1 Windows client connected"
+        default:
+            return "\(connectedClientCount) Windows clients connected"
+        }
+    }
+}
+
 @MainActor
 final class MenuBarController: NSObject {
     private let model: BridgeAppModel
     private let statusItem: NSStatusItem
-    private var observation: AnyCancellable?
+    private var observations = Set<AnyCancellable>()
+    private var transcriptPanelController: TranscriptPanelController!
     private var setupWindow: NSWindow?
     private var settingsWindow: NSWindow?
 
@@ -15,12 +33,35 @@ final class MenuBarController: NSObject {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
-        observation = model.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.refreshMenu()
+        transcriptPanelController = TranscriptPanelController(
+            model: model,
+            statusButton: statusItem.button
+        )
+
+        model.$phase
+            .combineLatest(model.$connectedClientCount, model.$preferences)
+            .sink { [weak self] output in
+                let (phase, connectedClientCount, preferences) = output
+                self?.refreshMenu(
+                    snapshot: MenuBarSnapshot(
+                        phase: phase,
+                        connectedClientCount: connectedClientCount,
+                        launchAtLogin: preferences.launchAtLogin
+                    )
+                )
             }
-        }
-        refreshMenu()
+            .store(in: &observations)
+
+        model.$isTranscriptPanelVisible
+            .removeDuplicates()
+            .sink { [weak self] isVisible in
+                if isVisible {
+                    self?.transcriptPanelController.show()
+                } else {
+                    self?.transcriptPanelController.hide()
+                }
+            }
+            .store(in: &observations)
 
         if model.shouldPresentSetup {
             DispatchQueue.main.async { [weak self] in
@@ -29,24 +70,27 @@ final class MenuBarController: NSObject {
         }
     }
 
-    private func refreshMenu() {
-        let image = NSImage(systemSymbolName: model.phase.symbolName, accessibilityDescription: model.phase.title)
+    private func refreshMenu(snapshot: MenuBarSnapshot) {
+        let image = NSImage(
+            systemSymbolName: snapshot.phase.symbolName,
+            accessibilityDescription: snapshot.phase.title
+        )
         image?.isTemplate = true
         statusItem.button?.image = image
-        statusItem.button?.contentTintColor = statusColor
-        statusItem.button?.toolTip = "Doubao Voice Bridge: \(model.phase.title)"
+        statusItem.button?.contentTintColor = statusColor(for: snapshot.phase)
+        statusItem.button?.toolTip = "Doubao Voice Bridge: \(snapshot.phase.title)"
 
         let menu = NSMenu()
         let title = NSMenuItem(title: "Doubao Voice Bridge", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
-        let status = NSMenuItem(title: model.phase.title, action: nil, keyEquivalent: "")
-        status.image = NSImage(systemSymbolName: model.phase.symbolName, accessibilityDescription: nil)
+        let status = NSMenuItem(title: snapshot.phase.title, action: nil, keyEquivalent: "")
+        status.image = NSImage(systemSymbolName: snapshot.phase.symbolName, accessibilityDescription: nil)
         status.isEnabled = false
         menu.addItem(status)
 
-        let clients = NSMenuItem(title: model.connectionSummary, action: nil, keyEquivalent: "")
+        let clients = NSMenuItem(title: snapshot.connectionSummary, action: nil, keyEquivalent: "")
         clients.image = NSImage(systemSymbolName: "desktopcomputer", accessibilityDescription: nil)
         clients.isEnabled = false
         menu.addItem(clients)
@@ -61,7 +105,7 @@ final class MenuBarController: NSObject {
             symbol: "power",
             action: #selector(toggleLaunchAtLogin)
         )
-        launchAtLogin.state = model.preferences.launchAtLogin ? .on : .off
+        launchAtLogin.state = snapshot.launchAtLogin ? .on : .off
         menu.addItem(launchAtLogin)
 
         menu.addItem(.separator())
@@ -69,8 +113,8 @@ final class MenuBarController: NSObject {
         statusItem.menu = menu
     }
 
-    private var statusColor: NSColor {
-        switch model.phase {
+    private func statusColor(for phase: BridgeAppPhase) -> NSColor {
+        switch phase {
         case .starting:
             return .secondaryLabelColor
         case .ready:

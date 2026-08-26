@@ -223,9 +223,35 @@ struct VoiceInputReadiness {
     }
 }
 
+struct CaptureWindowPresentation {
+    static let hiddenOrigin = NSPoint(x: -10_000, y: -10_000)
+
+    static func frame(showDeveloperWindow: Bool) -> NSRect {
+        showDeveloperWindow
+            ? NSRect(x: 120, y: 120, width: 680, height: 320)
+            : NSRect(origin: hiddenOrigin, size: NSSize(width: 640, height: 240))
+    }
+
+    static func styleMask(showDeveloperWindow: Bool) -> NSWindow.StyleMask {
+        showDeveloperWindow
+            ? [.titled, .closable, .resizable, .miniaturizable]
+            : [.borderless]
+    }
+
+    static func alphaValue(showDeveloperWindow: Bool) -> CGFloat {
+        showDeveloperWindow ? 1 : 0
+    }
+}
+
+final class VoiceCaptureHostWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
     private let window: NSWindow
     private let textView: CaptureTextView
+    private let showsDeveloperWindow: Bool
     private var partialObservationTimer: Timer?
     private var lastText = ""
     private var lastPartialText = ""
@@ -235,13 +261,12 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
     var onCaptureUnavailable: ((String) -> Void)?
 
     init(showWindow: Bool) {
-        let rect = showWindow
-            ? NSRect(x: 120, y: 120, width: 680, height: 320)
-            : NSRect(x: -10000, y: -10000, width: 640, height: 240)
+        showsDeveloperWindow = showWindow
+        let rect = CaptureWindowPresentation.frame(showDeveloperWindow: showWindow)
 
-        window = NSWindow(
+        window = VoiceCaptureHostWindow(
             contentRect: rect,
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            styleMask: CaptureWindowPresentation.styleMask(showDeveloperWindow: showWindow),
             backing: .buffered,
             defer: false
         )
@@ -249,9 +274,18 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.isReleasedWhenClosed = false
+        window.alphaValue = CaptureWindowPresentation.alphaValue(showDeveloperWindow: showWindow)
+        if !showWindow {
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.hasShadow = false
+            window.ignoresMouseEvents = true
+            window.animationBehavior = .none
+        }
 
         let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: rect.width, height: rect.height))
-        scrollView.hasVerticalScroller = true
+        scrollView.hasVerticalScroller = showWindow
+        scrollView.drawsBackground = showWindow
         scrollView.autoresizingMask = [.width, .height]
 
         textView = CaptureTextView(frame: scrollView.bounds)
@@ -261,6 +295,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.allowsUndo = true
+        textView.drawsBackground = showWindow
 
         scrollView.documentView = textView
         window.contentView = scrollView
@@ -314,9 +349,17 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
-        window.makeMain()
         let focused = window.makeFirstResponder(textView)
+        concealInternalWindowIfNeeded()
         print("[voice-ui] activation result focused=\(focused) ready=\(isReadyForVoiceInput)")
+    }
+
+    private func concealInternalWindowIfNeeded() {
+        guard !showsDeveloperWindow else {
+            return
+        }
+        window.alphaValue = 0
+        window.setFrameOrigin(CaptureWindowPresentation.hiddenOrigin)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -2315,9 +2358,15 @@ func runApplication() throws {
     }
     captureWindow.onChange = { text, delta in
         server.broadcast(["type": "text", "text": text, "delta": delta])
+        DispatchQueue.main.async {
+            appModel.updateTranscript(text)
+        }
     }
     captureWindow.onPartial = { text in
         server.broadcast(["type": "partial", "text": text])
+        DispatchQueue.main.async {
+            appModel.updateTranscript(text)
+        }
     }
 
     server.start()
