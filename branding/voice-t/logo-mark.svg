@@ -1,7 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
-  <title>Voice T logo mark</title>
-  <desc>Speech waveform bars arranged into a capital T. Transparent background; no shadow.</desc>
-  <defs><linearGradient id="brandGradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1FD7F6"/><stop offset="34%" stop-color="#25B6FF"/><stop offset="68%" stop-color="#1879FF"/><stop offset="100%" stop-color="#1455F5"/></linearGradient></defs>
-  <g fill="url(#brandGradient)"><rect x="462" y="107" width="101" height="429" rx="50.5"/><rect x="281" y="219" width="75" height="271" rx="37.5"/><rect x="668" y="219" width="75" height="271" rx="37.5"/><rect x="370" y="247" width="74" height="233" rx="37"/><rect x="579" y="247" width="75" height="233" rx="37.5"/><rect x="201" y="271" width="67" height="176" rx="33.5"/><rect x="756" y="271" width="67" height="176" rx="33.5"/><rect x="135" y="311" width="54" height="97" rx="27"/><rect x="834" y="311" width="55" height="97" rx="27.5"/><circle cx="98.5" cy="360.5" r="28.5"/><circle cx="925.5" cy="360.5" r="28.5"/><rect x="474" y="559" width="75" height="358" rx="37.5"/><rect x="395" y="524" width="68" height="167" rx="34"/><rect x="560" y="524" width="70" height="167" rx="35"/><rect x="396" y="718" width="67" height="118" rx="33.5"/><rect x="559" y="718" width="68" height="118" rx="34"/></g>
+  <title>Voice T Scheme C logo mark</title>
+  <desc>Five-element speech waveform above one isolated vertical stem, forming a minimal capital T. Transparent background; no plate, stroke, glow, or shadow.</desc>
+  <defs>
+    <linearGradient id="brandGradient" gradientUnits="userSpaceOnUse" x1="0" y1="155" x2="0" y2="864">
+      <stop offset="0%" stop-color="#1FD7F6"/>
+      <stop offset="34%" stop-color="#25B6FF"/>
+      <stop offset="68%" stop-color="#1879FF"/>
+      <stop offset="100%" stop-color="#1455F5"/>
+    </linearGradient>
+  </defs>
+  <g>
+    <circle cx="222" cy="335" r="34" fill="url(#brandGradient)"/>
+    <rect x="310" y="242" width="92" height="198" rx="46" fill="url(#brandGradient)"/>
+    <rect x="454" y="155" width="116" height="332" rx="58" fill="url(#brandGradient)"/>
+    <rect x="622" y="242" width="92" height="198" rx="46" fill="url(#brandGradient)"/>
+    <circle cx="802" cy="335" r="34" fill="url(#brandGradient)"/>
+    <rect x="459" y="555" width="106" height="309" rx="53" fill="url(#brandGradient)"/>
+  </g>
 </svg>

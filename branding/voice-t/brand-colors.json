@@ -1,4 +1,7 @@
 {
+  "version": "2.0",
+  "date": "2026-08-27",
+  "scheme": "C",
   "color_space": "sRGB",
   "colors": {
     "aqua": {
@@ -48,6 +51,54 @@
         255,
         255
       ]
+    },
+    "surface_top": {
+      "hex": "#F9FCFF",
+      "rgb": [
+        249,
+        252,
+        255
+      ]
+    },
+    "surface_bottom": {
+      "hex": "#DCEAFF",
+      "rgb": [
+        220,
+        234,
+        255
+      ]
+    },
+    "surface_outline": {
+      "hex": "#FFFFFF",
+      "rgb": [
+        255,
+        255,
+        255
+      ]
+    },
+    "shadow_blue": {
+      "hex": "#0B3A88",
+      "rgb": [
+        11,
+        58,
+        136
+      ]
+    },
+    "windows_top": {
+      "hex": "#168DFD",
+      "rgb": [
+        22,
+        141,
+        253
+      ]
+    },
+    "windows_bottom": {
+      "hex": "#0C46CF",
+      "rgb": [
+        12,
+        70,
+        207
+      ]
     }
   },
   "primary_gradient": {
@@ -73,9 +124,23 @@
       }
     ]
   },
-  "clear_space": {
-    "minimum": "0.125H on all sides",
-    "H": "visible mark height"
+  "geometry": {
+    "description": "Five-element top waveform plus one isolated vertical stem.",
+    "canvas": [
+      1024,
+      1024
+    ],
+    "visible_bbox": [
+      188,
+      155,
+      836,
+      864
+    ],
+    "clear_space": {
+      "minimum": "0.125H on all sides",
+      "H_units": 709,
+      "minimum_units": 88.625
+    }
   },
-  "menu_bar_rule": "Pure black alpha template only; no gradient, background, glow, stroke, or shadow."
+  "menu_bar_rule": "Pure black alpha template only; no gradient, background, glow, stroke, or shadow. Set NSImage.isTemplate = true."
 }

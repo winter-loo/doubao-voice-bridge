@@ -7,6 +7,7 @@ APP_RESOURCES_DIR="$APP_DIR/Contents/Resources"
 APP_ICONSET_DIR="$ROOT_DIR/packaging/macos/AppIcon.iconset"
 
 cd "$ROOT_DIR"
+"$ROOT_DIR/scripts/verify-brand-assets.sh"
 swift build -c release
 
 rm -rf "$APP_DIR"

@@ -2,18 +2,48 @@ import XCTest
 @testable import DoubaoBridgeMac
 
 final class MenuBarSnapshotTests: XCTestCase {
-    func testCoreBlueMatchesCanonicalBrandToken() throws {
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    private func canonicalBrandDocument() throws -> [String: Any] {
         let data = try Data(
             contentsOf: repositoryRoot
                 .appendingPathComponent("branding/voice-t/brand-colors.json")
         )
-        let document = try XCTUnwrap(
+        return try XCTUnwrap(
             JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
+    }
+
+    func testCanonicalBrandManifestIdentifiesSchemeCV2() throws {
+        let document = try canonicalBrandDocument()
+
+        XCTAssertEqual(document["version"] as? String, "2.0")
+        XCTAssertEqual(document["scheme"] as? String, "C")
+    }
+
+    func testPlatformBrandAssetsMatchSchemeCV2Checksums() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [
+            repositoryRoot
+                .appendingPathComponent("scripts/verify-brand-assets.sh")
+                .path
+        ]
+        process.currentDirectoryURL = repositoryRoot
+
+        try process.run()
+        process.waitUntilExit()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+    }
+
+    func testCoreBlueMatchesCanonicalBrandToken() throws {
+        let document = try canonicalBrandDocument()
         let colors = try XCTUnwrap(document["colors"] as? [String: Any])
         let coreBlue = try XCTUnwrap(colors["core_blue"] as? [String: Any])
         let expectedRGB = try XCTUnwrap(coreBlue["rgb"] as? [Int])
