@@ -46,5 +46,6 @@ gio = "0.18"
 glib = "0.18"
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "inspector", "wayland", "x11"] }
 ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
+png = "0.18"
 x11rb = { version = "0.13", features = ["xkb"] }
 xkbcommon = "0.8"

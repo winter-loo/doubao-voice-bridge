@@ -10,6 +10,8 @@
     <string>doubao-bridge-mac</string>
     <key>CFBundleIdentifier</key>
     <string>local.doubao.voicebridge</string>
+    <key>CFBundleIconFile</key>
+    <string>DoubaoVoiceBridge.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

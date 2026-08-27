@@ -13,6 +13,9 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "DoubaoBridgeMac",
+            resources: [
+                .copy("Resources/Brand")
+            ],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("ApplicationServices"),

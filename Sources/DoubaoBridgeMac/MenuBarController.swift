@@ -78,7 +78,7 @@ final class MenuBarController: NSObject {
     }
 
     private func refreshMenu(snapshot: MenuBarSnapshot) {
-        let image = NSImage(
+        let image = BrandAssets.menuBarTemplateImage() ?? NSImage(
             systemSymbolName: snapshot.phase.symbolName,
             accessibilityDescription: snapshot.phase.title
         )
@@ -86,6 +86,7 @@ final class MenuBarController: NSObject {
         statusItem.button?.image = image
         statusItem.button?.contentTintColor = statusColor(for: snapshot.phase)
         statusItem.button?.toolTip = "Doubao Voice Bridge: \(snapshot.phase.title)"
+        statusItem.button?.setAccessibilityLabel("Doubao Voice Bridge: \(snapshot.phase.title)")
 
         let menu = NSMenu()
         let title = NSMenuItem(title: "Doubao Voice Bridge", action: nil, keyEquivalent: "")
@@ -125,11 +126,11 @@ final class MenuBarController: NSObject {
         case .starting:
             return .secondaryLabelColor
         case .ready:
-            return .systemGreen
+            return .labelColor
         case .activating, .optimizing:
             return .systemOrange
         case .listening:
-            return .systemBlue
+            return BrandPalette.coreBlue
         case .error:
             return .systemRed
         }

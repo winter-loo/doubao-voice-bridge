@@ -38,6 +38,8 @@ mod native_voice;
 mod platform_paste;
 #[cfg(target_os = "linux")]
 mod settings_gui;
+#[cfg(target_os = "linux")]
+mod tray_icon;
 #[cfg(target_os = "windows")]
 mod windows_shell;
 

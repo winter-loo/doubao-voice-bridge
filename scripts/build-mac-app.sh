@@ -3,14 +3,22 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$ROOT_DIR/dist/DoubaoVoiceBridge.app"
+APP_RESOURCES_DIR="$APP_DIR/Contents/Resources"
+APP_ICONSET_DIR="$ROOT_DIR/packaging/macos/AppIcon.iconset"
 
 cd "$ROOT_DIR"
 swift build -c release
 
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_RESOURCES_DIR"
 cp "$ROOT_DIR/.build/release/doubao-bridge-mac" "$APP_DIR/Contents/MacOS/doubao-bridge-mac"
 cp "$ROOT_DIR/packaging/DoubaoVoiceBridge-Info.plist" "$APP_DIR/Contents/Info.plist"
+cp -R "$ROOT_DIR/Sources/DoubaoBridgeMac/Resources/Brand" "$APP_RESOURCES_DIR/Brand"
+iconutil \
+    --convert icns \
+    --output "$APP_RESOURCES_DIR/DoubaoVoiceBridge.icns" \
+    "$APP_ICONSET_DIR"
 chmod +x "$APP_DIR/Contents/MacOS/doubao-bridge-mac"
 
 SIGNING_IDENTITY="${DOUBAO_CODESIGN_IDENTITY:-}"

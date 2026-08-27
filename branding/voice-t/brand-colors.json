@@ -1,0 +1,81 @@
+{
+  "color_space": "sRGB",
+  "colors": {
+    "aqua": {
+      "hex": "#1FD7F6",
+      "rgb": [
+        31,
+        215,
+        246
+      ]
+    },
+    "bright_blue": {
+      "hex": "#25B6FF",
+      "rgb": [
+        37,
+        182,
+        255
+      ]
+    },
+    "core_blue": {
+      "hex": "#1879FF",
+      "rgb": [
+        24,
+        121,
+        255
+      ]
+    },
+    "deep_blue": {
+      "hex": "#1455F5",
+      "rgb": [
+        20,
+        85,
+        245
+      ]
+    },
+    "template_black": {
+      "hex": "#000000",
+      "rgb": [
+        0,
+        0,
+        0
+      ]
+    },
+    "white": {
+      "hex": "#FFFFFF",
+      "rgb": [
+        255,
+        255,
+        255
+      ]
+    }
+  },
+  "primary_gradient": {
+    "type": "linear",
+    "angle_degrees": 180,
+    "direction": "top-to-bottom",
+    "stops": [
+      {
+        "offset": 0.0,
+        "hex": "#1FD7F6"
+      },
+      {
+        "offset": 0.34,
+        "hex": "#25B6FF"
+      },
+      {
+        "offset": 0.68,
+        "hex": "#1879FF"
+      },
+      {
+        "offset": 1.0,
+        "hex": "#1455F5"
+      }
+    ]
+  },
+  "clear_space": {
+    "minimum": "0.125H on all sides",
+    "H": "visible mark height"
+  },
+  "menu_bar_rule": "Pure black alpha template only; no gradient, background, glow, stroke, or shadow."
+}

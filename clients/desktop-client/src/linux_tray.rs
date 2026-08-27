@@ -6,7 +6,8 @@ use ksni::{
     menu::StandardItem,
 };
 
-const TRAY_ICON_SIZE: u32 = 32;
+use crate::tray_icon::{VOICE_T_TRAY_ICON_SIZE, voice_t_tray_icon_argb};
+
 static TRAY_HANDLE: OnceLock<Mutex<Option<Handle<VoiceTray>>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,9 +38,9 @@ impl Tray for VoiceTray {
 
     fn icon_pixmap(&self) -> Vec<Icon> {
         vec![Icon {
-            width: TRAY_ICON_SIZE as i32,
-            height: TRAY_ICON_SIZE as i32,
-            data: tray_icon_argb(TRAY_ICON_SIZE),
+            width: VOICE_T_TRAY_ICON_SIZE as i32,
+            height: VOICE_T_TRAY_ICON_SIZE as i32,
+            data: voice_t_tray_icon_argb(),
         }]
     }
 
@@ -165,37 +166,6 @@ fn tray_labels(phase: TrayPhase) -> TrayLabels {
     }
 }
 
-fn tray_icon_argb(size: u32) -> Vec<u8> {
-    let mut argb = vec![0; (size * size * 4) as usize];
-    let center = (size as f32 - 1.0) / 2.0;
-    let radius = size as f32 * 0.47;
-
-    for y in 0..size {
-        for x in 0..size {
-            let offset = ((y * size + x) * 4) as usize;
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            if dx * dx + dy * dy <= radius * radius {
-                argb[offset..offset + 4].copy_from_slice(&[255, 44, 153, 255]);
-            }
-
-            let microphone = (x >= size * 11 / 32 && x <= size * 20 / 32)
-                && (y >= size * 6 / 32 && y <= size * 20 / 32);
-            let microphone_base = (x >= size * 9 / 32 && x <= size * 22 / 32)
-                && (y >= size * 18 / 32 && y <= size * 21 / 32);
-            let stem = (x >= size * 15 / 32 && x <= size * 17 / 32)
-                && (y >= size * 20 / 32 && y <= size * 25 / 32);
-            let foot = (x >= size * 11 / 32 && x <= size * 21 / 32)
-                && (y >= size * 24 / 32 && y <= size * 26 / 32);
-            if microphone || microphone_base || stem || foot {
-                argb[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
-            }
-        }
-    }
-
-    argb
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,13 +207,5 @@ mod tests {
         assert_eq!(toggles[2], "开始语音输入");
         assert_eq!(toggles[3], "取消语音输入");
         assert_eq!(toggles[6], "开始语音输入");
-    }
-
-    #[test]
-    fn status_notifier_icon_uses_argb_byte_order() {
-        let pixels = tray_icon_argb(TRAY_ICON_SIZE);
-
-        assert_eq!(pixels.len(), (TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4) as usize);
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0] == 255));
     }
 }

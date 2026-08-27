@@ -57,7 +57,19 @@ struct SetupAssistantView: View {
 
     private var setupSidebar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Set Up Bridge", systemImage: "waveform.badge.mic")
+            HStack(spacing: 8) {
+                if let logo = BrandAssets.logoMarkImage() {
+                    Image(nsImage: logo)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 28, height: 28)
+                        .accessibilityHidden(true)
+                } else {
+                    Image(systemName: "waveform.badge.mic")
+                        .accessibilityHidden(true)
+                }
+                Text("Set Up Bridge")
+            }
                 .font(.headline)
                 .padding(.bottom, 12)
 
