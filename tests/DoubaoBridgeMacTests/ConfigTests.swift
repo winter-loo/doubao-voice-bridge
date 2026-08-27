@@ -19,9 +19,10 @@ final class ConfigTests: XCTestCase {
         let config = try Config.parse(arguments: [], preferences: AppPreferences())
 
         XCTAssertEqual(config.voiceActivationCheckDelay, 0.05)
-        XCTAssertEqual(config.voiceActivationAttemptTimeout, 1.0)
+        XCTAssertEqual(config.voiceActivationAttemptTimeout, 2.5)
         XCTAssertEqual(config.voiceActivationStableSamples, 2)
         XCTAssertEqual(config.asrWarmupDelay, 0.3)
+        XCTAssertEqual(config.voiceActivationRetryDelay, 0.5)
         XCTAssertEqual(config.finalDelay, 1.8)
     }
 

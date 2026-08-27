@@ -22,11 +22,11 @@ struct Config {
     var listAudioDevices = false
     var startupDelay: TimeInterval = 0.3
     var voiceActivationCheckDelay: TimeInterval = 0.05
-    var voiceActivationAttemptTimeout: TimeInterval = 1.0
+    var voiceActivationAttemptTimeout: TimeInterval = 2.5
     var voiceActivationStableSamples = 2
     var asrWarmupDelay: TimeInterval = 0.3
     var voiceActivationRetries = 2
-    var voiceActivationRetryDelay: TimeInterval = 0.25
+    var voiceActivationRetryDelay: TimeInterval = 0.5
     var finalDelay: TimeInterval = 1.8
     var showWindow = false
 
@@ -1848,7 +1848,7 @@ final class Bridge {
             try controller.switchToDoubao()
             emitTrace("doubao_input_selected")
             logDiagnostics("after switchToDoubao")
-            emitVoiceState("after switchToDoubao")
+            emitQuickVoiceState("after switchToDoubao")
 
             let generation = voiceActivationGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + config.startupDelay) { [weak self] in
@@ -2203,7 +2203,7 @@ final class Bridge {
         voiceActivationAttemptStartedAt = DispatchTime.now().uptimeNanoseconds
         captureWindow.ensureVoiceInputUIActive(reason: "voice activation")
         logDiagnostics("before voice shortcut")
-        emitVoiceState("before voice shortcut")
+        emitQuickVoiceState("before voice shortcut")
         if config.voiceShortcutMode == "hold" {
             controller.holdVoiceShortcutDown()
         } else {
@@ -2212,8 +2212,7 @@ final class Bridge {
         isRecording = true
         emitTrace("voice_shortcut_down")
         logDiagnostics("after voice shortcut")
-        emitVoiceState("after voice shortcut")
-        scheduleVoiceStateChecks(prefix: "after voice shortcut")
+        emitQuickVoiceState("after voice shortcut")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + config.voiceActivationCheckDelay) { [weak self] in
             self?.checkVoiceActivation(generation: generation)
@@ -2225,7 +2224,9 @@ final class Bridge {
             return
         }
 
-        captureWindow.ensureVoiceInputUIActive(reason: "voice activation check")
+        if !captureWindow.isReadyForVoiceInput {
+            captureWindow.ensureVoiceInputUIActive(reason: "voice activation check")
+        }
         let doubaoUIActive = voiceStateDetector.likelyVoiceUIActive()
         let captureFocused = captureWindow.isReadyForVoiceInput
         let transportReady = audioReceiver.transportReady()
@@ -2245,6 +2246,16 @@ final class Bridge {
             return
         }
 
+        // If the UI becomes visible on the timeout boundary, give the stable
+        // readiness gate enough samples to confirm it instead of rejecting a
+        // successful (but slightly late) activation.
+        if doubaoUIActive, captureFocused, transportReady {
+            DispatchQueue.main.asyncAfter(deadline: .now() + config.voiceActivationCheckDelay) { [weak self] in
+                self?.checkVoiceActivation(generation: generation)
+            }
+            return
+        }
+
         let nowNanoseconds = DispatchTime.now().uptimeNanoseconds
         let elapsedNanoseconds = nowNanoseconds >= voiceActivationAttemptStartedAt
             ? nowNanoseconds - voiceActivationAttemptStartedAt
@@ -2258,8 +2269,8 @@ final class Bridge {
 
         if voiceActivationAttempt < config.voiceActivationRetries {
             voiceActivationAttempt += 1
-            emitVoiceState("voice activation timeout attempt \(voiceActivationAttempt)")
-            print("[voice-state] voice input not ready doubaoUI=\(doubaoUIActive) captureFocused=\(captureWindow.isReadyForVoiceInput); retry \(voiceActivationAttempt)/\(config.voiceActivationRetries)")
+            emitQuickVoiceState("voice activation timeout attempt \(voiceActivationAttempt)")
+            print("[voice-state] voice input not ready doubaoUI=\(doubaoUIActive) captureFocused=\(captureFocused) transportReady=\(transportReady); retry \(voiceActivationAttempt)/\(config.voiceActivationRetries)")
             emitStatus("voice_retry", recording: true)
             emitTrace("voice_activation_retry")
             releaseVoiceShortcutIfNeeded()
@@ -2271,7 +2282,7 @@ final class Bridge {
         }
 
         print("[voice-state] Doubao voice UI did not become active after \(config.voiceActivationRetries + 1) attempts")
-        emitVoiceState("voice activation failed")
+        emitQuickVoiceState("voice activation failed")
         emitTrace("voice_activation_failed")
         releaseVoiceShortcutIfNeeded()
         audioReceiver.finishSession()
@@ -2428,6 +2439,24 @@ final class Bridge {
     private func emitVoiceState(_ label: String) -> [String: Any] {
         let snapshot = voiceStateDetector.snapshot(label: label, capture: captureWindow.diagnosticSnapshot())
         print("[voice-state] \(label): input=\(snapshot["selectedInputSourceID"] ?? "") windows=\(snapshot["doubaoWindowCount"] ?? 0) keywords=\(snapshot["keywordHits"] ?? []) likely=\(snapshot["likelyVoiceUIActive"] ?? false)")
+        emit?(snapshot)
+        return snapshot
+    }
+
+    @discardableResult
+    private func emitQuickVoiceState(_ label: String) -> [String: Any] {
+        let selectedInputSourceID = controller.selectedInputSourceID()
+        let likelyVoiceUIActive = voiceStateDetector.likelyVoiceUIActive()
+        let snapshot: [String: Any] = [
+            "type": "voice_state",
+            "label": label,
+            "selectedInputSourceID": selectedInputSourceID,
+            "selectedInputSourceMatchesDoubao": selectedInputSourceID == config.inputSourceID,
+            "likelyVoiceUIActive": likelyVoiceUIActive,
+            "capture": captureWindow.diagnosticSnapshot(),
+            "diagnosticLevel": "quick",
+        ]
+        print("[voice-state] \(label): input=\(selectedInputSourceID) likely=\(likelyVoiceUIActive) diagnostic=quick")
         emit?(snapshot)
         return snapshot
     }

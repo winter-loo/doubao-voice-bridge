@@ -87,11 +87,11 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
   --voice-shortcut-mode hold \
   --startup-delay 0.3 \
   --voice-activation-check-delay 0.05 \
-  --voice-activation-attempt-timeout 1.0 \
+  --voice-activation-attempt-timeout 2.5 \
   --voice-activation-stable-samples 2 \
   --asr-warmup-delay 0.3 \
   --voice-activation-retries 2 \
-  --voice-activation-retry-delay 0.25 \
+  --voice-activation-retry-delay 0.5 \
   --final-delay 1.8
 ```
 
