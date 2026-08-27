@@ -23,6 +23,7 @@ class RecordArgumentsTests(unittest.TestCase):
         args = doubao_remote.parse_args(["record"])
 
         self.assertIsNone(args.seconds)
+        self.assertEqual(args.audio_start_delay, 0.0)
 
     def test_record_accepts_a_fixed_duration(self):
         args = doubao_remote.parse_args(["record", "--seconds", "12.5"])

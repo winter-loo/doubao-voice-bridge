@@ -19,9 +19,10 @@ use crate::client_settings::ClientSettings;
 use crate::platform_paste::{PasteTarget, RealtimeTextOutput};
 
 const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RECORDING_READY_TIMEOUT: Duration = Duration::from_secs(6);
 const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
-const AUDIO_START_DELAY: Duration = Duration::from_millis(200);
 const AUDIO_STOP_SILENCE: Duration = Duration::from_millis(500);
+const AUDIO_WARMUP_SILENCE_BYTES: usize = 1_920;
 const ARMING_PREROLL_BYTES: usize = 48_000 * 2 * 5;
 const AUDIO_BACKLOG_BYTES: usize = 48_000 * 2 * 10;
 const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -400,14 +401,18 @@ where
     )?;
     let realtime_text = RealtimeTextOutput::new(config.paste_target);
 
+    let (audio_tx, audio_rx) = audio_channel(AUDIO_BACKLOG_BYTES);
+    let (audio_error_tx, audio_error_rx) = mpsc::sync_channel(1);
+    let stream = start_microphone(config.input_device.as_deref(), audio_tx, audio_error_tx)?;
+    let mut audio_forwarding = PrerollAudio::new(ARMING_PREROLL_BYTES, AUDIO_BACKLOG_BYTES);
+
     if let Some(token) = &config.token {
         write_command(&mut control, &format!("token {token}"))?;
     }
     write_command(&mut control, "start")?;
     let mut stop_sent = false;
+    let mut bridge_session_id = None;
     let result = (|| {
-        thread::sleep(AUDIO_START_DELAY);
-
         let mut audio_socket =
             connect_with_timeout(&control_host, config.audio_port, AUDIO_CONNECT_TIMEOUT)?;
         audio_socket
@@ -416,13 +421,9 @@ where
         audio_socket
             .set_write_timeout(Some(AUDIO_WRITE_TIMEOUT))
             .map_err(|error| format!("could not configure audio write timeout: {error}"))?;
-
-        let (audio_tx, audio_rx) = audio_channel(AUDIO_BACKLOG_BYTES);
-        let (audio_error_tx, audio_error_rx) = mpsc::sync_channel(1);
-        let stream = start_microphone(config.input_device.as_deref(), audio_tx, audio_error_tx)?;
         let mut latest_text = String::new();
         let mut final_text = String::new();
-        let mut audio_forwarding = PrerollAudio::new(ARMING_PREROLL_BYTES, AUDIO_BACKLOG_BYTES);
+        let mut warmup_sent = false;
 
         loop {
             if drain_bridge_events(
@@ -431,8 +432,15 @@ where
                 &realtime_text,
                 &mut latest_text,
                 &mut final_text,
+                &mut bridge_session_id,
             )? {
                 audio_forwarding.start_recording(Instant::now());
+            }
+            if !warmup_sent && bridge_session_id.is_some() {
+                audio_socket
+                    .write_all(&vec![0; AUDIO_WARMUP_SILENCE_BYTES])
+                    .map_err(|error| format!("could not send audio warm-up: {error}"))?;
+                warmup_sent = true;
             }
             if let Ok(error) = audio_error_rx.try_recv() {
                 return Err(error);
@@ -465,6 +473,30 @@ where
         while let Ok(chunk) = audio_rx.try_recv() {
             audio_forwarding.push(chunk.pcm)?;
         }
+        if !audio_forwarding.is_recording() {
+            let deadline = Instant::now() + RECORDING_READY_TIMEOUT;
+            while Instant::now() < deadline && !audio_forwarding.is_recording() {
+                match bridge_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(event) => {
+                        if handle_bridge_event(
+                            event,
+                            notify,
+                            &realtime_text,
+                            &mut latest_text,
+                            &mut final_text,
+                            &mut bridge_session_id,
+                        )? {
+                            audio_forwarding.start_recording(Instant::now());
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            if !audio_forwarding.is_recording() {
+                return Err("voice input did not become ready before release".to_string());
+            }
+        }
         while audio_forwarding.is_recording() && !audio_forwarding.is_empty() {
             let now = Instant::now();
             if let Some(pcm) = audio_forwarding.take_ready(now) {
@@ -474,21 +506,26 @@ where
                 thread::sleep(audio_forwarding.wait_duration(now, Duration::from_millis(20)));
             }
         }
-        write_command(&mut control, "stop")?;
+        let session_id = bridge_session_id
+            .ok_or_else(|| "bridge did not acknowledge the active voice session".to_string())?;
+        write_command(&mut control, &format!("stop {session_id}"))?;
         stop_sent = true;
-        send_silence(&mut audio_socket, AUDIO_STOP_SILENCE)?;
+        let _ = send_silence(&mut audio_socket, AUDIO_STOP_SILENCE);
         let _ = audio_socket.shutdown(Shutdown::Write);
 
         let deadline = Instant::now() + FINAL_TIMEOUT;
         while Instant::now() < deadline && final_text.is_empty() {
             match bridge_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(event) => handle_bridge_event(
-                    event,
-                    notify,
-                    &realtime_text,
-                    &mut latest_text,
-                    &mut final_text,
-                )?,
+                Ok(event) => {
+                    let _ = handle_bridge_event(
+                        event,
+                        notify,
+                        &realtime_text,
+                        &mut latest_text,
+                        &mut final_text,
+                        &mut bridge_session_id,
+                    )?;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -505,7 +542,9 @@ where
         Ok(())
     })();
     if !stop_sent {
-        let _ = write_command(&mut control, "stop");
+        if let Some(session_id) = bridge_session_id {
+            let _ = write_command(&mut control, &format!("stop {session_id}"));
+        }
     }
     result
 }
@@ -539,6 +578,7 @@ fn drain_bridge_events<F>(
     realtime_text: &RealtimeTextOutput,
     latest_text: &mut String,
     final_text: &mut String,
+    bridge_session_id: &mut Option<u64>,
 ) -> Result<bool, String>
 where
     F: Fn(NativeVoiceEvent),
@@ -547,11 +587,14 @@ where
     loop {
         match events.try_recv() {
             Ok(event) => {
-                recording_started |= matches!(
-                    &event,
-                    Ok(BridgeEvent::Phase(phase)) if phase == "recording"
-                );
-                handle_bridge_event(event, notify, realtime_text, latest_text, final_text)?;
+                recording_started |= handle_bridge_event(
+                    event,
+                    notify,
+                    realtime_text,
+                    latest_text,
+                    final_text,
+                    bridge_session_id,
+                )?;
             }
             Err(TryRecvError::Empty) => return Ok(recording_started),
             Err(TryRecvError::Disconnected) => {
@@ -567,33 +610,77 @@ fn handle_bridge_event<F>(
     realtime_text: &RealtimeTextOutput,
     latest_text: &mut String,
     final_text: &mut String,
-) -> Result<(), String>
+    bridge_session_id: &mut Option<u64>,
+) -> Result<bool, String>
 where
     F: Fn(NativeVoiceEvent),
 {
+    let mut recording_started = false;
     match event? {
-        BridgeEvent::Phase(phase) => notify(NativeVoiceEvent::Phase(phase)),
-        BridgeEvent::Partial(text) => {
+        BridgeEvent::Ack {
+            command,
+            session_id,
+        } => {
+            if command == "start" {
+                *bridge_session_id = session_id;
+            }
+        }
+        BridgeEvent::Phase { session_id, phase }
+            if session_id == *bridge_session_id && bridge_session_id.is_some() =>
+        {
+            recording_started = phase == "recording";
+            notify(NativeVoiceEvent::Phase(phase));
+        }
+        BridgeEvent::Partial { session_id, text }
+            if session_id == *bridge_session_id && bridge_session_id.is_some() =>
+        {
             let _ = realtime_text.update(&text);
             notify(NativeVoiceEvent::Partial(text));
         }
-        BridgeEvent::Text(text) => {
+        BridgeEvent::Text { session_id, text }
+            if session_id == *bridge_session_id && bridge_session_id.is_some() =>
+        {
             let _ = realtime_text.update(&text);
             *latest_text = text.clone();
             notify(NativeVoiceEvent::Committed(text));
         }
-        BridgeEvent::Final(text) => {
+        BridgeEvent::Final { session_id, text }
+            if session_id == *bridge_session_id && bridge_session_id.is_some() =>
+        {
             let _ = realtime_text.update(&text);
             *final_text = text.clone();
             notify(NativeVoiceEvent::Final(text));
         }
-        BridgeEvent::Error { phase, message } => {
+        BridgeEvent::Error {
+            session_id,
+            phase,
+            message,
+        } if (session_id == *bridge_session_id && bridge_session_id.is_some())
+            || (session_id.is_none() && bridge_session_id.is_none()) =>
+        {
             let context = phase.map(|phase| format!("{phase}: ")).unwrap_or_default();
             return Err(format!("{context}{message}"));
         }
-        BridgeEvent::Other => {}
+        BridgeEvent::Trace {
+            session_id,
+            elapsed_ms,
+            event,
+        } if session_id == *bridge_session_id && bridge_session_id.is_some() => eprintln!(
+            "[voice_trace] session={} elapsed_ms={elapsed_ms} event={event}",
+            session_id.map_or_else(|| "?".to_string(), |value| value.to_string())
+        ),
+        BridgeEvent::TraceSummary {
+            session_id,
+            audio_bytes,
+            contains_speech,
+            empty_final,
+        } if session_id == *bridge_session_id && bridge_session_id.is_some() => eprintln!(
+            "[voice_trace_summary] session={} audio_bytes={audio_bytes} contains_speech={contains_speech} empty_final={empty_final}",
+            session_id.map_or_else(|| "?".to_string(), |value| value.to_string())
+        ),
+        _ => {}
     }
-    Ok(())
+    Ok(recording_started)
 }
 
 #[cfg(test)]
@@ -616,30 +703,43 @@ mod tests {
         let notify = |event| received.lock().unwrap().push(event);
         let mut latest_text = String::new();
         let mut final_text = String::new();
+        let mut bridge_session_id = Some(7);
         let realtime_text = RealtimeTextOutput::new(PasteTarget::default());
 
         handle_bridge_event(
-            Ok(BridgeEvent::Partial("你".to_string())),
+            Ok(BridgeEvent::Partial {
+                session_id: Some(7),
+                text: "你".to_string(),
+            }),
             &notify,
             &realtime_text,
             &mut latest_text,
             &mut final_text,
+            &mut bridge_session_id,
         )
         .unwrap();
         handle_bridge_event(
-            Ok(BridgeEvent::Text("你好".to_string())),
+            Ok(BridgeEvent::Text {
+                session_id: Some(7),
+                text: "你好".to_string(),
+            }),
             &notify,
             &realtime_text,
             &mut latest_text,
             &mut final_text,
+            &mut bridge_session_id,
         )
         .unwrap();
         handle_bridge_event(
-            Ok(BridgeEvent::Final("你好世界".to_string())),
+            Ok(BridgeEvent::Final {
+                session_id: Some(7),
+                text: "你好世界".to_string(),
+            }),
             &notify,
             &realtime_text,
             &mut latest_text,
             &mut final_text,
+            &mut bridge_session_id,
         )
         .unwrap();
 
@@ -651,6 +751,32 @@ mod tests {
                 NativeVoiceEvent::Final("你好世界".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn bridge_text_events_from_another_session_are_ignored() {
+        let received = Mutex::new(Vec::new());
+        let notify = |event| received.lock().unwrap().push(event);
+        let mut latest_text = String::new();
+        let mut final_text = String::new();
+        let mut bridge_session_id = Some(7);
+        let realtime_text = RealtimeTextOutput::new(PasteTarget::default());
+
+        handle_bridge_event(
+            Ok(BridgeEvent::Final {
+                session_id: Some(6),
+                text: "上一轮".to_string(),
+            }),
+            &notify,
+            &realtime_text,
+            &mut latest_text,
+            &mut final_text,
+            &mut bridge_session_id,
+        )
+        .unwrap();
+
+        assert!(received.into_inner().unwrap().is_empty());
+        assert!(final_text.is_empty());
     }
 
     #[test]

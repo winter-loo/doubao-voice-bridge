@@ -27,4 +27,15 @@ final class RealtimePCMBufferTests: XCTestCase {
         XCTAssertEqual(buffer.enqueueS16LE(Data([0x40, 0x00, 0xC0])), 0)
         XCTAssertEqual(buffer.dequeue(frameCount: 2), [0.5, -0.5])
     }
+
+    func testClearRemovesQueuedFramesAndPendingSplitSample() {
+        let buffer = RealtimePCMBuffer(capacityFrames: 4)
+        XCTAssertEqual(buffer.enqueueS16LE(Data([0x00, 0x40, 0x7F])), 0)
+
+        buffer.clear()
+
+        XCTAssertEqual(buffer.dequeue(frameCount: 2), [0, 0])
+        XCTAssertEqual(buffer.enqueueS16LE(Data([0x00, 0x20])), 0)
+        XCTAssertEqual(buffer.dequeue(frameCount: 1), [0.25])
+    }
 }

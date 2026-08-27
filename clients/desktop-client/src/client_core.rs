@@ -4,13 +4,41 @@ pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BridgeEvent {
-    Phase(String),
-    Partial(String),
-    Text(String),
-    Final(String),
+    Ack {
+        command: String,
+        session_id: Option<u64>,
+    },
+    Phase {
+        session_id: Option<u64>,
+        phase: String,
+    },
+    Partial {
+        session_id: Option<u64>,
+        text: String,
+    },
+    Text {
+        session_id: Option<u64>,
+        text: String,
+    },
+    Final {
+        session_id: Option<u64>,
+        text: String,
+    },
     Error {
+        session_id: Option<u64>,
         phase: Option<String>,
         message: String,
+    },
+    Trace {
+        session_id: Option<u64>,
+        elapsed_ms: u64,
+        event: String,
+    },
+    TraceSummary {
+        session_id: Option<u64>,
+        audio_bytes: u64,
+        contains_speech: bool,
+        empty_final: bool,
     },
     Other,
 }
@@ -28,19 +56,39 @@ pub fn decode_bridge_event(line: &str) -> Result<BridgeEvent, serde_json::Error>
             .unwrap_or_default()
             .to_owned()
     };
+    let session_id = || event.get("session_id").and_then(Value::as_u64);
 
     Ok(match event_type {
-        "status" => BridgeEvent::Phase(
-            event
+        "ack" => BridgeEvent::Ack {
+            command: event
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            session_id: session_id(),
+        },
+        "status" => BridgeEvent::Phase {
+            session_id: session_id(),
+            phase: event
                 .get("phase")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-        ),
-        "partial" => BridgeEvent::Partial(text()),
-        "text" => BridgeEvent::Text(text()),
-        "final" => BridgeEvent::Final(text()),
+        },
+        "partial" => BridgeEvent::Partial {
+            session_id: session_id(),
+            text: text(),
+        },
+        "text" => BridgeEvent::Text {
+            session_id: session_id(),
+            text: text(),
+        },
+        "final" => BridgeEvent::Final {
+            session_id: session_id(),
+            text: text(),
+        },
         "error" => BridgeEvent::Error {
+            session_id: session_id(),
             phase: event
                 .get("phase")
                 .and_then(Value::as_str)
@@ -50,6 +98,33 @@ pub fn decode_bridge_event(line: &str) -> Result<BridgeEvent, serde_json::Error>
                 .and_then(Value::as_str)
                 .unwrap_or("Unknown bridge error")
                 .to_owned(),
+        },
+        "trace" => BridgeEvent::Trace {
+            session_id: session_id(),
+            elapsed_ms: event
+                .get("elapsed_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            event: event
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        },
+        "trace_summary" => BridgeEvent::TraceSummary {
+            session_id: session_id(),
+            audio_bytes: event
+                .get("audio_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            contains_speech: event
+                .get("contains_speech")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            empty_final: event
+                .get("empty_final")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         },
         _ => BridgeEvent::Other,
     })
@@ -156,12 +231,26 @@ mod tests {
     #[test]
     fn decodes_bridge_status_and_text_events() {
         assert_eq!(
-            decode_bridge_event(r#"{"type":"status","phase":"recording"}"#).unwrap(),
-            BridgeEvent::Phase("recording".to_string())
+            decode_bridge_event(r#"{"type":"ack","command":"start","session_id":7}"#).unwrap(),
+            BridgeEvent::Ack {
+                command: "start".to_string(),
+                session_id: Some(7),
+            }
         );
         assert_eq!(
-            decode_bridge_event(r#"{"type":"final","text":"hello"}"#).unwrap(),
-            BridgeEvent::Final("hello".to_string())
+            decode_bridge_event(r#"{"type":"status","phase":"recording","session_id":7}"#,)
+                .unwrap(),
+            BridgeEvent::Phase {
+                session_id: Some(7),
+                phase: "recording".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_bridge_event(r#"{"type":"final","text":"hello","session_id":7}"#).unwrap(),
+            BridgeEvent::Final {
+                session_id: Some(7),
+                text: "hello".to_string(),
+            }
         );
     }
 
@@ -170,6 +259,33 @@ mod tests {
         assert_eq!(
             decode_bridge_event(r#"{"type":"hello","authRequired":false}"#).unwrap(),
             BridgeEvent::Other
+        );
+    }
+
+    #[test]
+    fn decodes_session_relative_trace_events() {
+        assert_eq!(
+            decode_bridge_event(
+                r#"{"type":"trace","session_id":7,"elapsed_ms":245,"event":"ui_ready"}"#,
+            )
+            .unwrap(),
+            BridgeEvent::Trace {
+                session_id: Some(7),
+                elapsed_ms: 245,
+                event: "ui_ready".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_bridge_event(
+                r#"{"type":"trace_summary","session_id":7,"audio_bytes":96000,"contains_speech":true,"empty_final":false}"#,
+            )
+            .unwrap(),
+            BridgeEvent::TraceSummary {
+                session_id: Some(7),
+                audio_bytes: 96_000,
+                contains_speech: true,
+                empty_final: false,
+            }
         );
     }
 

@@ -67,6 +67,22 @@ final class TranscriptPanelSessionTests: XCTestCase {
         XCTAssertEqual(model.phase, .activating)
     }
 
+    func testReadyGatePhasesRemainActivatingUntilRecording() throws {
+        let model = try makeModel()
+        model.handleBridgeEvent(status("arming", sessionID: 51))
+
+        model.handleBridgeEvent(status("ui_ready", sessionID: 51))
+        XCTAssertEqual(model.phase, .activating)
+        XCTAssertEqual(model.statusMessage, "Doubao voice UI is stable")
+
+        model.handleBridgeEvent(status("asr_warmup", sessionID: 51))
+        XCTAssertEqual(model.phase, .activating)
+        XCTAssertEqual(model.statusMessage, "Verifying the audio data path")
+
+        model.handleBridgeEvent(status("recording", sessionID: 51))
+        XCTAssertEqual(model.phase, .listening)
+    }
+
     func testIdleGracePeriodOnlyEndsTheSessionThatScheduledIt() async throws {
         let model = try makeModel(transcriptDismissDelay: 0.01)
         model.handleBridgeEvent(status("arming", sessionID: 20))
@@ -86,6 +102,27 @@ final class TranscriptPanelSessionTests: XCTestCase {
         try await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertNil(model.transcriptPanelSession)
+    }
+
+    func testSessionErrorRemainsVisibleThroughIdleUntilGracePeriodEnds() async throws {
+        let model = try makeModel(transcriptDismissDelay: 0.01)
+        model.handleBridgeEvent(status("arming", sessionID: 31))
+
+        model.handleBridgeEvent([
+            "type": "error",
+            "phase": "empty_result",
+            "message": "No speech result was produced",
+            "session_id": 31,
+        ])
+        model.handleBridgeEvent(status("idle", sessionID: 31))
+
+        XCTAssertEqual(model.phase, .error("No speech result was produced"))
+        XCTAssertEqual(model.transcriptPanelSession?.id, 31)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertNil(model.transcriptPanelSession)
+        XCTAssertEqual(model.phase, .error("Setup is incomplete"))
     }
 
     private func status(_ phase: String, sessionID: Int) -> [String: Any] {

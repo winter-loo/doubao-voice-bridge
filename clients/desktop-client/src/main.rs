@@ -388,7 +388,7 @@ enum NativeVoiceEventOutcome {
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn overlay_phase_for_bridge_phase(phase: &str) -> Option<OverlayPhase> {
     match phase {
-        "arming" | "voice_retry" => Some(OverlayPhase::Activating),
+        "arming" | "voice_retry" | "ui_ready" | "asr_warmup" => Some(OverlayPhase::Activating),
         "recording" => Some(OverlayPhase::Listening),
         "optimizing" => Some(OverlayPhase::Optimizing),
         _ => None,
@@ -1896,6 +1896,14 @@ mod tests {
         );
         assert_eq!(
             overlay_phase_from_bridge_line("[bridge_phase] voice_retry"),
+            Some(OverlayPhase::Activating)
+        );
+        assert_eq!(
+            overlay_phase_from_bridge_line("[bridge_phase] ui_ready"),
+            Some(OverlayPhase::Activating)
+        );
+        assert_eq!(
+            overlay_phase_from_bridge_line("[bridge_phase] asr_warmup"),
             Some(OverlayPhase::Activating)
         );
         assert_eq!(

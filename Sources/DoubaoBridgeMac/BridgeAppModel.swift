@@ -84,6 +84,7 @@ final class BridgeAppModel: ObservableObject {
     private let ffmpegPath: String
     private let transcriptDismissDelay: TimeInterval
     private var transcriptEndWorkItem: DispatchWorkItem?
+    private var terminalSessionError = false
 
     init(
         preferences: AppPreferences,
@@ -173,7 +174,12 @@ final class BridgeAppModel: ObservableObject {
             let message = object["message"] as? String ?? "Unknown bridge error"
             phase = .error(message)
             statusMessage = message
-            endTranscriptPanelSession()
+            if sessionID != nil {
+                terminalSessionError = true
+                scheduleTranscriptEnd()
+            } else {
+                endTranscriptPanelSession()
+            }
             return
         }
 
@@ -197,6 +203,14 @@ final class BridgeAppModel: ObservableObject {
             guard ensureTranscriptPanelSession(sessionID: sessionID) else { return }
             phase = .activating
             statusMessage = "Preparing Doubao voice input"
+        case "ui_ready":
+            guard ensureTranscriptPanelSession(sessionID: sessionID) else { return }
+            phase = .activating
+            statusMessage = "Doubao voice UI is stable"
+        case "asr_warmup":
+            guard ensureTranscriptPanelSession(sessionID: sessionID) else { return }
+            phase = .activating
+            statusMessage = "Verifying the audio data path"
         case "recording":
             guard ensureTranscriptPanelSession(sessionID: sessionID) else { return }
             phase = .listening
@@ -207,6 +221,10 @@ final class BridgeAppModel: ObservableObject {
             statusMessage = "Waiting for Doubao to commit the final text"
         case "idle":
             guard eventBelongsToCurrentTranscriptSession(sessionID) else { return }
+            if terminalSessionError {
+                scheduleTranscriptEnd()
+                return
+            }
             phase = readiness.isReady ? .ready : .error("Setup is incomplete")
             statusMessage = connectedClientCount == 0
                 ? "Waiting for a Windows client"
@@ -329,6 +347,13 @@ final class BridgeAppModel: ObservableObject {
             }
             self.transcriptPanelSession = nil
             self.transcriptEndWorkItem = nil
+            if self.terminalSessionError {
+                self.terminalSessionError = false
+                self.phase = self.readiness.isReady ? .ready : .error("Setup is incomplete")
+                self.statusMessage = self.connectedClientCount == 0
+                    ? "Waiting for a Windows client"
+                    : self.connectionSummary
+            }
         }
         transcriptEndWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + transcriptDismissDelay, execute: workItem)
@@ -351,6 +376,7 @@ final class BridgeAppModel: ObservableObject {
             transcriptPanelSession = nil
         }
         transcriptText = ""
+        terminalSessionError = false
         transcriptPanelSession = TranscriptPanelSession(id: sessionID)
     }
 

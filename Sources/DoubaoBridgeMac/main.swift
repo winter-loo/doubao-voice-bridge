@@ -21,7 +21,10 @@ struct Config {
     var restoreDefaultInput = true
     var listAudioDevices = false
     var startupDelay: TimeInterval = 0.3
-    var voiceActivationCheckDelay: TimeInterval = 1.0
+    var voiceActivationCheckDelay: TimeInterval = 0.05
+    var voiceActivationAttemptTimeout: TimeInterval = 1.0
+    var voiceActivationStableSamples = 2
+    var asrWarmupDelay: TimeInterval = 0.3
     var voiceActivationRetries = 2
     var voiceActivationRetryDelay: TimeInterval = 0.25
     var finalDelay: TimeInterval = 1.8
@@ -84,6 +87,12 @@ struct Config {
                 config.startupDelay = Double(try takeValue(after: option)) ?? config.startupDelay
             case "--voice-activation-check-delay":
                 config.voiceActivationCheckDelay = Double(try takeValue(after: option)) ?? config.voiceActivationCheckDelay
+            case "--voice-activation-attempt-timeout":
+                config.voiceActivationAttemptTimeout = Double(try takeValue(after: option)) ?? config.voiceActivationAttemptTimeout
+            case "--voice-activation-stable-samples":
+                config.voiceActivationStableSamples = Int(try takeValue(after: option)) ?? config.voiceActivationStableSamples
+            case "--asr-warmup-delay":
+                config.asrWarmupDelay = Double(try takeValue(after: option)) ?? config.asrWarmupDelay
             case "--voice-activation-retries":
                 config.voiceActivationRetries = Int(try takeValue(after: option)) ?? config.voiceActivationRetries
             case "--voice-activation-retry-delay":
@@ -139,7 +148,12 @@ func printUsage() {
       --list-audio-devices           List CoreAudio devices and exit
       --startup-delay <seconds>      Delay before toggling Doubao voice input. Default: 0.3
       --voice-activation-check-delay <seconds>
-                                      Delay before checking Doubao voice UI. Default: 1.0
+                                      Poll interval for Doubao voice UI. Default: 0.05
+      --voice-activation-attempt-timeout <seconds>
+                                      Timeout for each shortcut attempt. Default: 1.0
+      --voice-activation-stable-samples <n>
+                                      Consecutive ready samples required. Default: 2
+      --asr-warmup-delay <seconds>    Guard after stable UI/audio readiness. Default: 0.3
       --voice-activation-retries <n> Retry voice shortcut when Doubao voice UI is not detected. Default: 2
       --voice-activation-retry-delay <seconds>
                                       Delay between voice shortcut retries. Default: 0.25
@@ -258,6 +272,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
     private var lastPartialEmitTime = Date.distantPast
     var onChange: ((String, String) -> Void)?
     var onPartial: ((String) -> Void)?
+    var onCommit: ((String) -> Void)?
     var onCaptureUnavailable: ((String) -> Void)?
 
     init(showWindow: Bool) {
@@ -306,7 +321,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
         textView.onMarkedTextChange = { [weak self] in
             self?.emitPartialIfChanged()
         }
-        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.emitPartialIfChanged()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -401,12 +416,21 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
     func clear() {
         lastText = ""
         lastPartialText = ""
+        lastPartialEmitTime = .distantPast
         textView.string = ""
         onChange?("", "")
     }
 
     func currentText() -> String {
         textView.string
+    }
+
+    var hasMarkedText: Bool {
+        textView.hasMarkedText()
+    }
+
+    var hasProducedText: Bool {
+        !lastText.isEmpty || !lastPartialText.isEmpty || !textView.string.isEmpty
     }
 
     func textDidChange(_ notification: Notification) {
@@ -421,6 +445,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
         lastText = text
         print("[capture] textDidChange textLength=\(text.count) deltaLength=\(delta.count) deltaPreview=\(String(delta.prefix(80)))")
         onChange?(text, delta)
+        onCommit?(text)
     }
 
     private func emitPartialIfChanged() {
@@ -434,7 +459,7 @@ final class TextCaptureWindow: NSObject, NSTextViewDelegate, NSWindowDelegate {
             return
         }
         let now = Date()
-        guard now.timeIntervalSince(lastPartialEmitTime) >= 0.1 else {
+        guard now.timeIntervalSince(lastPartialEmitTime) >= 0.05 else {
             return
         }
 
@@ -589,6 +614,15 @@ final class VoiceStateDetector {
 
     init(controller: DoubaoController) {
         self.controller = controller
+    }
+
+    func likelyVoiceUIActive() -> Bool {
+        let apps = doubaoApplications()
+        let appPIDs = Set(apps.map { $0.processIdentifier })
+        return doubaoWindows(appPIDs: appPIDs).contains { window in
+            let name = window["name"] as? String ?? ""
+            return !name.isEmpty || (window["layer"] as? Int ?? 0) > 0
+        }
     }
 
     func snapshot(label: String, capture: [String: Any]) -> [String: Any] {
@@ -1279,6 +1313,14 @@ final class AudioReceiver {
     private var levelSumSquares: Double = 0
     private var levelSamples: UInt64 = 0
     private var levelPeak: Int16 = 0
+    private var sessionBytes: UInt64 = 0
+    private var sessionPackets: UInt64 = 0
+    private var sessionSumSquares: Double = 0
+    private var sessionSamples: UInt64 = 0
+    private var sessionWindowSumSquares: Double = 0
+    private var sessionWindowSamples: UInt64 = 0
+    private var sessionMaxWindowRMS: Double = 0
+    private var sessionPeak: Int16 = 0
 
     init(
         ffmpegPath: String,
@@ -1300,6 +1342,48 @@ final class AudioReceiver {
     func resetAudioLevel() {
         tcpQueue.async { [weak self] in
             self?.resetAudioLevelOnQueue()
+        }
+    }
+
+    func resetSessionEvidence() {
+        tcpQueue.sync {
+            resetAudioLevelOnQueue()
+            sessionBytes = 0
+            sessionPackets = 0
+            sessionSumSquares = 0
+            sessionSamples = 0
+            sessionWindowSumSquares = 0
+            sessionWindowSamples = 0
+            sessionMaxWindowRMS = 0
+            sessionPeak = 0
+        }
+    }
+
+    func transportReady() -> Bool {
+        if audioSourceCommand != nil || audioTransport != "tcp" {
+            return process?.isRunning == true
+        }
+        return tcpQueue.sync { !tcpConnections.isEmpty }
+    }
+
+    func sessionAudioEvidence() -> VoiceAudioEvidence {
+        tcpQueue.sync {
+            let rms = sessionSamples > 0
+                ? sqrt(sessionSumSquares / Double(sessionSamples))
+                : 0
+            let peak = max(1, abs(Int(sessionPeak)))
+            let pendingWindowRMS = sessionWindowSamples > 0
+                ? sqrt(sessionWindowSumSquares / Double(sessionWindowSamples))
+                : 0
+            let maxWindowRMS = max(sessionMaxWindowRMS, pendingWindowRMS)
+            return VoiceAudioEvidence(
+                bytes: sessionBytes,
+                rmsDBFS: rms > 0 ? max(20 * log10(rms / 32768), -120) : -120,
+                maxWindowRMSDBFS: maxWindowRMS > 0
+                    ? max(20 * log10(maxWindowRMS / 32768), -120)
+                    : -120,
+                peakDBFS: max(20 * log10(Double(peak) / 32768), -120)
+            )
         }
     }
 
@@ -1485,6 +1569,29 @@ final class AudioReceiver {
         }
     }
 
+    func finishSession() {
+        guard realtimeOutput != nil else {
+            stop()
+            return
+        }
+        tcpQueue.sync {
+            for connection in tcpConnections {
+                connection.cancel()
+            }
+            tcpConnections.removeAll()
+            realtimeOutput?.clear()
+            resetAudioLevelOnQueue()
+            sessionBytes = 0
+            sessionPackets = 0
+            sessionSumSquares = 0
+            sessionSamples = 0
+            sessionWindowSumSquares = 0
+            sessionWindowSamples = 0
+            sessionMaxWindowRMS = 0
+            sessionPeak = 0
+        }
+    }
+
     private func startTCPAudioServer() throws {
         guard let port = NWEndpoint.Port(rawValue: udpPort) else {
             throw BridgeError.message("Invalid TCP audio port: \(udpPort)")
@@ -1600,6 +1707,8 @@ final class AudioReceiver {
     private func ingestAudioLevel(_ data: Data) {
         levelBytes += UInt64(data.count)
         levelPackets += 1
+        sessionBytes += UInt64(data.count)
+        sessionPackets += 1
         var index = data.startIndex
         while index + 1 < data.endIndex {
             let low = UInt16(data[index])
@@ -1609,9 +1718,24 @@ final class AudioReceiver {
             if magnitude > abs(Int(levelPeak)) {
                 levelPeak = sample
             }
+            if magnitude > abs(Int(sessionPeak)) {
+                sessionPeak = sample
+            }
             let normalized = Double(sample)
             levelSumSquares += normalized * normalized
             levelSamples += 1
+            sessionSumSquares += normalized * normalized
+            sessionSamples += 1
+            sessionWindowSumSquares += normalized * normalized
+            sessionWindowSamples += 1
+            if sessionWindowSamples >= 960 {
+                sessionMaxWindowRMS = max(
+                    sessionMaxWindowRMS,
+                    sqrt(sessionWindowSumSquares / Double(sessionWindowSamples))
+                )
+                sessionWindowSumSquares = 0
+                sessionWindowSamples = 0
+            }
             index = data.index(index, offsetBy: 2)
         }
     }
@@ -1631,8 +1755,14 @@ final class Bridge {
     private var nextSessionID = 0
     private(set) var currentSessionID: Int?
     private var finalizationWorkItem: DispatchWorkItem?
+    private var commitFinalizationWorkItem: DispatchWorkItem?
+    private var commitGate = StableTextCommitGate()
+    private var sessionTrace: VoiceSessionTrace?
+    private var currentPhase = "idle"
     private var voiceActivationGeneration = 0
     private var voiceActivationAttempt = 0
+    private var voiceActivationAttemptStartedAt: UInt64 = 0
+    private var readyGate: StableVoiceReadyGate
     private var audioLevelGeneration = 0
     private var appActivationObserver: NSObjectProtocol?
     private var captureRecoveryInProgress = false
@@ -1657,8 +1787,12 @@ final class Bridge {
         self.audioReceiver = audioReceiver
         self.audioDeviceManager = audioDeviceManager
         self.defaultInputRecoveryStore = defaultInputRecoveryStore
+        readyGate = StableVoiceReadyGate(requiredSamples: config.voiceActivationStableSamples)
         captureWindow.onCaptureUnavailable = { [weak self] reason in
             self?.recoverCaptureFocusIfNeeded(reason: reason)
+        }
+        captureWindow.onCommit = { [weak self] text in
+            self?.scheduleFinalizationFromStableCommit(text)
         }
         appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
@@ -1678,31 +1812,41 @@ final class Bridge {
         }
     }
 
-    func startSession() {
+    var hasActiveSession: Bool {
+        currentSessionID != nil
+    }
+
+    @discardableResult
+    func startSession() -> Int? {
+        guard currentSessionID == nil else {
+            return nil
+        }
         discardPendingFinalization()
         nextSessionID += 1
         let sessionID = nextSessionID
         currentSessionID = sessionID
-        emit?([
-            "type": "status",
-            "recording": true,
-            "phase": "arming",
-            "session_id": sessionID
-        ])
+        sessionTrace = VoiceSessionTrace(sessionID: sessionID)
+        emitTrace("start_received")
+        emitStatus("arming", recording: true)
 
         do {
             print("[session] start requested id=\(sessionID)")
             voiceActivationGeneration += 1
             audioLevelGeneration += 1
             voiceActivationAttempt = 0
+            readyGate.reset()
             captureRecoveryInProgress = false
             try switchDefaultInputForRemoteSession()
+            emitTrace("default_input_switched")
+            audioReceiver.resetSessionEvidence()
             try audioReceiver.start()
-            audioReceiver.resetAudioLevel()
+            emitTrace("coreaudio_started")
             captureWindow.clear()
             captureWindow.ensureVoiceInputUIActive(reason: "client session started")
+            emitTrace("capture_focused")
             logDiagnostics("after initial focus")
             try controller.switchToDoubao()
+            emitTrace("doubao_input_selected")
             logDiagnostics("after switchToDoubao")
             emitVoiceState("after switchToDoubao")
 
@@ -1710,8 +1854,10 @@ final class Bridge {
             DispatchQueue.main.asyncAfter(deadline: .now() + config.startupDelay) { [weak self] in
                 self?.beginVoiceActivation(generation: generation)
             }
+            return sessionID
         } catch {
-            audioReceiver.stop()
+            emitTrace("start_failed")
+            audioReceiver.finishSession()
             restoreDefaultInputIfNeeded()
             fputs("[session] start failed id=\(sessionID): \(error)\n", stderr)
             emit?([
@@ -1720,8 +1866,11 @@ final class Bridge {
                 "session_id": sessionID
             ])
             if currentSessionID == sessionID {
+                emitStatus("idle", recording: false)
                 currentSessionID = nil
+                sessionTrace = nil
             }
+            return nil
         }
     }
 
@@ -1730,14 +1879,8 @@ final class Bridge {
             return
         }
         print("[session] stop requested id=\(sessionID)")
-        if isRecording {
-            emit?([
-                "type": "status",
-                "recording": false,
-                "phase": "optimizing",
-                "session_id": sessionID
-            ])
-        }
+        emitStatus("optimizing", recording: false)
+        emitTrace("stop_received")
         voiceActivationGeneration += 1
         audioLevelGeneration += 1
         captureRecoveryInProgress = false
@@ -1752,39 +1895,110 @@ final class Bridge {
                 controller.pressVoiceShortcut()
             }
             isRecording = false
+            emitTrace("voice_shortcut_up")
             emitFocusState("after stop shortcut")
         }
 
         finalizationWorkItem?.cancel()
+        commitFinalizationWorkItem?.cancel()
+        commitFinalizationWorkItem = nil
+        commitGate.reset()
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self, self.currentSessionID == sessionID else { return }
-            self.logDiagnostics("before final emit")
-            self.emitVoiceState("before final emit")
-            self.emitFocusState("before final emit")
-            self.emitAudioLevel(label: "before final emit", reset: false)
-            self.audioReceiver.stop()
-            self.restoreDefaultInputIfNeeded()
-            self.emit?([
-                "type": "final",
-                "text": self.captureWindow.currentText(),
-                "session_id": sessionID
-            ])
-            self.emit?([
-                "type": "status",
-                "recording": false,
-                "phase": "idle",
-                "session_id": sessionID
-            ])
-            self.currentSessionID = nil
-            self.finalizationWorkItem = nil
+            self?.completeFinalization(sessionID: sessionID, trigger: "fallback_timeout")
         }
         finalizationWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + config.finalDelay, execute: workItem)
     }
 
+    private func scheduleFinalizationFromStableCommit(_ text: String) {
+        guard finalizationWorkItem != nil,
+              let currentSessionID,
+              let revision = commitGate.observe(text)
+        else {
+            return
+        }
+        commitFinalizationWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.commitGate.isCurrent(revision) else { return }
+            self.completeFinalization(
+                sessionID: currentSessionID,
+                trigger: "marked_text_commit_stable"
+            )
+        }
+        commitFinalizationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+    }
+
+    private func completeFinalization(sessionID: Int, trigger: String) {
+        guard currentSessionID == sessionID, finalizationWorkItem != nil else { return }
+        finalizationWorkItem?.cancel()
+        finalizationWorkItem = nil
+        commitFinalizationWorkItem?.cancel()
+        commitFinalizationWorkItem = nil
+        commitGate.reset()
+        emitTrace("final_trigger_\(trigger)")
+        logDiagnostics("before final emit")
+        emitVoiceState("before final emit")
+        emitFocusState("before final emit")
+        emitAudioLevel(label: "before final emit", reset: false)
+
+        let evidence = audioReceiver.sessionAudioEvidence()
+        let text = captureWindow.currentText()
+        let completion = VoiceSessionCompletion.classify(
+            text: text,
+            hadText: captureWindow.hasProducedText,
+            containsSpeech: evidence.containsSpeech
+        )
+        audioReceiver.finishSession()
+        restoreDefaultInputIfNeeded()
+
+        switch completion {
+        case .final(let finalText):
+            emit?([
+                "type": "final",
+                "text": finalText,
+                "session_id": sessionID,
+            ])
+            emitTrace("final_emitted")
+        case .emptyResult:
+            emit?([
+                "type": "error",
+                "phase": "empty_result",
+                "message": "No speech result was produced",
+                "session_id": sessionID,
+            ])
+            emitTrace("empty_result")
+        case .noSpeech:
+            emit?([
+                "type": "error",
+                "phase": "no_speech",
+                "message": "No speech was detected",
+                "session_id": sessionID,
+            ])
+            emitTrace("no_speech")
+        }
+
+        emit?([
+            "type": "trace_summary",
+            "session_id": sessionID,
+            "audio_bytes": evidence.bytes,
+            "audio_rms_dbfs": evidence.rmsDBFS,
+            "audio_max_window_rms_dbfs": evidence.maxWindowRMSDBFS,
+            "audio_peak_dbfs": evidence.peakDBFS,
+            "contains_speech": evidence.containsSpeech,
+            "empty_final": text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        ])
+        emitStatus("idle", recording: false)
+        currentSessionID = nil
+        sessionTrace = nil
+    }
+
     func prepareForTermination() {
         finalizationWorkItem?.cancel()
         finalizationWorkItem = nil
+        commitFinalizationWorkItem?.cancel()
+        commitFinalizationWorkItem = nil
+        commitGate.reset()
         voiceActivationGeneration += 1
         audioLevelGeneration += 1
         if isRecording {
@@ -1798,10 +2012,16 @@ final class Bridge {
         audioReceiver.stop()
         restoreDefaultInputIfNeeded()
         currentSessionID = nil
+        sessionTrace = nil
+        currentPhase = "idle"
     }
 
     func toggleSession() {
-        isRecording ? stopSession() : startSession()
+        if currentSessionID == nil {
+            _ = startSession()
+        } else {
+            stopSession()
+        }
     }
 
     func clear() {
@@ -1812,12 +2032,29 @@ final class Bridge {
         var object: [String: Any] = [
             "type": "status",
             "recording": isRecording,
-            "phase": isRecording ? "recording" : "idle"
+            "phase": currentPhase
         ]
         if let currentSessionID {
             object["session_id"] = currentSessionID
         }
         emit?(object)
+    }
+
+    private func emitStatus(_ phase: String, recording: Bool) {
+        currentPhase = phase
+        guard let currentSessionID else { return }
+        emit?([
+            "type": "status",
+            "recording": recording,
+            "phase": phase,
+            "session_id": currentSessionID,
+        ])
+    }
+
+    private func emitTrace(_ name: String) {
+        guard let event = sessionTrace?.event(name) else { return }
+        print("[voice-trace] session=\(event.sessionID) elapsed_ms=\(event.elapsedMilliseconds) event=\(event.name)")
+        emit?(event.dictionary)
     }
 
     private func discardPendingFinalization() {
@@ -1826,9 +2063,14 @@ final class Bridge {
         }
         finalizationWorkItem?.cancel()
         finalizationWorkItem = nil
-        audioReceiver.stop()
+        commitFinalizationWorkItem?.cancel()
+        commitFinalizationWorkItem = nil
+        commitGate.reset()
+        audioReceiver.finishSession()
         restoreDefaultInputIfNeeded()
         currentSessionID = nil
+        sessionTrace = nil
+        currentPhase = "idle"
     }
 
     func diagnose() {
@@ -1957,6 +2199,8 @@ final class Bridge {
             return
         }
 
+        readyGate.reset()
+        voiceActivationAttemptStartedAt = DispatchTime.now().uptimeNanoseconds
         captureWindow.ensureVoiceInputUIActive(reason: "voice activation")
         logDiagnostics("before voice shortcut")
         emitVoiceState("before voice shortcut")
@@ -1966,6 +2210,7 @@ final class Bridge {
             controller.pressVoiceShortcut()
         }
         isRecording = true
+        emitTrace("voice_shortcut_down")
         logDiagnostics("after voice shortcut")
         emitVoiceState("after voice shortcut")
         scheduleVoiceStateChecks(prefix: "after voice shortcut")
@@ -1981,38 +2226,42 @@ final class Bridge {
         }
 
         captureWindow.ensureVoiceInputUIActive(reason: "voice activation check")
-        let snapshot = emitVoiceState("voice activation check attempt \(voiceActivationAttempt + 1)")
-        let doubaoUIActive = snapshot["likelyVoiceUIActive"] as? Bool == true
-        if VoiceInputReadiness.isReady(
+        let doubaoUIActive = voiceStateDetector.likelyVoiceUIActive()
+        let captureFocused = captureWindow.isReadyForVoiceInput
+        let transportReady = audioReceiver.transportReady()
+        if readyGate.observe(
             doubaoUIActive: doubaoUIActive,
-            captureFocused: captureWindow.isReadyForVoiceInput
+            captureFocused: captureFocused,
+            transportReady: transportReady
         ) {
             captureRecoveryInProgress = false
-            if let currentSessionID {
-                emit?([
-                    "type": "status",
-                    "recording": true,
-                    "phase": "recording",
-                    "session_id": currentSessionID
-                ])
+            emitStatus("ui_ready", recording: true)
+            emitTrace("ui_ready")
+            emitStatus("asr_warmup", recording: true)
+            emitTrace("asr_warmup_started")
+            DispatchQueue.main.asyncAfter(deadline: .now() + config.asrWarmupDelay) { [weak self] in
+                self?.completeASRWarmup(generation: generation)
             }
-            startAudioLevelReporting(generation: generation)
+            return
+        }
+
+        let nowNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let elapsedNanoseconds = nowNanoseconds >= voiceActivationAttemptStartedAt
+            ? nowNanoseconds - voiceActivationAttemptStartedAt
+            : 0
+        if Double(elapsedNanoseconds) / 1_000_000_000 < config.voiceActivationAttemptTimeout {
+            DispatchQueue.main.asyncAfter(deadline: .now() + config.voiceActivationCheckDelay) { [weak self] in
+                self?.checkVoiceActivation(generation: generation)
+            }
             return
         }
 
         if voiceActivationAttempt < config.voiceActivationRetries {
             voiceActivationAttempt += 1
+            emitVoiceState("voice activation timeout attempt \(voiceActivationAttempt)")
             print("[voice-state] voice input not ready doubaoUI=\(doubaoUIActive) captureFocused=\(captureWindow.isReadyForVoiceInput); retry \(voiceActivationAttempt)/\(config.voiceActivationRetries)")
-            if let currentSessionID {
-                emit?([
-                    "type": "status",
-                    "recording": true,
-                    "phase": "voice_retry",
-                    "attempt": voiceActivationAttempt,
-                    "maxAttempts": config.voiceActivationRetries,
-                    "session_id": currentSessionID
-                ])
-            }
+            emitStatus("voice_retry", recording: true)
+            emitTrace("voice_activation_retry")
             releaseVoiceShortcutIfNeeded()
 
             DispatchQueue.main.asyncAfter(deadline: .now() + config.voiceActivationRetryDelay) { [weak self] in
@@ -2022,8 +2271,10 @@ final class Bridge {
         }
 
         print("[voice-state] Doubao voice UI did not become active after \(config.voiceActivationRetries + 1) attempts")
+        emitVoiceState("voice activation failed")
+        emitTrace("voice_activation_failed")
         releaseVoiceShortcutIfNeeded()
-        audioReceiver.stop()
+        audioReceiver.finishSession()
         restoreDefaultInputIfNeeded()
         if let currentSessionID {
             emit?([
@@ -2032,14 +2283,28 @@ final class Bridge {
                 "phase": "voice_activation_failed",
                 "session_id": currentSessionID
             ])
-            emit?([
-                "type": "status",
-                "recording": false,
-                "phase": "idle",
-                "session_id": currentSessionID
-            ])
+            emitStatus("idle", recording: false)
             self.currentSessionID = nil
+            sessionTrace = nil
         }
+    }
+
+    private func completeASRWarmup(generation: Int) {
+        guard generation == voiceActivationGeneration else { return }
+        let doubaoUIActive = voiceStateDetector.likelyVoiceUIActive()
+        guard VoiceInputReadiness.isReady(
+            doubaoUIActive: doubaoUIActive,
+            captureFocused: captureWindow.isReadyForVoiceInput
+        ), audioReceiver.transportReady()
+        else {
+            readyGate.reset()
+            checkVoiceActivation(generation: generation)
+            return
+        }
+
+        emitStatus("recording", recording: true)
+        emitTrace("asr_audio_ready")
+        startAudioLevelReporting(generation: generation)
     }
 
     private func releaseVoiceShortcutIfNeeded() {
@@ -2093,14 +2358,7 @@ final class Bridge {
         captureRecoveryInProgress = true
         let generation = voiceActivationGeneration
         print("[voice-ui] capture focus lost reason=\(reason); rearming voice input")
-        if let currentSessionID {
-            emit?([
-                "type": "status",
-                "recording": true,
-                "phase": "arming",
-                "session_id": currentSessionID
-            ])
-        }
+        emitStatus("arming", recording: true)
         captureWindow.ensureVoiceInputUIActive(reason: reason)
         scheduleCaptureRecovery(generation: generation, attempt: 0)
     }
@@ -2124,7 +2382,7 @@ final class Bridge {
                 print("[voice-ui] capture focus recovery failed")
                 self.releaseVoiceShortcutIfNeeded()
                 self.captureRecoveryInProgress = false
-                self.audioReceiver.stop()
+                self.audioReceiver.finishSession()
                 self.restoreDefaultInputIfNeeded()
                 if let currentSessionID = self.currentSessionID {
                     self.emit?([
@@ -2133,13 +2391,9 @@ final class Bridge {
                         "phase": "voice_activation_failed",
                         "session_id": currentSessionID
                     ])
-                    self.emit?([
-                        "type": "status",
-                        "recording": false,
-                        "phase": "idle",
-                        "session_id": currentSessionID
-                    ])
+                    self.emitStatus("idle", recording: false)
                     self.currentSessionID = nil
+                    self.sessionTrace = nil
                 }
                 return
             }
@@ -2193,6 +2447,7 @@ final class BridgeServer {
         let connection: NWConnection
         var buffer = Data()
         var authorized: Bool
+        var activeSessionID: Int?
 
         init(connection: NWConnection, authorized: Bool) {
             self.connection = connection
@@ -2319,11 +2574,45 @@ final class BridgeServer {
             guard let self else { return }
             switch command {
             case "start":
-                self.bridge.startSession()
-                self.send(["type": "ack", "command": "start"], to: client)
+                if self.bridge.hasActiveSession {
+                    self.send([
+                        "type": "error",
+                        "phase": "session_busy",
+                        "message": "Another voice session is already active",
+                    ], to: client)
+                } else if let sessionID = self.bridge.startSession() {
+                    client.activeSessionID = sessionID
+                    self.send([
+                        "type": "ack",
+                        "command": "start",
+                        "session_id": sessionID,
+                    ], to: client)
+                } else {
+                    self.send([
+                        "type": "error",
+                        "phase": "start_failed",
+                        "message": "The voice session could not be started",
+                    ], to: client)
+                }
             case "stop":
-                self.bridge.stopSession()
-                self.send(["type": "ack", "command": "stop"], to: client)
+                if let sessionID = SessionCommandOwnership.authorizedStopSessionID(
+                    argument: argument,
+                    clientSessionID: client.activeSessionID,
+                    activeSessionID: self.bridge.currentSessionID
+                ) {
+                    self.bridge.stopSession()
+                    self.send([
+                        "type": "ack",
+                        "command": "stop",
+                        "session_id": sessionID,
+                    ], to: client)
+                } else {
+                    self.send([
+                        "type": "error",
+                        "phase": "stale_session",
+                        "message": "Stop rejected because this client does not own the active session",
+                    ], to: client)
+                }
             case "toggle":
                 self.bridge.toggleSession()
                 self.send(["type": "ack", "command": "toggle"], to: client)
@@ -2420,6 +2709,14 @@ func runApplication() throws {
         audioDeviceName: config.audioDeviceName ?? config.remoteInputDeviceName,
         audioSourceCommand: config.audioSourceCommand
     )
+    if config.audioSourceCommand == nil, config.audioTransport == "tcp" {
+        do {
+            try audioReceiver.start()
+            print("[audio] prewarmed CoreAudio output and transport listener")
+        } catch {
+            fputs("[audio] prewarm deferred until first session: \(error)\n", stderr)
+        }
+    }
     let bridge = Bridge(
         config: config,
         captureWindow: captureWindow,
@@ -2452,14 +2749,8 @@ func runApplication() throws {
 
     bridge.emit = { object in
         server.broadcast(object)
-        if Thread.isMainThread {
-            MainActor.assumeIsolated {
-                appModel.handleBridgeEvent(object)
-            }
-        } else {
-            DispatchQueue.main.async {
-                appModel.handleBridgeEvent(object)
-            }
+        DispatchQueue.main.async {
+            appModel.handleBridgeEvent(object)
         }
     }
     captureWindow.onChange = { text, delta in

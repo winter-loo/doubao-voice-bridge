@@ -291,15 +291,32 @@ where
     F: Fn(NativeVoiceEvent),
 {
     match event? {
-        BridgeEvent::Phase(phase) => notify(NativeVoiceEvent::Phase(phase)),
-        BridgeEvent::Partial(text) => notify(NativeVoiceEvent::Partial(text)),
-        BridgeEvent::Text(text) => *latest_text = text,
-        BridgeEvent::Final(text) => *final_text = text,
-        BridgeEvent::Error { phase, message } => {
+        BridgeEvent::Phase { phase, .. } => notify(NativeVoiceEvent::Phase(phase)),
+        BridgeEvent::Partial { text, .. } => notify(NativeVoiceEvent::Partial(text)),
+        BridgeEvent::Text { text, .. } => *latest_text = text,
+        BridgeEvent::Final { text, .. } => *final_text = text,
+        BridgeEvent::Error { phase, message, .. } => {
             let context = phase.map(|phase| format!("{phase}: ")).unwrap_or_default();
             return Err(format!("{context}{message}"));
         }
-        BridgeEvent::Other => {}
+        BridgeEvent::Trace {
+            session_id,
+            elapsed_ms,
+            event,
+        } => eprintln!(
+            "[voice_trace] session={} elapsed_ms={elapsed_ms} event={event}",
+            session_id.map_or_else(|| "?".to_string(), |value| value.to_string())
+        ),
+        BridgeEvent::TraceSummary {
+            session_id,
+            audio_bytes,
+            contains_speech,
+            empty_final,
+        } => eprintln!(
+            "[voice_trace_summary] session={} audio_bytes={audio_bytes} contains_speech={contains_speech} empty_final={empty_final}",
+            session_id.map_or_else(|| "?".to_string(), |value| value.to_string())
+        ),
+        BridgeEvent::Ack { .. } | BridgeEvent::Other => {}
     }
     Ok(())
 }

@@ -69,6 +69,15 @@ final class RealtimePCMBuffer {
         return output
     }
 
+    func clear() {
+        os_unfair_lock_lock(&lock)
+        readIndex = 0
+        writeIndex = 0
+        availableFrames = 0
+        pendingLowByte = nil
+        os_unfair_lock_unlock(&lock)
+    }
+
     func render(into audioBufferList: UnsafeMutablePointer<AudioBufferList>, frameCount: UInt32) {
         let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
         os_unfair_lock_lock(&lock)
@@ -253,6 +262,10 @@ final class RealtimeAudioOutput {
 
     func enqueueS16LE(_ data: Data) -> UInt64 {
         pcmBuffer.enqueueS16LE(data)
+    }
+
+    func clear() {
+        pcmBuffer.clear()
     }
 
     fileprivate func render(

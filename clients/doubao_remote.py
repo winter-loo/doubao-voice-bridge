@@ -603,7 +603,7 @@ def build_parser():
         help="Stop after this many seconds. Omit to record until Ctrl+C.",
     )
     record.add_argument("--final-timeout", type=float, default=4.0)
-    record.add_argument("--audio-start-delay", type=float, default=1.0)
+    record.add_argument("--audio-start-delay", type=float, default=0.0)
     record.add_argument("--audio-connect-timeout", type=float, default=5.0)
     record.add_argument("--audio-tail-buffer", type=float, default=1.0)
     record.add_argument("--audio-pre-stop-tail", type=float, default=0.5)

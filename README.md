@@ -86,9 +86,13 @@ dist/DoubaoVoiceBridge.app/Contents/MacOS/doubao-bridge-mac \
   --voice-shortcut fn \
   --voice-shortcut-mode hold \
   --startup-delay 0.3 \
-  --voice-activation-check-delay 1.0 \
+  --voice-activation-check-delay 0.05 \
+  --voice-activation-attempt-timeout 1.0 \
+  --voice-activation-stable-samples 2 \
+  --asr-warmup-delay 0.3 \
   --voice-activation-retries 2 \
-  --voice-activation-retry-delay 0.25
+  --voice-activation-retry-delay 0.25 \
+  --final-delay 1.8
 ```
 
 With `--remote-input-device`, the bridge temporarily switches macOS default input to BlackHole when a session starts, then restores the previous input device after stop.
@@ -157,7 +161,7 @@ python3 clients/doubao_remote.py \
   --udp-port 5004 \
   --audio-transport tcp \
   record \
-  --audio-start-delay 0.2 \
+  --audio-start-delay 0 \
   --audio-stop-delay 0.5 \
   --recording-timeout 15 \
   --final-timeout 8
@@ -165,12 +169,18 @@ python3 clients/doubao_remote.py \
 
 Without `--seconds`, the client records until you press `Ctrl+C`. To stop automatically after a fixed duration, add `--seconds 22`.
 
-The client starts streaming audio early, but recording begins after the Mac bridge emits `phase=recording`. That phase is only emitted after the Mac confirms Doubao's voice UI is active. Pressing `Ctrl+C` stops the remote microphone, releases the Doubao voice shortcut, and waits for the final committed text.
+The native client starts microphone capture before it sends `start`, keeps speech
+in a bounded pre-roll, and connects the audio data path without the old 200 ms
+gap. Playback begins only after the Mac bridge emits `phase=recording`, following
+`arming -> ui_ready -> asr_warmup`. The Python diagnostic client defaults to no
+extra startup delay. Pressing `Ctrl+C` stops the remote microphone, releases the
+Doubao voice shortcut, and waits for the final committed text.
 
 The GPUI client mirrors that protocol state. It displays `激活中` for
-the Mac bridge's `arming` and `voice_retry` phases, and only switches to the
-audio-reactive waveform after `phase=recording`. This prevents early microphone
-energy from looking as if Doubao is already recognizing speech.
+the Mac bridge's `arming`, `voice_retry`, `ui_ready`, and `asr_warmup` phases,
+and only switches to the audio-reactive waveform after `phase=recording`. This
+prevents early microphone energy from looking as if Doubao is already
+recognizing speech.
 
 When launching the client as a one-shot SSH command, allocate a pseudo-terminal so `Ctrl+C` reaches the remote Python process:
 
