@@ -7,6 +7,10 @@ struct MenuBarSnapshot: Equatable {
     let connectedClientCount: Int
     let launchAtLogin: Bool
 
+    var usesActiveIcon: Bool {
+        phase != .ready
+    }
+
     var connectionSummary: String {
         switch connectedClientCount {
         case 0:
@@ -78,13 +82,15 @@ final class MenuBarController: NSObject {
     }
 
     private func refreshMenu(snapshot: MenuBarSnapshot) {
-        let image = BrandAssets.menuBarTemplateImage() ?? NSImage(
+        let brandImage = snapshot.usesActiveIcon
+            ? BrandAssets.menuBarActiveImage()
+            : BrandAssets.menuBarTemplateImage()
+        let image = brandImage ?? NSImage(
             systemSymbolName: snapshot.phase.symbolName,
             accessibilityDescription: snapshot.phase.title
         )
-        image?.isTemplate = true
         statusItem.button?.image = image
-        statusItem.button?.contentTintColor = statusColor(for: snapshot.phase)
+        statusItem.button?.contentTintColor = nil
         statusItem.button?.toolTip = "Doubao Voice Bridge: \(snapshot.phase.title)"
         statusItem.button?.setAccessibilityLabel("Doubao Voice Bridge: \(snapshot.phase.title)")
 
@@ -119,21 +125,6 @@ final class MenuBarController: NSObject {
         menu.addItem(.separator())
         menu.addItem(menuItem("Quit", symbol: "power", action: #selector(quit)))
         statusItem.menu = menu
-    }
-
-    private func statusColor(for phase: BridgeAppPhase) -> NSColor {
-        switch phase {
-        case .starting:
-            return .secondaryLabelColor
-        case .ready:
-            return .labelColor
-        case .activating, .optimizing:
-            return .systemOrange
-        case .listening:
-            return BrandPalette.coreBlue
-        case .error:
-            return .systemRed
-        }
     }
 
     private func menuItem(_ title: String, symbol: String, action: Selector) -> NSMenuItem {

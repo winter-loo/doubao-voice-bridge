@@ -69,6 +69,74 @@ final class MenuBarSnapshotTests: XCTestCase {
         )
     }
 
+    func testOnlyReadyUsesAdaptiveTemplateMenuBarIcon() {
+        XCTAssertFalse(
+            MenuBarSnapshot(
+                phase: .ready,
+                connectedClientCount: 1,
+                launchAtLogin: false
+            ).usesActiveIcon
+        )
+
+        let activePhases: [BridgeAppPhase] = [
+            .starting,
+            .activating,
+            .listening,
+            .optimizing,
+            .error("test"),
+        ]
+        for phase in activePhases {
+            XCTAssertTrue(
+                MenuBarSnapshot(
+                    phase: phase,
+                    connectedClientCount: 1,
+                    launchAtLogin: false
+                ).usesActiveIcon,
+                "Expected \(phase) to use the active menu-bar icon"
+            )
+        }
+    }
+
+    func testActiveMenuBarImageContainsVisibleCanonicalBrandBluePixels() throws {
+        let document = try canonicalBrandDocument()
+        let colors = try XCTUnwrap(document["colors"] as? [String: Any])
+        let coreBlue = try XCTUnwrap(colors["core_blue"] as? [String: Any])
+        let expectedRGB = try XCTUnwrap(coreBlue["rgb"] as? [Int])
+        let image = try XCTUnwrap(BrandAssets.menuBarActiveImage())
+        let representations = image.representations.compactMap { $0 as? NSBitmapImageRep }
+        let representation = try XCTUnwrap(
+            representations.first { $0.pixelsWide == 20 }
+        )
+        var foundBrandBluePixel = false
+
+        if let bitmapData = representation.bitmapData {
+            for y in 0..<representation.pixelsHigh {
+                for x in 0..<representation.pixelsWide {
+                    let offset = y * representation.bytesPerRow + x * 4
+                    if bitmapData[offset + 3] > 127,
+                       [
+                           Int(bitmapData[offset]),
+                           Int(bitmapData[offset + 1]),
+                           Int(bitmapData[offset + 2]),
+                       ] == expectedRGB {
+                        foundBrandBluePixel = true
+                        break
+                    }
+                }
+                if foundBrandBluePixel {
+                    break
+                }
+            }
+        }
+
+        XCTAssertEqual(
+            Set(representations.map(\.pixelsWide)),
+            Set([20, 40])
+        )
+        XCTAssertFalse(image.isTemplate)
+        XCTAssertTrue(foundBrandBluePixel)
+    }
+
     func testBrandLogoLoadsForSetupAssistant() {
         XCTAssertNotNil(BrandAssets.logoMarkImage())
     }

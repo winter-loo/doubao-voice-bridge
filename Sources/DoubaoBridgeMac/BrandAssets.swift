@@ -2,10 +2,11 @@ import AppKit
 import Foundation
 
 enum BrandPalette {
+    static let coreBlueRGB = (red: UInt8(24), green: UInt8(121), blue: UInt8(255))
     static let coreBlue = NSColor(
-        srgbRed: 24.0 / 255.0,
-        green: 121.0 / 255.0,
-        blue: 255.0 / 255.0,
+        srgbRed: CGFloat(coreBlueRGB.red) / 255.0,
+        green: CGFloat(coreBlueRGB.green) / 255.0,
+        blue: CGFloat(coreBlueRGB.blue) / 255.0,
         alpha: 1
     )
 }
@@ -36,6 +37,57 @@ enum BrandAssets {
         image.addRepresentation(standard)
         image.addRepresentation(retina)
         image.isTemplate = true
+        return image
+    }
+
+    static func menuBarActiveImage() -> NSImage? {
+        guard let template = menuBarTemplateImage() else {
+            return nil
+        }
+
+        let image = NSImage(size: menuBarPointSize)
+        for case let source as NSBitmapImageRep in template.representations {
+            guard let tinted = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: source.pixelsWide,
+                pixelsHigh: source.pixelsHigh,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bitmapFormat: [.alphaNonpremultiplied, .thirtyTwoBitBigEndian],
+                bytesPerRow: source.pixelsWide * 4,
+                bitsPerPixel: 32
+            ), let bitmapData = tinted.bitmapData else {
+                continue
+            }
+
+            tinted.size = menuBarPointSize
+            let alphaIndex = source.bitmapFormat.contains(.alphaFirst)
+                ? 0
+                : source.samplesPerPixel - 1
+            var sourceSamples = [Int](repeating: 0, count: source.samplesPerPixel)
+            for y in 0..<source.pixelsHigh {
+                for x in 0..<source.pixelsWide {
+                    source.getPixel(&sourceSamples, atX: x, y: y)
+                    let alpha = source.hasAlpha ? sourceSamples[alphaIndex] : 255
+                    guard alpha > 0 else {
+                        continue
+                    }
+                    let offset = y * tinted.bytesPerRow + x * 4
+                    bitmapData[offset] = BrandPalette.coreBlueRGB.red
+                    bitmapData[offset + 1] = BrandPalette.coreBlueRGB.green
+                    bitmapData[offset + 2] = BrandPalette.coreBlueRGB.blue
+                    bitmapData[offset + 3] = UInt8(clamping: alpha)
+                }
+            }
+            image.addRepresentation(tinted)
+        }
+        guard !image.representations.isEmpty else {
+            return nil
+        }
+        image.isTemplate = false
         return image
     }
 
