@@ -26,6 +26,7 @@ const AUDIO_WARMUP_SILENCE_BYTES: usize = 1_920;
 const ARMING_PREROLL_BYTES: usize = 48_000 * 2 * 5;
 const AUDIO_BACKLOG_BYTES: usize = 48_000 * 2 * 10;
 const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_AUDIO_WRITES_PER_TICK: usize = 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeVoiceEvent {
@@ -272,12 +273,13 @@ impl PrerollAudio {
         if !self.recording || self.next_write_at.is_some_and(|deadline| deadline > now) {
             return None;
         }
+        let scheduled_at = self.next_write_at.unwrap_or(now);
         let pcm = self.chunks.pop_front()?;
         self.bytes -= pcm.len();
         self.next_write_at = if self.chunks.is_empty() {
             None
         } else {
-            Some(now + pcm_playback_duration(pcm.len()))
+            Some(scheduled_at + pcm_playback_duration(pcm.len()))
         };
         Some(pcm)
     }
@@ -449,7 +451,11 @@ where
                 break;
             }
 
-            if let Some(pcm) = audio_forwarding.take_ready(Instant::now()) {
+            let now = Instant::now();
+            for _ in 0..MAX_AUDIO_WRITES_PER_TICK {
+                let Some(pcm) = audio_forwarding.take_ready(now) else {
+                    break;
+                };
                 write_audio(&mut audio_socket, &pcm)?;
             }
 
@@ -850,6 +856,40 @@ mod tests {
     #[test]
     fn pcm_playback_duration_uses_48khz_mono_s16le_rate() {
         assert_eq!(pcm_playback_duration(96_000), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn pacing_jitter_does_not_accumulate_audio_backlog_over_long_sessions() {
+        const FRAME_BYTES: usize = 1_920;
+        const BACKLOG_LIMIT: usize = 96_000 * 10;
+        const SESSION_DURATION: Duration = Duration::from_secs(10 * 60);
+        const SCHEDULER_JITTER: Duration = Duration::from_millis(3);
+
+        let started = Instant::now();
+        let frame_duration = pcm_playback_duration(FRAME_BYTES);
+        let mut audio = PrerollAudio::new(0, BACKLOG_LIMIT);
+        audio.start_recording(started);
+        let mut captured_frames = 0usize;
+        let mut now = started;
+
+        while now.duration_since(started) < SESSION_DURATION {
+            now += frame_duration + SCHEDULER_JITTER;
+            let expected_frames =
+                (now.duration_since(started).as_nanos() / frame_duration.as_nanos()) as usize;
+            while captured_frames < expected_frames {
+                audio
+                    .push(vec![0; FRAME_BYTES])
+                    .expect("scheduler jitter must not exhaust the audio backlog");
+                captured_frames += 1;
+            }
+            while audio.take_ready(now).is_some() {}
+        }
+
+        assert!(
+            audio.bytes <= FRAME_BYTES * 2,
+            "long-running pacing drifted by {} bytes",
+            audio.bytes
+        );
     }
 }
 
