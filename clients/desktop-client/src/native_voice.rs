@@ -26,7 +26,7 @@ const AUDIO_WARMUP_SILENCE_BYTES: usize = 1_920;
 const ARMING_PREROLL_BYTES: usize = 48_000 * 2 * 5;
 const AUDIO_BACKLOG_BYTES: usize = 48_000 * 2 * 10;
 const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_AUDIO_WRITES_PER_TICK: usize = 8;
+const MAX_AUDIO_CATCH_UP: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeVoiceEvent {
@@ -290,6 +290,30 @@ impl PrerollAudio {
             .unwrap_or(maximum)
     }
 
+    fn take_ready_batch(&mut self, now: Instant, catch_up_limit: Duration) -> Vec<Vec<u8>> {
+        let mut batch = Vec::new();
+        let mut catch_up = Duration::ZERO;
+        let mut last_frame_duration = Duration::ZERO;
+        while catch_up < catch_up_limit {
+            let Some(pcm) = self.take_ready(now) else {
+                break;
+            };
+            last_frame_duration = pcm_playback_duration(pcm.len());
+            catch_up += last_frame_duration;
+            batch.push(pcm);
+        }
+        if catch_up >= catch_up_limit {
+            self.resume_realtime_pacing(now, last_frame_duration);
+        }
+        batch
+    }
+
+    fn resume_realtime_pacing(&mut self, now: Instant, frame_duration: Duration) {
+        if self.next_write_at.is_some_and(|deadline| deadline <= now) {
+            self.next_write_at = Some(now + frame_duration);
+        }
+    }
+
     fn is_recording(&self) -> bool {
         self.recording
     }
@@ -452,10 +476,7 @@ where
             }
 
             let now = Instant::now();
-            for _ in 0..MAX_AUDIO_WRITES_PER_TICK {
-                let Some(pcm) = audio_forwarding.take_ready(now) else {
-                    break;
-                };
+            for pcm in audio_forwarding.take_ready_batch(now, MAX_AUDIO_CATCH_UP) {
                 write_audio(&mut audio_socket, &pcm)?;
             }
 
@@ -693,8 +714,8 @@ where
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        AudioChunk, AudioQueueSendError, NativeVoiceEvent, PrerollAudio, audio_channel,
-        handle_bridge_event, pcm_playback_duration,
+        AUDIO_BACKLOG_BYTES, AudioChunk, AudioQueueSendError, MAX_AUDIO_CATCH_UP, NativeVoiceEvent,
+        PrerollAudio, audio_channel, handle_bridge_event, pcm_playback_duration,
     };
     use crate::client_core::BridgeEvent;
     use crate::platform_paste::{PasteTarget, RealtimeTextOutput};
@@ -882,7 +903,7 @@ mod tests {
                     .expect("scheduler jitter must not exhaust the audio backlog");
                 captured_frames += 1;
             }
-            while audio.take_ready(now).is_some() {}
+            audio.take_ready_batch(now, MAX_AUDIO_CATCH_UP);
         }
 
         assert!(
@@ -890,6 +911,35 @@ mod tests {
             "long-running pacing drifted by {} bytes",
             audio.bytes
         );
+    }
+
+    #[test]
+    fn catch_up_burst_resumes_realtime_pacing_before_receiver_capacity() {
+        const FRAME_BYTES: usize = 1_920;
+        const RECEIVER_CAPACITY: Duration = Duration::from_millis(250);
+
+        let started = Instant::now();
+        let delayed = started + Duration::from_secs(2);
+        let frame_duration = pcm_playback_duration(FRAME_BYTES);
+        let mut audio = PrerollAudio::new(0, AUDIO_BACKLOG_BYTES);
+        audio.start_recording(started);
+        for _ in 0..100 {
+            audio.push(vec![0; FRAME_BYTES]).unwrap();
+        }
+
+        let batch = audio.take_ready_batch(delayed, MAX_AUDIO_CATCH_UP);
+        let catch_up: Duration = batch
+            .iter()
+            .map(|pcm| pcm_playback_duration(pcm.len()))
+            .sum();
+
+        assert!(catch_up < RECEIVER_CAPACITY);
+        assert_eq!(
+            audio.wait_duration(delayed, Duration::from_secs(1)),
+            frame_duration
+        );
+        assert!(audio.take_ready(delayed).is_none());
+        assert!(audio.take_ready(delayed + frame_duration).is_some());
     }
 }
 
