@@ -40,6 +40,7 @@ use crate::native_voice::{InputDeviceInfo, input_devices};
 const TRAY_MESSAGE: u32 = WM_APP + 24;
 const TRAY_ID: u32 = 1;
 const APP_ICON_RESOURCE_ID: usize = 1;
+const TRAY_ICON_RESOURCE_ID: usize = 2;
 const ID_SERVER: usize = 1001;
 const ID_MICROPHONE: usize = 1002;
 const ID_STARTUP: usize = 1003;
@@ -364,6 +365,15 @@ fn load_application_icon(instance: HINSTANCE) -> HICON {
     }
 }
 
+fn load_tray_icon(instance: HINSTANCE) -> HICON {
+    unsafe {
+        LoadIconW(Some(instance), PCWSTR(TRAY_ICON_RESOURCE_ID as *const u16))
+            .or_else(|_| LoadIconW(Some(instance), PCWSTR(APP_ICON_RESOURCE_ID as *const u16)))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default()
+    }
+}
+
 fn add_tray_icon(window: HWND, instance: HINSTANCE) -> Result<(), String> {
     unsafe {
         let mut icon = NOTIFYICONDATAW {
@@ -372,7 +382,7 @@ fn add_tray_icon(window: HWND, instance: HINSTANCE) -> Result<(), String> {
             uID: TRAY_ID,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: TRAY_MESSAGE,
-            hIcon: load_application_icon(instance),
+            hIcon: load_tray_icon(instance),
             ..Default::default()
         };
         copy_wide(&mut icon.szTip, "Doubao Voice Client");
