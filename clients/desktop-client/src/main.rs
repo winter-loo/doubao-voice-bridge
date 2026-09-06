@@ -3,20 +3,22 @@
     windows_subsystem = "windows"
 )]
 
-#[cfg(target_os = "linux")]
-use std::sync::{Mutex, OnceLock};
 use std::{
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, ColorSpace, Context, FontWeight,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill,
-    linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
+    Animation, AnimationExt as _, App, Application, Bounds, Context, Corners, FontWeight,
+    RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    canvas, div, fill, point, prelude::*, px, rgb, rgba, size,
 };
 #[cfg(target_os = "linux")]
 use gpui::{ClipboardItem, Entity, Focusable, KeyBinding};
+use image::{Frame, RgbaImage};
 
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod client_core;
@@ -32,6 +34,7 @@ mod linux_shortcut;
 mod linux_transcript_input;
 #[cfg(target_os = "linux")]
 mod linux_tray;
+mod liquid_glass;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod native_voice;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -495,156 +498,71 @@ fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
+/// The generated glass textures, keyed by device-pixel size and lighting environment.
+///
+/// The optics are fixed for a given capsule; only the sheen phase moves, and every phase
+/// is baked into one multi-frame image. Shading is cheap, but the atlas upload is not,
+/// so regenerating this per frame would push a new tile sixty times a second for a
+/// picture that never changes. There are at most a handful of keys -- one capsule size
+/// per display scale, times light and dark -- so the cache never needs eviction.
+fn glass_texture(width: u32, height: u32, dark: bool) -> Arc<RenderImage> {
+    type Key = (u32, u32, bool);
+    static CACHE: OnceLock<Mutex<Vec<(Key, Arc<RenderImage>)>>> = OnceLock::new();
+
+    let key = (width, height, dark);
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, texture)) = cache.iter().find(|(cached, _)| *cached == key) {
+        return texture.clone();
+    }
+
+    let frames = liquid_glass::CapsuleGlass::new(width, height, dark)
+        .render_frames()
+        .into_iter()
+        .map(|pixels| {
+            Frame::new(
+                RgbaImage::from_raw(width, height, pixels)
+                    .expect("a glass frame is exactly width * height * 4 bytes"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let texture = Arc::new(RenderImage::new(frames));
+    cache.push((key, texture.clone()));
+    texture
+}
+
 fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
             let radius = bounds.size.height / 2.0;
+            let scale = window.scale_factor();
+            let width = (f32::from(bounds.size.width) * scale).round().max(1.0) as u32;
+            let height = (f32::from(bounds.size.height) * scale).round().max(1.0) as u32;
+            let sheen = ((delta * liquid_glass::SHEEN_FRAMES as f32) as usize)
+                .min(liquid_glass::SHEEN_FRAMES - 1);
             let dark = dark_background();
-            let (glass_top, glass_bottom) = if dark {
-                (rgba(0x5f7f966e), rgba(0x07121f9c))
-            } else {
-                (rgba(0xffffff38), rgba(0xd8efff1c))
-            };
-            window.paint_quad(
-                fill(
+
+            if window
+                .paint_image(
                     bounds,
-                    linear_gradient(
-                        180.0,
-                        linear_color_stop(glass_top, 0.0),
-                        linear_color_stop(glass_bottom, 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
+                    Corners::all(radius),
+                    glass_texture(width, height, dark),
+                    sheen,
+                    false,
                 )
-                .corner_radii(radius),
-            );
-
-            let top_lens = Bounds::new(
-                bounds.origin + point(px(4.0), px(1.0)),
-                size(bounds.size.width - px(8.0), px(10.0)),
-            );
-            window.paint_quad(
-                fill(
-                    top_lens,
-                    linear_gradient(
-                        180.0,
-                        linear_color_stop(
-                            if dark {
-                                rgba(0xffffffec)
-                            } else {
-                                rgba(0xffffffb8)
-                            },
-                            0.0,
-                        ),
-                        linear_color_stop(rgba(0xffffff00), 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let lower_reflection = Bounds::new(
-                bounds.origin + point(px(3.0), bounds.size.height - px(8.0)),
-                size(bounds.size.width - px(6.0), px(6.0)),
-            );
-            window.paint_quad(
-                fill(
-                    lower_reflection,
-                    linear_gradient(
-                        180.0,
-                        linear_color_stop(rgba(0xffffff00), 0.0),
-                        linear_color_stop(
-                            if dark {
-                                rgba(0xa7dcff68)
-                            } else {
-                                rgba(0xffffff4c)
-                            },
-                            1.0,
-                        ),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let left_refraction = Bounds::new(
-                bounds.origin + point(px(1.0), px(4.0)),
-                size(px(8.0), bounds.size.height - px(8.0)),
-            );
-            window.paint_quad(
-                fill(
-                    left_refraction,
-                    linear_gradient(
-                        90.0,
-                        linear_color_stop(rgba(0x8ee9ff42), 0.0),
-                        linear_color_stop(rgba(0xffffff00), 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let right_refraction = Bounds::new(
-                point(
-                    bounds.origin.x + bounds.size.width - px(9.0),
-                    bounds.origin.y + px(4.0),
-                ),
-                size(px(8.0), bounds.size.height - px(8.0)),
-            );
-            window.paint_quad(
-                fill(
-                    right_refraction,
-                    linear_gradient(
-                        270.0,
-                        linear_color_stop(rgba(0xffc8f12e), 0.0),
-                        linear_color_stop(rgba(0xffffff00), 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let upper_rim = Bounds::new(
-                bounds.origin + point(px(13.0), px(1.0)),
-                size(bounds.size.width - px(26.0), px(1.0)),
-            );
-            window.paint_quad(
-                fill(
-                    upper_rim,
-                    linear_gradient(
-                        90.0,
-                        linear_color_stop(rgba(0xffffff22), 0.0),
-                        linear_color_stop(rgba(0xffffffea), 0.5),
-                    ),
-                )
-                .corner_radii(px(0.5)),
-            );
-
-            let lower_rim = Bounds::new(
-                bounds.origin + point(px(15.0), bounds.size.height - px(2.0)),
-                size(bounds.size.width - px(30.0), px(1.0)),
-            );
-            window.paint_quad(
-                fill(
-                    lower_rim,
-                    linear_gradient(
-                        90.0,
-                        linear_color_stop(rgba(0xaeeaff18), 0.0),
-                        linear_color_stop(rgba(0xffffff78), 0.55),
-                    ),
-                )
-                .corner_radii(px(0.5)),
-            );
-
-            for x in [
-                bounds.origin.x + px(1.0),
-                bounds.origin.x + bounds.size.width - px(2.0),
-            ] {
-                let edge_caustic = Bounds::new(
-                    point(x, bounds.origin.y + px(6.0)),
-                    size(px(1.0), bounds.size.height - px(12.0)),
-                );
-                window.paint_quad(fill(edge_caustic, rgba(0xffffff62)).corner_radii(px(0.5)));
+                .is_err()
+            {
+                // The sprite atlas refused the tile. Fall back to a flat capsule so the
+                // overlay stays readable instead of disappearing.
+                let flat = if dark {
+                    rgba(0x0c1a2ad8)
+                } else {
+                    rgba(0xffffffbc)
+                };
+                window.paint_quad(fill(bounds, flat).corner_radii(radius));
             }
 
             if !show_waveform {
@@ -681,8 +599,10 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
     .h(px(LISTENING_CAPSULE_HEIGHT))
 }
 
+/// The capsule shell. It carries layout and text color only: the fill, the rim and the
+/// outline all come out of the glass texture, which shapes them to the real silhouette
+/// instead of to an axis-aligned box.
 fn capsule_base() -> gpui::Div {
-    let dark = dark_background();
     div()
         .relative()
         .flex()
@@ -690,18 +610,7 @@ fn capsule_base() -> gpui::Div {
         .justify_center()
         .rounded_full()
         .overflow_hidden()
-        .bg(if dark {
-            rgba(0x06101b38)
-        } else {
-            rgba(0xffffff0c)
-        })
-        .border_1()
-        .border_color(if dark {
-            rgba(0xffffffe0)
-        } else {
-            rgba(0xaec8d55a)
-        })
-        .text_color(if dark {
+        .text_color(if dark_background() {
             rgba(0xffffffff)
         } else {
             rgba(0x07131ff5)
