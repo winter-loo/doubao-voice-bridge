@@ -147,16 +147,24 @@ const DARK_PALETTE: Palette = Palette {
     sheen: Rgba::hex(0xdff2ff1c),
 };
 
+/// The light palette cannot mirror the dark one.
+///
+/// The dark palette separates from its background in both directions at once: a body
+/// darker than the desktop and a rim brighter than it. Over a white document there is no
+/// "brighter" left to use, so a palette built the same way -- white tint, white rim,
+/// white bounce -- disappears into the page. Glass on paper reads the other way round:
+/// what you see is the edge bending light *away*, so the rim is darker than the surface,
+/// not lighter, and the body carries a faint cool cast rather than a white wash.
 const LIGHT_PALETTE: Palette = Palette {
-    tint_top: Rgba::hex(0xffffff52),
-    tint_bottom: Rgba::hex(0xd8efff2c),
-    inner_wall: Rgba::hex(0x51707f18),
-    dispersion_cool: Rgba::hex(0x5fd6ff62),
-    dispersion_warm: Rgba::hex(0xff9fe04a),
-    key_light: Rgba::hex(0xffffffcc),
-    bounce_light: Rgba::hex(0xffffff66),
-    edge_line: Rgba::hex(0xffffffd8),
-    sheen: Rgba::hex(0xffffff26),
+    tint_top: Rgba::hex(0xdae6f27e),
+    tint_bottom: Rgba::hex(0x9db4cb96),
+    inner_wall: Rgba::hex(0x2c455c5e),
+    dispersion_cool: Rgba::hex(0x3dbcff70),
+    dispersion_warm: Rgba::hex(0xff86cf58),
+    key_light: Rgba::hex(0xffffffe6),
+    bounce_light: Rgba::hex(0xeaf4ff8c),
+    edge_line: Rgba::hex(0x51698adc),
+    sheen: Rgba::hex(0xffffff40),
 };
 
 /// A capsule-shaped glass lens, measured in device pixels.
@@ -479,6 +487,40 @@ mod tests {
             center
         );
         assert!(top_rim.a > center.a);
+    }
+
+    #[test]
+    fn the_light_capsule_separates_from_a_white_page() {
+        // The regression this guards against: a light palette built the way the dark one
+        // is -- white tint, white rim, white bounce -- vanishes on a white document,
+        // because against white there is no "brighter than the background" left to use.
+        // Composited onto the page, the rim has to come out materially *darker* than it.
+        let glass = CapsuleGlass::new(WIDTH, HEIGHT, false);
+        let luminance = |c: Rgba| c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722;
+        let over_white = |c: Rgba| luminance(c) * c.a + (1.0 - c.a);
+
+        let rim = over_white(glass.shade(WIDTH as f32 / 2.0, 1.2, 0.5));
+        let body = over_white(glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.5));
+        assert!(rim < 0.80, "rim over white is {rim}, too close to the page");
+        assert!(body < 0.93, "body over white is {body}, too close to the page");
+        assert!(rim < body, "the rim has to read darker than the body it encloses");
+    }
+
+    #[test]
+    fn each_palette_leans_away_from_its_own_background() {
+        // The two palettes are not mirror images: the dark one is legible because its rim
+        // is brighter than the desktop behind it, the light one because its rim is
+        // darker. Losing either direction is what makes a capsule disappear.
+        let luminance = |c: Rgba| c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722;
+        let rim_of = |dark: bool| {
+            let glass = CapsuleGlass::new(WIDTH, HEIGHT, dark);
+            glass.shade(WIDTH as f32 / 2.0, 1.2, 0.5)
+        };
+
+        let on_black = |c: Rgba| luminance(c) * c.a;
+        let on_white = |c: Rgba| luminance(c) * c.a + (1.0 - c.a);
+        assert!(on_black(rim_of(true)) > 0.5, "the dark rim must light up a dark desktop");
+        assert!(on_white(rim_of(false)) < 0.8, "the light rim must darken a light one");
     }
 
     #[test]
