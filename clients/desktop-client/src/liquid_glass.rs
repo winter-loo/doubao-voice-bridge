@@ -340,6 +340,37 @@ impl CapsuleGlass {
     }
 }
 
+/// Mixes two rendered frame sets into a third, `mix` running from all `start` to all
+/// `end`.
+///
+/// This interpolates the finished pixels rather than the palettes behind them, which is
+/// what keeps alpha linear across the range: a capsule halfway between the two is
+/// halfway as opaque. Painting one glass on top of the other instead would compound
+/// their alpha and make the capsule visibly thicker in the middle of a change -- the
+/// thing that separates a transition from a dissolve.
+///
+/// Both sides must share a frame count and frame length; they come from the same
+/// `render_frames` shape, so a mismatch is a programming error rather than input.
+pub fn blend_frames(start: &[Vec<u8>], end: &[Vec<u8>], mix: f32) -> Vec<Vec<u8>> {
+    debug_assert_eq!(start.len(), end.len(), "frame sets differ in length");
+    let mix = mix.clamp(0.0, 1.0);
+
+    start
+        .iter()
+        .zip(end)
+        .map(|(from, to)| {
+            debug_assert_eq!(from.len(), to.len(), "frames differ in size");
+            from.iter()
+                .zip(to)
+                .map(|(&from, &to)| {
+                    let from = f32::from(from);
+                    (from + (f32::from(to) - from) * mix).round() as u8
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Refraction strength across the bevel, from 0 where the slab is flat to 1 at the
 /// boundary.
 ///
@@ -497,5 +528,59 @@ mod tests {
         let blended = half_white.over(black);
         assert!((blended.a - 1.0).abs() < 1.0e-6);
         assert!((blended.r - 128.0 / 255.0).abs() < 0.01, "{blended:?}");
+    }
+
+    #[test]
+    fn blending_returns_each_end_untouched() {
+        let light = CapsuleGlass::new(24, 12, false).render_frames();
+        let dark = CapsuleGlass::new(24, 12, true).render_frames();
+        assert_eq!(blend_frames(&light, &dark, 0.0), light);
+        assert_eq!(blend_frames(&light, &dark, 1.0), dark);
+    }
+
+    #[test]
+    fn blending_stays_between_the_two_ends() {
+        let light = CapsuleGlass::new(24, 12, false).render_frames();
+        let dark = CapsuleGlass::new(24, 12, true).render_frames();
+        let middle = blend_frames(&light, &dark, 0.5);
+
+        for (frame, (light, dark)) in middle.iter().zip(light.iter().zip(&dark)) {
+            for ((&mixed, &light), &dark) in frame.iter().zip(light).zip(dark) {
+                let low = light.min(dark);
+                let high = light.max(dark);
+                assert!(
+                    (low..=high).contains(&mixed),
+                    "{mixed} escaped the range {low}..={high}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_moves_linearly_so_the_capsule_never_thickens() {
+        // A capsule painted over itself would compound alpha; mixing must not. Halfway
+        // through, every pixel's alpha has to sit on the straight line between the ends.
+        let light = CapsuleGlass::new(24, 12, false).render_frames();
+        let dark = CapsuleGlass::new(24, 12, true).render_frames();
+        let middle = blend_frames(&light, &dark, 0.5);
+
+        for (frame, (light, dark)) in middle.iter().zip(light.iter().zip(&dark)) {
+            for offset in (3..frame.len()).step_by(4) {
+                let expected = (f32::from(light[offset]) + f32::from(dark[offset])) / 2.0;
+                let actual = f32::from(frame[offset]);
+                assert!(
+                    (actual - expected).abs() <= 0.5,
+                    "alpha {actual} is not the midpoint {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blending_clamps_a_mix_outside_the_range() {
+        let light = CapsuleGlass::new(16, 8, false).render_frames();
+        let dark = CapsuleGlass::new(16, 8, true).render_frames();
+        assert_eq!(blend_frames(&light, &dark, -1.0), light);
+        assert_eq!(blend_frames(&light, &dark, 2.0), dark);
     }
 }

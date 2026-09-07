@@ -257,6 +257,14 @@ static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
+/// How far the capsule has travelled from the light palette (0) towards the dark one
+/// (`GLASS_MIX_STEPS`).
+///
+/// `DARK_BACKGROUND` is the palette the probes have settled on; this is the palette
+/// actually on screen, walking towards that target a step at a time. Without the walk
+/// the capsule snaps between two very different looks the instant the background crosses
+/// a threshold, which reads as the glass blinking rather than responding.
+static GLASS_MIX_LEVEL: AtomicU32 = AtomicU32::new(0);
 static VOICE_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 static VOICE_ACTIVITY_UPDATED_AT: AtomicU64 = AtomicU64::new(0);
 static SPEECH_ACTIVITY_UNTIL: AtomicU64 = AtomicU64::new(0);
@@ -300,6 +308,40 @@ fn overlay_generation() -> u64 {
 
 fn dark_background() -> bool {
     DARK_BACKGROUND.load(Ordering::Acquire)
+}
+
+/// Steps between the light and dark palettes.
+///
+/// Each step that gets displayed costs one baked texture, so this trades transition
+/// smoothness against memory; the whole ladder for one capsule size is a few megabytes.
+const GLASS_MIX_STEPS: u32 = 12;
+
+fn glass_mix_level() -> u32 {
+    GLASS_MIX_LEVEL.load(Ordering::Acquire).min(GLASS_MIX_STEPS)
+}
+
+/// The palette currently on screen as a fraction: 0.0 fully light, 1.0 fully dark.
+fn glass_mix() -> f32 {
+    glass_mix_level() as f32 / GLASS_MIX_STEPS as f32
+}
+
+#[cfg(target_os = "windows")]
+fn set_glass_mix_level(level: u32) {
+    GLASS_MIX_LEVEL.store(level.min(GLASS_MIX_STEPS), Ordering::Release);
+}
+
+/// One step of the walk from `level` towards `target`.
+///
+/// Kept separate from the thread that drives it so the walk can be checked without a
+/// screen: it has to move by exactly one step, in the right direction, and stop on
+/// arrival rather than stepping past it.
+#[cfg(target_os = "windows")]
+fn step_glass_mix_level(level: u32, target: u32) -> u32 {
+    match level.cmp(&target) {
+        std::cmp::Ordering::Less => level + 1,
+        std::cmp::Ordering::Greater => level - 1,
+        std::cmp::Ordering::Equal => level,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -531,6 +573,20 @@ fn waveform_bar_height(index: usize, delta: f32, voice_level: f32) -> f32 {
     3.0 + 13.0 * BAR_AMPLITUDES[index] * voice_level.sqrt() * (0.24 + 0.76 * movement)
 }
 
+/// Interpolates a `0xRRGGBBAA` colour, alpha included.
+///
+/// The capsule's text and its flat fallback both have to travel with the glass; leaving
+/// either on a hard switch would put a jump back into a transition that is otherwise
+/// continuous.
+fn lerp_rgba(start: u32, end: u32, t: f32) -> u32 {
+    let channel = |shift: u32| {
+        let from = ((start >> shift) & 0xffu32) as f32;
+        let to = ((end >> shift) & 0xffu32) as f32;
+        (from + (to - from) * t.clamp(0.0, 1.0)).round() as u32
+    };
+    (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
     let channel = |shift: u32| {
         let from = ((start >> shift) & 0xffu32) as f32;
@@ -540,18 +596,43 @@ fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
-/// The generated glass textures, keyed by device-pixel size and lighting environment.
+/// The shaded pixels for one end of the palette range, keyed by device-pixel size.
 ///
-/// The optics are fixed for a given capsule; only the sheen phase moves, and every phase
-/// is baked into one multi-frame image. Shading is cheap, but the atlas upload is not,
-/// so regenerating this per frame would push a new tile sixty times a second for a
-/// picture that never changes. There are at most a handful of keys -- one capsule size
-/// per display scale, times light and dark -- so the cache never needs eviction.
-fn glass_texture(width: u32, height: u32, dark: bool) -> Arc<RenderImage> {
+/// Held as raw frames rather than as a texture because every palette in between is mixed
+/// from these two, and mixing finished pixels is far cheaper than re-shading the capsule
+/// at each step.
+fn glass_base_frames(width: u32, height: u32, dark: bool) -> Arc<Vec<Vec<u8>>> {
     type Key = (u32, u32, bool);
-    static CACHE: OnceLock<Mutex<Vec<(Key, Arc<RenderImage>)>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Vec<(Key, Arc<Vec<Vec<u8>>>)>>> = OnceLock::new();
 
     let key = (width, height, dark);
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, frames)) = cache.iter().find(|(cached, _)| *cached == key) {
+        return frames.clone();
+    }
+
+    let frames = Arc::new(liquid_glass::CapsuleGlass::new(width, height, dark).render_frames());
+    cache.push((key, frames.clone()));
+    frames
+}
+
+/// The generated glass texture for one step between the light and dark palettes, keyed
+/// by device-pixel size and step.
+///
+/// The optics are fixed for a given capsule and step; only the sheen phase moves, and
+/// every phase is baked into one multi-frame image. Shading is cheap, but the atlas
+/// upload is not, so regenerating this per frame would push a new tile sixty times a
+/// second for a picture that never changes. The keys are bounded -- one capsule size per
+/// display scale, times `GLASS_MIX_STEPS + 1` steps -- so the cache never needs eviction.
+fn glass_texture(width: u32, height: u32, level: u32) -> Arc<RenderImage> {
+    type Key = (u32, u32, u32);
+    static CACHE: OnceLock<Mutex<Vec<(Key, Arc<RenderImage>)>>> = OnceLock::new();
+
+    let level = level.min(GLASS_MIX_STEPS);
+    let key = (width, height, level);
     let mut cache = CACHE
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
@@ -560,8 +641,17 @@ fn glass_texture(width: u32, height: u32, dark: bool) -> Arc<RenderImage> {
         return texture.clone();
     }
 
-    let frames = liquid_glass::CapsuleGlass::new(width, height, dark)
-        .render_frames()
+    let pixels = match level {
+        0 => (*glass_base_frames(width, height, false)).clone(),
+        level if level == GLASS_MIX_STEPS => (*glass_base_frames(width, height, true)).clone(),
+        level => liquid_glass::blend_frames(
+            &glass_base_frames(width, height, false),
+            &glass_base_frames(width, height, true),
+            level as f32 / GLASS_MIX_STEPS as f32,
+        ),
+    };
+
+    let frames = pixels
         .into_iter()
         .map(|pixels| {
             Frame::new(
@@ -585,13 +675,13 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
             let height = (f32::from(bounds.size.height) * scale).round().max(1.0) as u32;
             let sheen = ((delta * liquid_glass::SHEEN_FRAMES as f32) as usize)
                 .min(liquid_glass::SHEEN_FRAMES - 1);
-            let dark = dark_background();
+            let level = glass_mix_level();
 
             if window
                 .paint_image(
                     bounds,
                     Corners::all(radius),
-                    glass_texture(width, height, dark),
+                    glass_texture(width, height, level),
                     sheen,
                     false,
                 )
@@ -599,12 +689,8 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
             {
                 // The sprite atlas refused the tile. Fall back to a flat capsule so the
                 // overlay stays readable instead of disappearing.
-                let flat = if dark {
-                    rgba(0x0c1a2ad8)
-                } else {
-                    rgba(0xffffffbc)
-                };
-                window.paint_quad(fill(bounds, flat).corner_radii(radius));
+                let flat = lerp_rgba(0xffffffbc, 0x0c1a2ad8, glass_mix());
+                window.paint_quad(fill(bounds, rgba(flat)).corner_radii(radius));
             }
 
             if !show_waveform {
@@ -652,11 +738,7 @@ fn capsule_base() -> gpui::Div {
         .justify_center()
         .rounded_full()
         .overflow_hidden()
-        .text_color(if dark_background() {
-            rgba(0xffffffff)
-        } else {
-            rgba(0x07131ff5)
-        })
+        .text_color(rgba(lerp_rgba(0x07131ff5, 0xffffffff, glass_mix())))
 }
 
 fn listening_capsule(delta: f32) -> impl IntoElement {
@@ -1014,15 +1096,16 @@ mod platform {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController};
     use super::platform_paste::PasteTarget;
     use super::{
-        LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, NativeVoiceEventOutcome, OVERLAY_HEIGHT,
-        OVERLAY_WIDTH, OverlayPhase, apply_native_voice_event, clear_voice_activity,
-        dark_background, decide_dark_background, next_overlay_generation, overlay_generation,
-        overlay_phase, set_dark_background, set_overlay_phase,
+        GLASS_MIX_STEPS, LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH,
+        NativeVoiceEventOutcome, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPhase,
+        apply_native_voice_event, clear_voice_activity, dark_background, decide_dark_background,
+        glass_mix_level, next_overlay_generation, overlay_generation, overlay_phase,
+        set_dark_background, set_glass_mix_level, set_overlay_phase, step_glass_mix_level,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1062,6 +1145,10 @@ mod platform {
     /// The capsule is hidden for almost the whole life of the process, so the sampler
     /// idles at a much longer period rather than waking seven times a second forever.
     const BACKGROUND_IDLE_INTERVAL: Duration = Duration::from_millis(1_000);
+    /// One step of the walk between palettes. Times `GLASS_MIX_STEPS` this sets how long
+    /// a change takes: long enough to read as movement, short enough to keep up with a
+    /// window being dragged across.
+    const GLASS_TRANSITION_STEP: Duration = Duration::from_millis(22);
     static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
@@ -1220,7 +1307,12 @@ mod platform {
     fn begin_input(hwnd: HWND) {
         let generation = next_overlay_generation();
         clear_voice_activity();
-        set_dark_background(sample_dark_background(hwnd, None));
+        let dark = sample_dark_background(hwnd, None);
+        set_dark_background(dark);
+        // A capsule that has just appeared should already be wearing the right palette.
+        // Walking to it from wherever the previous session left off would show a wipe
+        // across the glass every time the overlay opens.
+        set_glass_mix_level(if dark { GLASS_MIX_STEPS } else { 0 });
         show_phase(hwnd, OverlayPhase::Activating);
         if let Err(error) = start_voice_client(generation, hwnd) {
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
@@ -1353,16 +1445,35 @@ mod platform {
     fn start_background_sampler_thread(hwnd_value: isize) {
         thread::spawn(move || {
             let hwnd = HWND(hwnd_value as *mut c_void);
+            // Far enough in the past that the first visible iteration samples at once.
+            let mut sampled_at = Instant::now() - BACKGROUND_SAMPLE_INTERVAL;
+
             loop {
-                let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
-                if visible {
-                    set_dark_background(sample_dark_background(hwnd, Some(dark_background())));
+                if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                    thread::sleep(BACKGROUND_IDLE_INTERVAL);
+                    continue;
                 }
-                thread::sleep(if visible {
-                    BACKGROUND_SAMPLE_INTERVAL
+
+                // Reading the screen is the expensive half, so it keeps its own slower
+                // cadence while the walk below runs at the finer transition step.
+                if sampled_at.elapsed() >= BACKGROUND_SAMPLE_INTERVAL {
+                    set_dark_background(sample_dark_background(hwnd, Some(dark_background())));
+                    sampled_at = Instant::now();
+                }
+
+                let target = if dark_background() {
+                    GLASS_MIX_STEPS
                 } else {
-                    BACKGROUND_IDLE_INTERVAL
-                });
+                    0
+                };
+                let level = glass_mix_level();
+                if level == target {
+                    thread::sleep(BACKGROUND_SAMPLE_INTERVAL);
+                    continue;
+                }
+
+                set_glass_mix_level(step_glass_mix_level(level, target));
+                thread::sleep(GLASS_TRANSITION_STEP);
             }
         });
     }
@@ -1465,11 +1576,11 @@ mod tests {
     use super::{
         BAR_COUNT, OverlayPhase, VoiceHotkeyAction, VoiceTranscript, decoded_voice_activity,
         is_partial_speech_line, is_strong_voice_activity_line, overlay_phase_from_bridge_line,
-        transcript_presentation, voice_activity_from_audio_line, voice_hotkey_action,
+        lerp_rgba, transcript_presentation, voice_activity_from_audio_line, voice_hotkey_action,
         waveform_bar_height,
     };
     #[cfg(target_os = "windows")]
-    use super::decide_dark_background;
+    use super::{GLASS_MIX_STEPS, decide_dark_background, step_glass_mix_level};
 
     /// A ring where only a couple of probes read dark, so the majority rule stays out of
     /// the way and the luminance thresholds are what actually decide.
@@ -1515,6 +1626,48 @@ mod tests {
         assert!(decide_dark_background(0, 0, 0, Some(true)));
         assert!(!decide_dark_background(0, 0, 0, Some(false)));
         assert!(!decide_dark_background(0, 0, 0, None));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_walk_moves_one_step_and_stops_on_arrival() {
+        assert_eq!(step_glass_mix_level(0, GLASS_MIX_STEPS), 1);
+        assert_eq!(step_glass_mix_level(GLASS_MIX_STEPS, 0), GLASS_MIX_STEPS - 1);
+        assert_eq!(step_glass_mix_level(5, 5), 5);
+        // The step before arrival lands exactly on the target rather than past it.
+        assert_eq!(step_glass_mix_level(GLASS_MIX_STEPS - 1, GLASS_MIX_STEPS), GLASS_MIX_STEPS);
+        assert_eq!(step_glass_mix_level(1, 0), 0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_walk_reaches_either_end_in_exactly_one_ladder() {
+        for (start, target) in [(0, GLASS_MIX_STEPS), (GLASS_MIX_STEPS, 0)] {
+            let mut level = start;
+            let mut steps = 0;
+            while level != target {
+                level = step_glass_mix_level(level, target);
+                steps += 1;
+                assert!(steps <= GLASS_MIX_STEPS, "the walk never arrived");
+            }
+            assert_eq!(steps, GLASS_MIX_STEPS);
+        }
+    }
+
+    #[test]
+    fn colour_interpolation_carries_alpha_and_holds_both_ends() {
+        assert_eq!(lerp_rgba(0x07131ff5, 0xffffffff, 0.0), 0x07131ff5);
+        assert_eq!(lerp_rgba(0x07131ff5, 0xffffffff, 1.0), 0xffffffff);
+        // Alpha is the low byte and has to travel with the colour, not stay put.
+        let middle = lerp_rgba(0x00000000, 0xffffffff, 0.5);
+        assert_eq!(middle & 0xff, 128);
+        assert_eq!((middle >> 24) & 0xff, 128);
+    }
+
+    #[test]
+    fn colour_interpolation_clamps_out_of_range_positions() {
+        assert_eq!(lerp_rgba(0x11223344, 0xaabbccdd, -1.0), 0x11223344);
+        assert_eq!(lerp_rgba(0x11223344, 0xaabbccdd, 2.0), 0xaabbccdd);
     }
 
     #[test]
