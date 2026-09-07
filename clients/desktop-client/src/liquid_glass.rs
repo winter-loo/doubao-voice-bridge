@@ -351,9 +351,15 @@ impl CapsuleGlass {
 ///
 /// Both sides must share a frame count and frame length; they come from the same
 /// `render_frames` shape, so a mismatch is a programming error rather than input.
+/// The mix is carried as a 0..=256 fixed-point weight so each byte costs one multiply,
+/// one add and a shift. The float form needed two conversions and a `round` per byte,
+/// which is 16ms for a single capsule in an unoptimised build -- a whole frame's budget
+/// spent on one step of a transition that has twelve of them.
+const BLEND_ONE: u32 = 256;
+
 pub fn blend_frames(start: &[Vec<u8>], end: &[Vec<u8>], mix: f32) -> Vec<Vec<u8>> {
     debug_assert_eq!(start.len(), end.len(), "frame sets differ in length");
-    let mix = mix.clamp(0.0, 1.0);
+    let mix = (mix.clamp(0.0, 1.0) * BLEND_ONE as f32).round() as u32;
 
     start
         .iter()
@@ -363,8 +369,14 @@ pub fn blend_frames(start: &[Vec<u8>], end: &[Vec<u8>], mix: f32) -> Vec<Vec<u8>
             from.iter()
                 .zip(to)
                 .map(|(&from, &to)| {
-                    let from = f32::from(from);
-                    (from + (f32::from(to) - from) * mix).round() as u8
+                    // The half added before the shift rounds to nearest rather than
+                    // always towards zero, which would otherwise drag every mixed
+                    // capsule slightly darker than the two ends it sits between.
+                    let blended = (u32::from(from) * (BLEND_ONE - mix)
+                        + u32::from(to) * mix
+                        + BLEND_ONE / 2)
+                        >> 8;
+                    blended as u8
                 })
                 .collect()
         })

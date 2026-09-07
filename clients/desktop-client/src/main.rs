@@ -619,49 +619,62 @@ fn glass_base_frames(width: u32, height: u32, dark: bool) -> Arc<Vec<Vec<u8>>> {
     frames
 }
 
-/// The generated glass texture for one step between the light and dark palettes, keyed
-/// by device-pixel size and step.
+/// The generated glass texture for one step between the light and dark palettes.
 ///
 /// The optics are fixed for a given capsule and step; only the sheen phase moves, and
 /// every phase is baked into one multi-frame image. Shading is cheap, but the atlas
 /// upload is not, so regenerating this per frame would push a new tile sixty times a
-/// second for a picture that never changes. The keys are bounded -- one capsule size per
-/// display scale, times `GLASS_MIX_STEPS + 1` steps -- so the cache never needs eviction.
+/// second for a picture that never changes.
+///
+/// The whole ladder is baked on first use rather than a step at a time. Baking lazily
+/// puts the cost of each step on the very frame that first shows it, and a transition
+/// steps every 22ms: the renderer falls behind the walk and skips most of the ladder,
+/// turning the change back into the jump it was meant to replace. One capsule size per
+/// display scale, times `GLASS_MIX_STEPS + 1` steps, keeps this bounded at a few
+/// megabytes, so the cache never needs eviction.
 fn glass_texture(width: u32, height: u32, level: u32) -> Arc<RenderImage> {
-    type Key = (u32, u32, u32);
-    static CACHE: OnceLock<Mutex<Vec<(Key, Arc<RenderImage>)>>> = OnceLock::new();
+    type Key = (u32, u32);
+    static CACHE: OnceLock<Mutex<Vec<(Key, Vec<Arc<RenderImage>>)>>> = OnceLock::new();
 
-    let level = level.min(GLASS_MIX_STEPS);
-    let key = (width, height, level);
+    let level = level.min(GLASS_MIX_STEPS) as usize;
+    let key = (width, height);
     let mut cache = CACHE
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((_, texture)) = cache.iter().find(|(cached, _)| *cached == key) {
-        return texture.clone();
+    if let Some((_, ladder)) = cache.iter().find(|(cached, _)| *cached == key) {
+        return ladder[level].clone();
     }
 
-    let pixels = match level {
-        0 => (*glass_base_frames(width, height, false)).clone(),
-        level if level == GLASS_MIX_STEPS => (*glass_base_frames(width, height, true)).clone(),
-        level => liquid_glass::blend_frames(
-            &glass_base_frames(width, height, false),
-            &glass_base_frames(width, height, true),
-            level as f32 / GLASS_MIX_STEPS as f32,
-        ),
+    let light = glass_base_frames(width, height, false);
+    let dark = glass_base_frames(width, height, true);
+    let bake = |pixels: Vec<Vec<u8>>| {
+        let frames = pixels
+            .into_iter()
+            .map(|pixels| {
+                Frame::new(
+                    RgbaImage::from_raw(width, height, pixels)
+                        .expect("a glass frame is exactly width * height * 4 bytes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        Arc::new(RenderImage::new(frames))
     };
 
-    let frames = pixels
-        .into_iter()
-        .map(|pixels| {
-            Frame::new(
-                RgbaImage::from_raw(width, height, pixels)
-                    .expect("a glass frame is exactly width * height * 4 bytes"),
-            )
+    let ladder = (0..=GLASS_MIX_STEPS)
+        .map(|step| match step {
+            0 => bake((*light).clone()),
+            step if step == GLASS_MIX_STEPS => bake((*dark).clone()),
+            step => bake(liquid_glass::blend_frames(
+                &light,
+                &dark,
+                step as f32 / GLASS_MIX_STEPS as f32,
+            )),
         })
         .collect::<Vec<_>>();
-    let texture = Arc::new(RenderImage::new(frames));
-    cache.push((key, texture.clone()));
+
+    let texture = ladder[level].clone();
+    cache.push((key, ladder));
     texture
 }
 
@@ -1141,7 +1154,9 @@ mod platform {
     /// is on screen instead of only before it appears.
     const BACKGROUND_PROBE_MARGIN: i32 = 6;
     /// Re-check often enough that dragging a window under the capsule feels immediate.
-    const BACKGROUND_SAMPLE_INTERVAL: Duration = Duration::from_millis(150);
+    /// This is latency the user sees before the glass even begins to move, so it is kept
+    /// well under the length of the transition it triggers.
+    const BACKGROUND_SAMPLE_INTERVAL: Duration = Duration::from_millis(80);
     /// The capsule is hidden for almost the whole life of the process, so the sampler
     /// idles at a much longer period rather than waking seven times a second forever.
     const BACKGROUND_IDLE_INTERVAL: Duration = Duration::from_millis(1_000);
