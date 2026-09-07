@@ -359,6 +359,115 @@ impl CapsuleGlass {
 ///
 /// Both sides must share a frame count and frame length; they come from the same
 /// `render_frames` shape, so a mismatch is a programming error rather than input.
+/// How far a fully saturated desktop is allowed to push a channel before the cast is
+/// clamped, so a scarlet wallpaper tints the glass rather than dyeing it.
+const MAX_CAST: f32 = 0.45;
+
+/// How much of the clamped cast is actually applied. The capsule should read as glass
+/// that picked up the colour of what is behind it, not as coloured glass.
+const CAST_STRENGTH: f32 = 0.35;
+
+/// A colour cast borrowed from the desktop, held as one multiplier per channel.
+///
+/// The cast carries hue only. It is normalised against the sampled colour's own
+/// luminance before use, so a navy wall and a powder-blue one push the glass the same
+/// way, and neither changes how light or dark it is. That separation is what keeps this
+/// from undoing the palette: the palette decides whether the capsule sits lighter or
+/// darker than its background, which is the whole reason it stays legible, and a tint
+/// that moved brightness could erase exactly that.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tint {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+}
+
+impl Tint {
+    pub const NEUTRAL: Self = Self {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+    };
+
+    /// `NEUTRAL.quantized()`, spelled out because rounding is not available in a const
+    /// context and the value is needed to initialise an atomic. A test pins the two
+    /// together.
+    pub const NEUTRAL_KEY: u32 = 0x888;
+
+    /// Derives the cast from an averaged desktop colour.
+    pub fn from_background(red: u8, green: u8, blue: u8) -> Self {
+        let (r, g, b) = (f32::from(red), f32::from(green), f32::from(blue));
+        let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if luminance <= 1.0 {
+            // Black carries no hue to borrow.
+            return Self::NEUTRAL;
+        }
+
+        let channel = |c: f32| {
+            let ratio = (c / luminance).clamp(1.0 - MAX_CAST, 1.0 + MAX_CAST);
+            1.0 + (ratio - 1.0) * CAST_STRENGTH
+        };
+        Self {
+            r: channel(r),
+            g: channel(g),
+            b: channel(b),
+        }
+    }
+
+    /// Packs the cast into a cache key.
+    ///
+    /// Deliberately coarse. Changing the cast rebakes the whole texture ladder, so every
+    /// shade of one wall has to land in the same bucket; a fine key would rebake on the
+    /// noise between two neighbouring pixels of the same wallpaper.
+    /// Steps are centred on 1.0 rather than spread across a range, so "no cast" survives
+    /// the round trip exactly. A grey desktop has to come back as untouched glass.
+    pub fn quantized(self) -> u32 {
+        let step =
+            |v: f32| (((v - 1.0) * 16.0).round() as i32 + 8).clamp(0, 15) as u32;
+        (step(self.r) << 8) | (step(self.g) << 4) | step(self.b)
+    }
+
+    /// The canonical cast for a bucket. Rendering goes through this rather than the raw
+    /// measurement, so the pixels in the cache always match the key they are filed under.
+    pub fn from_quantized(key: u32) -> Self {
+        let value = |shift: u32| 1.0 + (((key >> shift) & 0xf) as f32 - 8.0) / 16.0;
+        Self {
+            r: value(8),
+            g: value(4),
+            b: value(0),
+        }
+    }
+}
+
+/// Applies a colour cast to already-shaded frames.
+///
+/// Grading finished pixels rather than re-shading from a tinted palette is what makes
+/// this affordable: re-shading both ends costs around 120ms in an unoptimised build,
+/// while a per-channel multiply is in the same class as `blend_frames`. Alpha is left
+/// alone -- the cast changes what colour the glass is, never how much it hides.
+pub fn tint_frames(frames: &[Vec<u8>], tint: Tint) -> Vec<Vec<u8>> {
+    frames
+        .iter()
+        .map(|frame| {
+            frame
+                .chunks_exact(4)
+                .flat_map(|pixel| {
+                    let scale = |channel: u8, multiplier: f32| {
+                        (f32::from(channel) * multiplier).round().clamp(0.0, 255.0) as u8
+                    };
+                    // BGRA, matching `render_bgra`.
+                    [
+                        scale(pixel[0], tint.b),
+                        scale(pixel[1], tint.g),
+                        scale(pixel[2], tint.r),
+                        pixel[3],
+                    ]
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The mix is carried as a 0..=256 fixed-point weight so each byte costs one multiply,
 /// one add and a shift. The float form needed two conversions and a `round` per byte,
 /// which is 16ms for a single capsule in an unoptimised build -- a whole frame's budget
@@ -628,6 +737,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_cast_carries_hue_without_moving_brightness() {
+        // The palette's whole job is to sit lighter or darker than the desktop; a cast
+        // that moved brightness would undo that. The same wall under a dimmer lamp is
+        // the same colour scaled, so it has to produce the same cast.
+        let dim = Tint::from_background(24, 40, 96);
+        let lit = Tint::from_background(48, 80, 192);
+        let close = |a: f32, b: f32| (a - b).abs() < 1.0e-4;
+        assert!(
+            close(dim.r, lit.r) && close(dim.g, lit.g) && close(dim.b, lit.b),
+            "{dim:?} vs {lit:?}"
+        );
+        // Blue background, so blue is lifted and red held back.
+        assert!(dim.b > 1.0 && dim.r < 1.0, "{dim:?}");
+    }
+
+    #[test]
+    fn a_paler_colour_casts_more_weakly_than_a_saturated_one() {
+        // Saturation is what the cast follows, once brightness has been divided out.
+        let saturated = Tint::from_background(24, 40, 96);
+        let pale = Tint::from_background(160, 190, 240);
+        assert!(pale.b > 1.0, "a pale blue should still lean blue: {pale:?}");
+        assert!(
+            pale.b < saturated.b,
+            "pale {pale:?} should cast less than saturated {saturated:?}"
+        );
+    }
+
+    #[test]
+    fn the_spelled_out_neutral_key_matches_the_computed_one() {
+        assert_eq!(Tint::NEUTRAL.quantized(), Tint::NEUTRAL_KEY);
+        assert_eq!(Tint::from_quantized(Tint::NEUTRAL_KEY), Tint::NEUTRAL);
+    }
+
+    #[test]
+    fn a_grey_desktop_produces_no_cast() {
+        for level in [0u8, 64, 128, 200, 255] {
+            let tint = Tint::from_background(level, level, level);
+            let off = (tint.r - 1.0).abs() + (tint.g - 1.0).abs() + (tint.b - 1.0).abs();
+            assert!(off < 0.02, "grey {level} produced {tint:?}");
+        }
+    }
+
+    #[test]
+    fn a_saturated_desktop_is_clamped_rather_than_followed() {
+        let scarlet = Tint::from_background(255, 0, 0);
+        assert!(scarlet.r <= 1.0 + MAX_CAST * CAST_STRENGTH + 1.0e-4, "{scarlet:?}");
+        assert!(scarlet.g >= 1.0 - MAX_CAST * CAST_STRENGTH - 1.0e-4, "{scarlet:?}");
+    }
+
+    #[test]
+    fn quantising_a_cast_round_trips_through_its_bucket() {
+        for background in [(20, 30, 90), (200, 190, 160), (128, 128, 128), (10, 90, 40)] {
+            let tint = Tint::from_background(background.0, background.1, background.2);
+            let canonical = Tint::from_quantized(tint.quantized());
+            assert_eq!(canonical.quantized(), tint.quantized(), "{tint:?}");
+            let close = |a: f32, b: f32| (a - b).abs() < 0.05;
+            assert!(close(canonical.r, tint.r) && close(canonical.b, tint.b), "{tint:?} -> {canonical:?}");
+        }
+    }
+
+    #[test]
+    fn tinting_leaves_alpha_untouched() {
+        // The capsule must hide exactly as much of the desktop after a cast as before,
+        // or the transparency the palette was tuned against shifts under it.
+        let frames = CapsuleGlass::new(24, 12, false).render_frames();
+        let tinted = tint_frames(&frames, Tint::from_background(30, 60, 200));
+        for (before, after) in frames.iter().zip(&tinted) {
+            for offset in (3..before.len()).step_by(4) {
+                assert_eq!(before[offset], after[offset]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_neutral_cast_changes_nothing() {
+        let frames = CapsuleGlass::new(24, 12, true).render_frames();
+        assert_eq!(tint_frames(&frames, Tint::NEUTRAL), frames);
+    }
+
+    #[test]
+    fn a_blue_cast_moves_the_glass_towards_blue() {
+        let frames = CapsuleGlass::new(24, 12, false).render_frames();
+        let tinted = tint_frames(&frames, Tint::from_background(20, 40, 220));
+        let mean = |fs: &[Vec<u8>], offset: usize| {
+            let (sum, count) = fs.iter().fold((0u64, 0u64), |(s, c), f| {
+                (
+                    s + f.chunks_exact(4).map(|p| u64::from(p[offset])).sum::<u64>(),
+                    c + (f.len() / 4) as u64,
+                )
+            });
+            sum as f64 / count as f64
+        };
+        assert!(mean(&tinted, 0) > mean(&frames, 0), "blue channel should rise");
+        assert!(mean(&tinted, 2) < mean(&frames, 2), "red channel should fall");
     }
 
     #[test]

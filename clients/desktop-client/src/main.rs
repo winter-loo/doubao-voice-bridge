@@ -265,6 +265,12 @@ static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
 /// the capsule snaps between two very different looks the instant the background crosses
 /// a threshold, which reads as the glass blinking rather than responding.
 static GLASS_MIX_LEVEL: AtomicU32 = AtomicU32::new(0);
+/// The colour cast the glass is currently wearing, packed by `Tint::quantized`.
+///
+/// The probes that decide light or dark already read colour; this keeps the hue they
+/// were throwing away, so the capsule picks up the tone of whatever it is floating over
+/// instead of being one of two fixed greys.
+static GLASS_TINT: AtomicU32 = AtomicU32::new(liquid_glass::Tint::NEUTRAL_KEY);
 static VOICE_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 static VOICE_ACTIVITY_UPDATED_AT: AtomicU64 = AtomicU64::new(0);
 static SPEECH_ACTIVITY_UNTIL: AtomicU64 = AtomicU64::new(0);
@@ -328,6 +334,15 @@ fn glass_mix() -> f32 {
 #[cfg(target_os = "windows")]
 fn set_glass_mix_level(level: u32) {
     GLASS_MIX_LEVEL.store(level.min(GLASS_MIX_STEPS), Ordering::Release);
+}
+
+fn glass_tint() -> u32 {
+    GLASS_TINT.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "windows")]
+fn set_glass_tint(tint: u32) {
+    GLASS_TINT.store(tint, Ordering::Release);
 }
 
 /// One step of the walk from `level` towards `target`.
@@ -626,28 +641,51 @@ fn glass_base_frames(width: u32, height: u32, dark: bool) -> Arc<Vec<Vec<u8>>> {
 /// upload is not, so regenerating this per frame would push a new tile sixty times a
 /// second for a picture that never changes.
 ///
-/// The whole ladder is baked on first use rather than a step at a time. Baking lazily
-/// puts the cost of each step on the very frame that first shows it, and a transition
-/// steps every 22ms: the renderer falls behind the walk and skips most of the ladder,
-/// turning the change back into the jump it was meant to replace. One capsule size per
-/// display scale, times `GLASS_MIX_STEPS + 1` steps, keeps this bounded at a few
-/// megabytes, so the cache never needs eviction.
-fn glass_texture(width: u32, height: u32, level: u32) -> Arc<RenderImage> {
-    type Key = (u32, u32);
-    static CACHE: OnceLock<Mutex<Vec<(Key, Vec<Arc<RenderImage>>)>>> = OnceLock::new();
+/// The whole ladder is baked at once rather than a step at a time. Baking lazily puts
+/// the cost of each step on the very frame that first shows it, and a transition steps
+/// every 22ms: the renderer falls behind the walk and skips most of the ladder, turning
+/// the change back into the jump it was meant to replace.
+///
+/// Exactly one ladder is held. It is rebaked when the capsule's size or its colour cast
+/// changes -- a single dropped frame, against holding a ladder for every wall the capsule
+/// has floated over. The cast is quantised coarsely so that shades of one wall share a
+/// bucket and the rebake stays rare.
+fn glass_texture(
+    window: &mut Window,
+    width: u32,
+    height: u32,
+    tint: u32,
+    level: u32,
+) -> Arc<RenderImage> {
+    type Key = (u32, u32, u32);
+    static CACHE: OnceLock<Mutex<Option<(Key, Vec<Arc<RenderImage>>)>>> = OnceLock::new();
 
     let level = level.min(GLASS_MIX_STEPS) as usize;
-    let key = (width, height);
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(Vec::new()))
+    let key = (width, height, tint);
+    let mut slot = CACHE
+        .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((_, ladder)) = cache.iter().find(|(cached, _)| *cached == key) {
-        return ladder[level].clone();
+    if let Some((cached, ladder)) = slot.as_ref() {
+        if *cached == key {
+            return ladder[level].clone();
+        }
     }
 
-    let light = glass_base_frames(width, height, false);
-    let dark = glass_base_frames(width, height, true);
+    // Only one ladder is kept. Filing a ladder per colour cast would be tidier to read
+    // but would hold sprite-atlas tiles for every wall the capsule has ever floated
+    // over, and gpui frees those only when it is told to -- dropping the `Arc` alone
+    // leaves the tiles behind. So the outgoing ladder is handed back explicitly here,
+    // which is also why this needs the window.
+    if let Some((_, ladder)) = slot.take() {
+        for texture in ladder {
+            let _ = window.drop_image(texture);
+        }
+    }
+
+    let cast = liquid_glass::Tint::from_quantized(tint);
+    let light = liquid_glass::tint_frames(&glass_base_frames(width, height, false), cast);
+    let dark = liquid_glass::tint_frames(&glass_base_frames(width, height, true), cast);
     let bake = |pixels: Vec<Vec<u8>>| {
         let frames = pixels
             .into_iter()
@@ -663,8 +701,8 @@ fn glass_texture(width: u32, height: u32, level: u32) -> Arc<RenderImage> {
 
     let ladder = (0..=GLASS_MIX_STEPS)
         .map(|step| match step {
-            0 => bake((*light).clone()),
-            step if step == GLASS_MIX_STEPS => bake((*dark).clone()),
+            0 => bake(light.clone()),
+            step if step == GLASS_MIX_STEPS => bake(dark.clone()),
             step => bake(liquid_glass::blend_frames(
                 &light,
                 &dark,
@@ -674,7 +712,7 @@ fn glass_texture(width: u32, height: u32, level: u32) -> Arc<RenderImage> {
         .collect::<Vec<_>>();
 
     let texture = ladder[level].clone();
-    cache.push((key, ladder));
+    *slot = Some((key, ladder));
     texture
 }
 
@@ -689,15 +727,10 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
             let sheen = ((delta * liquid_glass::SHEEN_FRAMES as f32) as usize)
                 .min(liquid_glass::SHEEN_FRAMES - 1);
             let level = glass_mix_level();
+            let texture = glass_texture(window, width, height, glass_tint(), level);
 
             if window
-                .paint_image(
-                    bounds,
-                    Corners::all(radius),
-                    glass_texture(width, height, level),
-                    sheen,
-                    false,
-                )
+                .paint_image(bounds, Corners::all(radius), texture, sheen, false)
                 .is_err()
             {
                 // The sprite atlas refused the tile. Fall back to a flat capsule so the
@@ -1117,8 +1150,9 @@ mod platform {
         GLASS_MIX_STEPS, LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH,
         NativeVoiceEventOutcome, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPhase,
         apply_native_voice_event, clear_voice_activity, dark_background, decide_dark_background,
-        glass_mix_level, next_overlay_generation, overlay_generation, overlay_phase,
-        set_dark_background, set_glass_mix_level, set_overlay_phase, step_glass_mix_level,
+        glass_mix_level, glass_tint, liquid_glass, next_overlay_generation, overlay_generation,
+        overlay_phase, set_dark_background, set_glass_mix_level, set_glass_tint, set_overlay_phase,
+        step_glass_mix_level,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1324,8 +1358,10 @@ mod platform {
     fn begin_input(hwnd: HWND) {
         let generation = next_overlay_generation();
         clear_voice_activity();
-        let dark = sample_dark_background(hwnd, None);
+        let reading = sample_background(hwnd, None);
+        let dark = reading.dark;
         set_dark_background(dark);
+        set_glass_tint(reading.tint);
         // A capsule that has just appeared should already be wearing the right palette.
         // Walking to it from wherever the previous session left off would show a wipe
         // across the glass every time the overlay opens.
@@ -1381,6 +1417,13 @@ mod platform {
         VOICE_CLIENT.request_stop()
     }
 
+    /// What one look at the desktop behind the capsule yields.
+    #[derive(Clone, Copy)]
+    struct BackgroundReading {
+        dark: bool,
+        tint: u32,
+    }
+
     /// Reads the desktop in a ring around the capsule and decides which palette the
     /// glass should wear.
     ///
@@ -1391,8 +1434,15 @@ mod platform {
     ///
     /// `previous` is the palette currently on screen, or `None` for a first look, which
     /// is judged on a single threshold rather than the hysteresis band.
-    fn sample_dark_background(hwnd: HWND, previous: Option<bool>) -> bool {
-        let fallback = previous.unwrap_or(false);
+    ///
+    /// The same probes answer both questions the glass asks of the desktop: how light it
+    /// is, and what colour. Reading the screen is the expensive part, so the colour comes
+    /// along for free rather than costing a second blit.
+    fn sample_background(hwnd: HWND, previous: Option<bool>) -> BackgroundReading {
+        let fallback = BackgroundReading {
+            dark: previous.unwrap_or(false),
+            tint: glass_tint(),
+        };
         let Some(capsule) = capsule_screen_rect(hwnd) else {
             return fallback;
         };
@@ -1459,6 +1509,7 @@ mod platform {
             let mut luminance_sum = 0u32;
             let mut dark_samples = 0u32;
             let mut valid_samples = 0u32;
+            let (mut red_sum, mut green_sum, mut blue_sum) = (0u32, 0u32, 0u32);
 
             if copied {
                 for (x, y) in probes {
@@ -1474,6 +1525,9 @@ mod platform {
                     luminance_sum += luminance;
                     dark_samples += u32::from(luminance < 148);
                     valid_samples += 1;
+                    red_sum += red;
+                    green_sum += green;
+                    blue_sum += blue;
                 }
             }
 
@@ -1486,12 +1540,21 @@ mod platform {
                 return fallback;
             }
 
-            decide_dark_background(
-                luminance_sum / valid_samples,
-                dark_samples,
-                valid_samples,
-                previous,
-            )
+            let channel = |sum: u32| (sum / valid_samples).min(255) as u8;
+            BackgroundReading {
+                dark: decide_dark_background(
+                    luminance_sum / valid_samples,
+                    dark_samples,
+                    valid_samples,
+                    previous,
+                ),
+                tint: liquid_glass::Tint::from_background(
+                    channel(red_sum),
+                    channel(green_sum),
+                    channel(blue_sum),
+                )
+                .quantized(),
+            }
         }
     }
 
@@ -1504,7 +1567,9 @@ mod platform {
             let hwnd = HWND(hwnd_value as *mut c_void);
             loop {
                 if unsafe { IsWindowVisible(hwnd) }.as_bool() {
-                    set_dark_background(sample_dark_background(hwnd, Some(dark_background())));
+                    let reading = sample_background(hwnd, Some(dark_background()));
+                    set_dark_background(reading.dark);
+                    set_glass_tint(reading.tint);
                     thread::sleep(BACKGROUND_SAMPLE_INTERVAL);
                 } else {
                     thread::sleep(BACKGROUND_IDLE_INTERVAL);
