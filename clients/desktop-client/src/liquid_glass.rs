@@ -361,10 +361,17 @@ impl CapsuleGlass {
 /// `render_frames` shape, so a mismatch is a programming error rather than input.
 /// How far a fully saturated desktop is allowed to push a channel before the cast is
 /// clamped, so a scarlet wallpaper tints the glass rather than dyeing it.
+///
+/// Reading a colour off the desktop is Windows-only for now -- Wayland hands out no
+/// screen pixels -- so everything on the measuring side of `Tint` is genuinely dead
+/// elsewhere. The allow is scoped to those targets rather than blanket, so it starts
+/// warning again the day Windows stops calling it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const MAX_CAST: f32 = 0.45;
 
 /// How much of the clamped cast is actually applied. The capsule should read as glass
 /// that picked up the colour of what is behind it, not as coloured glass.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const CAST_STRENGTH: f32 = 0.35;
 
 /// A colour cast borrowed from the desktop, held as one multiplier per channel.
@@ -382,6 +389,7 @@ pub struct Tint {
     pub b: f32,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl Tint {
     pub const NEUTRAL: Self = Self {
         r: 1.0,
