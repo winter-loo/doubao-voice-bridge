@@ -256,6 +256,13 @@ fn voice_hotkey_action(phase: OverlayPhase) -> VoiceHotkeyAction {
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Whether the probes have settled on the dark palette.
+///
+/// Windows-only, and structurally so: reading the desktop's brightness needs screen
+/// pixels, which Wayland does not hand out. Elsewhere the capsule has nothing to decide
+/// from, `GLASS_MIX_LEVEL` stays at its light end, and this whole mechanism is absent
+/// rather than merely idle.
+#[cfg(target_os = "windows")]
 static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
 /// How far the capsule has travelled from the light palette (0) towards the dark one
 /// (`GLASS_MIX_STEPS`).
@@ -312,6 +319,7 @@ fn overlay_generation() -> u64 {
     OVERLAY_GENERATION.load(Ordering::Acquire)
 }
 
+#[cfg(target_os = "windows")]
 fn dark_background() -> bool {
     DARK_BACKGROUND.load(Ordering::Acquire)
 }
