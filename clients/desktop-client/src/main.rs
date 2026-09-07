@@ -307,6 +307,48 @@ fn set_dark_background(dark: bool) {
     DARK_BACKGROUND.store(dark, Ordering::Release);
 }
 
+/// Luminance below which a first look calls the background dark.
+#[cfg(target_os = "windows")]
+const FRESH_DARK_LUMINANCE: u32 = 150;
+/// Thresholds for a background that is already being tracked. The gap between them is
+/// hysteresis: once the palette has switched it takes a clearly different background to
+/// switch it back, so a window edge parked under the capsule cannot make the glass
+/// oscillate between palettes.
+#[cfg(target_os = "windows")]
+const ENTER_DARK_LUMINANCE: u32 = 132;
+#[cfg(target_os = "windows")]
+const LEAVE_DARK_LUMINANCE: u32 = 168;
+
+/// Turns a ring of luminance probes into a palette choice.
+///
+/// Kept separate from the Win32 pixel reads so the thresholds can be exercised without
+/// a screen. `previous` is the palette currently on display, or `None` for a first look:
+/// a first look uses one threshold, a follow-up uses the hysteresis band.
+#[cfg(target_os = "windows")]
+fn decide_dark_background(
+    average_luminance: u32,
+    dark_samples: u32,
+    valid_samples: u32,
+    previous: Option<bool>,
+) -> bool {
+    if valid_samples == 0 {
+        return previous.unwrap_or(false);
+    }
+
+    // A mostly dark ring wins outright, so a bright strip crossing one side cannot wash
+    // out an otherwise dark background.
+    if dark_samples * 2 >= valid_samples {
+        return true;
+    }
+
+    let threshold = match previous {
+        None => FRESH_DARK_LUMINANCE,
+        Some(true) => LEAVE_DARK_LUMINANCE,
+        Some(false) => ENTER_DARK_LUMINANCE,
+    };
+    average_luminance < threshold
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -979,8 +1021,8 @@ mod platform {
     use super::{
         LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, NativeVoiceEventOutcome, OVERLAY_HEIGHT,
         OVERLAY_WIDTH, OverlayPhase, apply_native_voice_event, clear_voice_activity,
-        next_overlay_generation, overlay_generation, overlay_phase, set_dark_background,
-        set_overlay_phase,
+        dark_background, decide_dark_background, next_overlay_generation, overlay_generation,
+        overlay_phase, set_dark_background, set_overlay_phase,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1010,6 +1052,16 @@ mod platform {
 
     const HOTKEY_ID: i32 = 0xDB01;
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
+    /// How far outside the capsule the background probes sit. The overlay window is
+    /// clipped to the capsule by `clip_overlay_to_capsule`, so pixels this far out are
+    /// desktop rather than glass -- which is what lets the probes run while the capsule
+    /// is on screen instead of only before it appears.
+    const BACKGROUND_PROBE_MARGIN: i32 = 6;
+    /// Re-check often enough that dragging a window under the capsule feels immediate.
+    const BACKGROUND_SAMPLE_INTERVAL: Duration = Duration::from_millis(150);
+    /// The capsule is hidden for almost the whole life of the process, so the sampler
+    /// idles at a much longer period rather than waking seven times a second forever.
+    const BACKGROUND_IDLE_INTERVAL: Duration = Duration::from_millis(1_000);
     static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
@@ -1063,6 +1115,7 @@ mod platform {
         clip_overlay_to_capsule(hwnd);
         hide_overlay(hwnd);
         start_hotkey_thread(hwnd.0 as isize);
+        start_background_sampler_thread(hwnd.0 as isize);
         super::windows_shell::start(hwnd);
     }
 
@@ -1167,7 +1220,7 @@ mod platform {
     fn begin_input(hwnd: HWND) {
         let generation = next_overlay_generation();
         clear_voice_activity();
-        set_dark_background(sample_dark_background(hwnd));
+        set_dark_background(sample_dark_background(hwnd, None));
         show_phase(hwnd, OverlayPhase::Activating);
         if let Err(error) = start_voice_client(generation, hwnd) {
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
@@ -1219,50 +1272,99 @@ mod platform {
         VOICE_CLIENT.request_stop()
     }
 
-    fn sample_dark_background(hwnd: HWND) -> bool {
+    /// Reads the desktop in a ring around the capsule and decides which palette the
+    /// glass should wear.
+    ///
+    /// The probes sit outside the capsule on purpose. Sampling inside it only works
+    /// before the overlay is shown -- afterwards the probes would land on the glass and
+    /// the reading would feed back on itself. A ring keeps the answer meaningful at any
+    /// time, which is what allows the palette to follow a window dragged underneath.
+    ///
+    /// `previous` is the palette currently on screen, or `None` for a first look, which
+    /// is judged on a single threshold rather than the hysteresis band.
+    fn sample_dark_background(hwnd: HWND, previous: Option<bool>) -> bool {
+        let fallback = previous.unwrap_or(false);
         let Some(capsule) = capsule_screen_rect(hwnd) else {
-            return false;
+            return fallback;
         };
+
+        let width = capsule.right - capsule.left;
+        let height = capsule.bottom - capsule.top;
+        let margin = height.max(3) / 3 + BACKGROUND_PROBE_MARGIN;
+
+        // Five probes along the top and bottom edges, two down each side. Points that
+        // fall off the desktop come back as CLR_INVALID and are skipped below, so a
+        // capsule near a screen edge simply votes with fewer probes.
+        let mut probes = Vec::with_capacity(14);
+        for step in 1..=5 {
+            let x = capsule.left + width * step / 6;
+            probes.push((x, capsule.top - margin));
+            probes.push((x, capsule.bottom + margin));
+        }
+        for step in 1..=2 {
+            let y = capsule.top + height * step / 3;
+            probes.push((capsule.left - margin, y));
+            probes.push((capsule.right + margin, y));
+        }
 
         unsafe {
             let screen = GetDC(None);
             if screen.is_invalid() {
-                return false;
+                return fallback;
             }
 
-            let width = capsule.right - capsule.left;
-            let height = capsule.bottom - capsule.top;
             let mut luminance_sum = 0u32;
             let mut dark_samples = 0u32;
             let mut valid_samples = 0u32;
 
-            for x_step in 1..=7 {
-                for y_step in 1..=3 {
-                    let x = capsule.left + width * x_step / 8;
-                    let y = capsule.top + height * y_step / 4;
-                    let color = GetPixel(screen, x, y).0;
-                    if color == u32::MAX {
-                        continue;
-                    }
-
-                    let red = color & 0xff;
-                    let green = (color >> 8) & 0xff;
-                    let blue = (color >> 16) & 0xff;
-                    let luminance = (red * 54 + green * 183 + blue * 19) / 256;
-                    luminance_sum += luminance;
-                    dark_samples += u32::from(luminance < 148);
-                    valid_samples += 1;
+            for (x, y) in probes {
+                let color = GetPixel(screen, x, y).0;
+                if color == u32::MAX {
+                    continue;
                 }
+
+                let red = color & 0xff;
+                let green = (color >> 8) & 0xff;
+                let blue = (color >> 16) & 0xff;
+                let luminance = (red * 54 + green * 183 + blue * 19) / 256;
+                luminance_sum += luminance;
+                dark_samples += u32::from(luminance < 148);
+                valid_samples += 1;
             }
 
             let _ = ReleaseDC(None, screen);
             if valid_samples == 0 {
-                return false;
+                return fallback;
             }
 
-            let average_luminance = luminance_sum / valid_samples;
-            average_luminance < 150 || dark_samples * 2 >= valid_samples
+            decide_dark_background(
+                luminance_sum / valid_samples,
+                dark_samples,
+                valid_samples,
+                previous,
+            )
         }
+    }
+
+    /// Keeps the palette in step with whatever ends up behind the capsule while it is
+    /// on screen. The one-shot sample in `begin_input` only sees the desktop at the
+    /// instant the overlay opens; without this the glass keeps that opening palette even
+    /// after a window is dragged underneath it.
+    fn start_background_sampler_thread(hwnd_value: isize) {
+        thread::spawn(move || {
+            let hwnd = HWND(hwnd_value as *mut c_void);
+            loop {
+                let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+                if visible {
+                    set_dark_background(sample_dark_background(hwnd, Some(dark_background())));
+                }
+                thread::sleep(if visible {
+                    BACKGROUND_SAMPLE_INTERVAL
+                } else {
+                    BACKGROUND_IDLE_INTERVAL
+                });
+            }
+        });
     }
 
     fn capsule_screen_rect(hwnd: HWND) -> Option<RECT> {
@@ -1366,6 +1468,54 @@ mod tests {
         transcript_presentation, voice_activity_from_audio_line, voice_hotkey_action,
         waveform_bar_height,
     };
+    #[cfg(target_os = "windows")]
+    use super::decide_dark_background;
+
+    /// A ring where only a couple of probes read dark, so the majority rule stays out of
+    /// the way and the luminance thresholds are what actually decide.
+    #[cfg(target_os = "windows")]
+    const MIXED_RING: (u32, u32) = (2, 14);
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_first_look_uses_one_threshold() {
+        let (dark, valid) = MIXED_RING;
+        assert!(decide_dark_background(140, dark, valid, None));
+        assert!(!decide_dark_background(160, dark, valid, None));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hysteresis_holds_the_palette_through_a_borderline_background() {
+        let (dark, valid) = MIXED_RING;
+        // 140 would read as dark on a first look, but is not dark enough to pull an
+        // already-light capsule across.
+        assert!(!decide_dark_background(140, dark, valid, Some(false)));
+        // 160 would read as light on a first look, yet leaves a dark capsule dark.
+        assert!(decide_dark_background(160, dark, valid, Some(true)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_clearly_changed_background_still_switches_the_palette() {
+        let (dark, valid) = MIXED_RING;
+        assert!(decide_dark_background(120, dark, valid, Some(false)));
+        assert!(!decide_dark_background(175, dark, valid, Some(true)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_mostly_dark_ring_wins_over_a_bright_average() {
+        assert!(decide_dark_background(200, 7, 14, Some(false)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn losing_every_probe_keeps_the_current_palette() {
+        assert!(decide_dark_background(0, 0, 0, Some(true)));
+        assert!(!decide_dark_background(0, 0, 0, Some(false)));
+        assert!(!decide_dark_background(0, 0, 0, None));
+    }
 
     #[test]
     fn transcript_tracks_partial_committed_and_final_text() {
