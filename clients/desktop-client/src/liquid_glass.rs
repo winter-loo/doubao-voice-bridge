@@ -156,14 +156,14 @@ const DARK_PALETTE: Palette = Palette {
 /// what you see is the edge bending light *away*, so the rim is darker than the surface,
 /// not lighter, and the body carries a faint cool cast rather than a white wash.
 const LIGHT_PALETTE: Palette = Palette {
-    tint_top: Rgba::hex(0xdae6f27e),
-    tint_bottom: Rgba::hex(0x9db4cb96),
-    inner_wall: Rgba::hex(0x2c455c5e),
+    tint_top: Rgba::hex(0xeaf2fa46),
+    tint_bottom: Rgba::hex(0xbfd0e246),
+    inner_wall: Rgba::hex(0x3a587238),
     dispersion_cool: Rgba::hex(0x3dbcff70),
     dispersion_warm: Rgba::hex(0xff86cf58),
     key_light: Rgba::hex(0xffffffe6),
     bounce_light: Rgba::hex(0xeaf4ff8c),
-    edge_line: Rgba::hex(0x51698adc),
+    edge_line: Rgba::hex(0x4a648482),
     sheen: Rgba::hex(0xffffff40),
 };
 
@@ -611,8 +611,41 @@ mod tests {
         let rim = over_white(glass.shade(WIDTH as f32 / 2.0, 1.2, 0.5));
         let body = over_white(glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.5));
         assert!(rim < 0.80, "rim over white is {rim}, too close to the page");
-        assert!(body < 0.93, "body over white is {body}, too close to the page");
         assert!(rim < body, "the rim has to read darker than the body it encloses");
+        // The body is deliberately *not* asserted to be dark. Separation is the rim's
+        // job; darkening the body to help is what turns glass into a painted pill, and
+        // `the_capsule_stays_see_through` guards the other side of that line.
+    }
+
+    #[test]
+    fn the_capsule_stays_see_through() {
+        // The guard that was missing the first time the light palette was made visible.
+        // It is entirely possible to score well on rim separation and still have turned
+        // the glass into a solid lozenge, because nothing here was measuring the one
+        // thing the eye actually reads as glass: the page surviving through the body.
+        //
+        // Straight alpha means a pattern behind the capsule keeps exactly `1 - alpha` of
+        // its contrast, so the body's alpha is that number directly.
+        let survives = |dark: bool| {
+            let glass = CapsuleGlass::new(WIDTH, HEIGHT, dark);
+            1.0 - glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.5).a
+        };
+
+        let light = survives(false);
+        let dark = survives(true);
+        assert!(
+            light > 0.6,
+            "only {:.0}% of the page survives the light capsule",
+            light * 100.0
+        );
+        assert!(
+            dark > 0.45,
+            "only {:.0}% of the desktop survives the dark capsule",
+            dark * 100.0
+        );
+        // A page is busier than a desktop and shows through a thinner glass, so the
+        // light capsule is the more transparent of the two by design.
+        assert!(light > dark, "light {light} should out-transmit dark {dark}");
     }
 
     #[test]
