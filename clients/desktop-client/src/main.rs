@@ -1109,7 +1109,7 @@ mod platform {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController};
     use super::platform_paste::PasteTarget;
@@ -1130,8 +1130,9 @@ mod platform {
         DwmSetWindowAttribute,
     };
     use windows::Win32::Graphics::Gdi::{
-        CreateRoundRectRgn, GetDC, GetMonitorInfoW, GetPixel, MONITOR_DEFAULTTOPRIMARY,
-        MONITORINFO, MonitorFromWindow, ReleaseDC, SetWindowRgn,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, DeleteDC,
+        DeleteObject, GetDC, GetMonitorInfoW, GetPixel, MONITOR_DEFAULTTOPRIMARY,
+        MONITORINFO, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject, SetWindowRgn,
     };
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -1218,6 +1219,7 @@ mod platform {
         hide_overlay(hwnd);
         start_hotkey_thread(hwnd.0 as isize);
         start_background_sampler_thread(hwnd.0 as isize);
+        start_glass_transition_thread(hwnd.0 as isize);
         super::windows_shell::start(hwnd);
     }
 
@@ -1398,20 +1400,24 @@ mod platform {
         let width = capsule.right - capsule.left;
         let height = capsule.bottom - capsule.top;
         let margin = height.max(3) / 3 + BACKGROUND_PROBE_MARGIN;
+        let block_width = width + margin * 2;
+        let block_height = height + margin * 2;
+        if block_width <= 0 || block_height <= 0 {
+            return fallback;
+        }
 
-        // Five probes along the top and bottom edges, two down each side. Points that
-        // fall off the desktop come back as CLR_INVALID and are skipped below, so a
-        // capsule near a screen edge simply votes with fewer probes.
+        // Five probes along the top and bottom edges, two down each side, as offsets
+        // inside the copied block.
         let mut probes = Vec::with_capacity(14);
         for step in 1..=5 {
-            let x = capsule.left + width * step / 6;
-            probes.push((x, capsule.top - margin));
-            probes.push((x, capsule.bottom + margin));
+            let x = margin + width * step / 6;
+            probes.push((x, 0));
+            probes.push((x, block_height - 1));
         }
         for step in 1..=2 {
-            let y = capsule.top + height * step / 3;
-            probes.push((capsule.left - margin, y));
-            probes.push((capsule.right + margin, y));
+            let y = margin + height * step / 3;
+            probes.push((0, y));
+            probes.push((block_width - 1, y));
         }
 
         unsafe {
@@ -1420,26 +1426,62 @@ mod platform {
                 return fallback;
             }
 
+            // The ring is copied into memory in one blit and read from there. Reading the
+            // fourteen points off the screen DC directly costs 234ms on this hardware,
+            // because every GetPixel against a composited desktop forces its own readback
+            // from the GPU; one blit plus fourteen reads from ordinary memory is 17ms.
+            let memory = CreateCompatibleDC(Some(screen));
+            if memory.is_invalid() {
+                let _ = ReleaseDC(None, screen);
+                return fallback;
+            }
+            let bitmap = CreateCompatibleBitmap(screen, block_width, block_height);
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(memory);
+                let _ = ReleaseDC(None, screen);
+                return fallback;
+            }
+            let replaced = SelectObject(memory, bitmap.into());
+
+            let copied = BitBlt(
+                memory,
+                0,
+                0,
+                block_width,
+                block_height,
+                Some(screen),
+                capsule.left - margin,
+                capsule.top - margin,
+                SRCCOPY,
+            )
+            .is_ok();
+
             let mut luminance_sum = 0u32;
             let mut dark_samples = 0u32;
             let mut valid_samples = 0u32;
 
-            for (x, y) in probes {
-                let color = GetPixel(screen, x, y).0;
-                if color == u32::MAX {
-                    continue;
-                }
+            if copied {
+                for (x, y) in probes {
+                    let color = GetPixel(memory, x, y).0;
+                    if color == u32::MAX {
+                        continue;
+                    }
 
-                let red = color & 0xff;
-                let green = (color >> 8) & 0xff;
-                let blue = (color >> 16) & 0xff;
-                let luminance = (red * 54 + green * 183 + blue * 19) / 256;
-                luminance_sum += luminance;
-                dark_samples += u32::from(luminance < 148);
-                valid_samples += 1;
+                    let red = color & 0xff;
+                    let green = (color >> 8) & 0xff;
+                    let blue = (color >> 16) & 0xff;
+                    let luminance = (red * 54 + green * 183 + blue * 19) / 256;
+                    luminance_sum += luminance;
+                    dark_samples += u32::from(luminance < 148);
+                    valid_samples += 1;
+                }
             }
 
+            SelectObject(memory, replaced);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory);
             let _ = ReleaseDC(None, screen);
+
             if valid_samples == 0 {
                 return fallback;
             }
@@ -1460,20 +1502,31 @@ mod platform {
     fn start_background_sampler_thread(hwnd_value: isize) {
         thread::spawn(move || {
             let hwnd = HWND(hwnd_value as *mut c_void);
-            // Far enough in the past that the first visible iteration samples at once.
-            let mut sampled_at = Instant::now() - BACKGROUND_SAMPLE_INTERVAL;
+            loop {
+                if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                    set_dark_background(sample_dark_background(hwnd, Some(dark_background())));
+                    thread::sleep(BACKGROUND_SAMPLE_INTERVAL);
+                } else {
+                    thread::sleep(BACKGROUND_IDLE_INTERVAL);
+                }
+            }
+        });
+    }
 
+    /// Advances the displayed palette towards whatever the probes have settled on.
+    ///
+    /// This is deliberately a thread of its own. Reading the desktop is the one slow
+    /// step here, and a walk sharing a thread with it inherits every stall: the palette
+    /// lurches forward in bursts between reads, which is the jump it exists to remove
+    /// wearing a different shape. Separated, the walk keeps its cadence no matter what
+    /// sampling costs.
+    fn start_glass_transition_thread(hwnd_value: isize) {
+        thread::spawn(move || {
+            let hwnd = HWND(hwnd_value as *mut c_void);
             loop {
                 if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
                     thread::sleep(BACKGROUND_IDLE_INTERVAL);
                     continue;
-                }
-
-                // Reading the screen is the expensive half, so it keeps its own slower
-                // cadence while the walk below runs at the finer transition step.
-                if sampled_at.elapsed() >= BACKGROUND_SAMPLE_INTERVAL {
-                    set_dark_background(sample_dark_background(hwnd, Some(dark_background())));
-                    sampled_at = Instant::now();
                 }
 
                 let target = if dark_background() {
@@ -1482,12 +1535,9 @@ mod platform {
                     0
                 };
                 let level = glass_mix_level();
-                if level == target {
-                    thread::sleep(BACKGROUND_SAMPLE_INTERVAL);
-                    continue;
+                if level != target {
+                    set_glass_mix_level(step_glass_mix_level(level, target));
                 }
-
-                set_glass_mix_level(step_glass_mix_level(level, target));
                 thread::sleep(GLASS_TRANSITION_STEP);
             }
         });
