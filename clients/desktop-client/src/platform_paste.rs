@@ -291,7 +291,7 @@ mod implementation {
 
 #[cfg(target_os = "linux")]
 mod implementation {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     /// Linux delivers text through fcitx5, which already owns the input focus
     /// of every application on the desktop, so there is no per-window target to
@@ -320,42 +320,58 @@ mod implementation {
     #[derive(Debug)]
     pub struct RealtimeTextOutput {
         bridge: Result<VoiceBridgeProxyBlocking<'static>, String>,
-        /// Whether a preedit is outstanding, so an abandoned session withdraws
-        /// it instead of stranding provisional text in the application.
-        preedit_shown: AtomicBool,
+        /// The preedit the focused application is currently showing. Repeated
+        /// snapshots are not resent, and an abandoned session withdraws
+        /// whatever it left behind instead of stranding provisional text.
+        preedit: Mutex<String>,
     }
 
     impl RealtimeTextOutput {
         pub fn new(_target: PasteTarget) -> Self {
             Self {
                 bridge: connect(),
-                preedit_shown: AtomicBool::new(false),
+                preedit: Mutex::new(String::new()),
             }
         }
 
         /// Each bridge event carries the whole recognition so far, so the
         /// preedit is replaced wholesale. Unlike the Windows keystroke path,
         /// revising the text needs no erasure of what was written before.
+        ///
+        /// Everything stays provisional until the session ends, because Doubao
+        /// revises text it has already shown: measured over four sessions, a
+        /// partial snapshot rewrote up to 24 characters behind its own end, and
+        /// the settled snapshot that arrives on stop rewrote 80 of 84 and 57 of
+        /// 98 characters. Committing a prefix early to shorten the final
+        /// replacement would leave that rewritten text behind, and committed
+        /// text can only be taken back by erasing it.
         pub fn update(&self, text: &str) -> Result<(), String> {
+            let mut preedit = self.preedit()?;
+            if *preedit == text {
+                return Ok(());
+            }
             let shown = self
                 .bridge
                 .as_ref()
                 .map_err(String::clone)?
                 .update_preedit(text)
                 .map_err(describe_bridge_error)?;
-            self.preedit_shown
-                .store(shown && !text.is_empty(), Ordering::Release);
+            preedit.clear();
+            if shown {
+                preedit.push_str(text);
+            }
             Ok(())
         }
 
         pub fn finish(&self, text: &str) -> Result<(), String> {
+            let mut preedit = self.preedit()?;
             let delivered = self
                 .bridge
                 .as_ref()
                 .map_err(String::clone)?
                 .commit_string(text)
                 .map_err(describe_bridge_error)?;
-            self.preedit_shown.store(false, Ordering::Release);
+            preedit.clear();
             if !delivered {
                 return Err(
                     "no application held the input focus, so the recognized text was not delivered"
@@ -364,11 +380,18 @@ mod implementation {
             }
             Ok(())
         }
+
+        fn preedit(&self) -> Result<std::sync::MutexGuard<'_, String>, String> {
+            self.preedit
+                .lock()
+                .map_err(|_| "the preedit state lock is poisoned".to_string())
+        }
     }
 
     impl Drop for RealtimeTextOutput {
         fn drop(&mut self) {
-            if !self.preedit_shown.load(Ordering::Acquire) {
+            let outstanding = self.preedit.get_mut().is_ok_and(|text| !text.is_empty());
+            if !outstanding {
                 return;
             }
             if let Ok(bridge) = &self.bridge {
