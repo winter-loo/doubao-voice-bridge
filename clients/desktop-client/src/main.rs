@@ -2439,9 +2439,16 @@ mod platform {
         }
     }
 
+    // `XDG_SESSION_TYPE` describes the login session, not the display server
+    // this process talks to: a client started from a tty shell, a terminal
+    // multiplexer, or a systemd user unit inherits `tty` on a Wayland desktop
+    // and would silently take the X11 hotkey path, where XGrabKey never sees a
+    // native Wayland application. Decide from the compositor socket instead,
+    // remembering that `prefer_xwayland_overlay` removes `WAYLAND_DISPLAY`
+    // itself and records that it did so.
     fn is_wayland_session() -> bool {
-        std::env::var("XDG_SESSION_TYPE")
-            .is_ok_and(|session_type| session_type.eq_ignore_ascii_case("wayland"))
+        std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("DOUBAO_XWAYLAND_OVERLAY").is_some()
     }
 
     pub fn finish_input(window: &mut Window) {
