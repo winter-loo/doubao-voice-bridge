@@ -1,61 +1,33 @@
-//! Procedural liquid-glass shading for the voice overlay capsule.
+//! Procedural glass-like shading for the voice overlay capsule.
 //!
-//! This is a port of the pure CSS + SVG technique. There, a `<canvas>` computes a
-//! displacement map from a rounded-rect signed distance field at runtime, and
-//! `backdrop-filter` feeds the blurred backdrop through an inline `feDisplacementMap`
-//! that reads it. GPUI exposes no backdrop texture, so the second half of that
-//! pipeline is unavailable — but the first half, the part that actually produces the
-//! optics, is just math over the same distance field.
+//! The distance field, bevel and displaced sampling follow the geometry of a lens,
+//! but `sample_interior` reads our own gradient, NOT pixels behind the window. Real
+//! desktop refraction needs a separate live backdrop source and render path. Only
+//! geometry and surface shading, not a live refracted backdrop, can be baked here.
 //!
-//! So we compute the identical field here (SDF, surface normal, bevel profile,
-//! displacement vector) and shade the lens directly instead of handing the vector to
-//! a filter primitive. Every visual layer the CSS version stacks as a pseudo-element
-//! becomes one `over()` composite below, driven by the same `rim` term.
-//!
-//! The result is one straight-alpha BGRA bitmap per animation frame, uploaded once and
-//! cached, so per-frame cost stays at "draw a sprite".
-//!
-//! This module deliberately depends on nothing but `core`, which keeps the optics
-//! unit-testable and lets it be compiled standalone with `rustc --test`.
+//! Frames use straight-alpha BGRA for GPUI's RenderImage. This module has no GPUI or
+//! window-system dependency and can be tested with `rustc --test liquid_glass.rs`.
 
-/// Number of sheen phases baked into the animated texture. One full traversal of the
-/// capsule per overlay animation loop.
 pub const SHEEN_FRAMES: usize = 24;
 
-/// Rim thickness as a fraction of the capsule's corner radius. The bevel is the band
-/// where the glass surface curves away and bends light; inside it the slab is flat.
-const BEVEL_RATIO: f32 = 0.46;
-
-/// Peak displacement as a fraction of the bevel width. This is the `scale` attribute
-/// of `feDisplacementMap` in the CSS version.
+/// Keep the bevel narrow; the middle is a flat, continuous slab, not an inset trough.
+const BEVEL_RATIO: f32 = 0.30;
 const DISPLACEMENT_RATIO: f32 = 0.55;
-
-/// Sharpness of the bevel cross-section. 2.0 is a circular dome; higher values flatten
-/// the top and concentrate the bend into the outermost sliver, which is what reads as
-/// "thin hard glass" rather than "plastic bubble".
 const BEVEL_SHARPNESS: f32 = 3.9;
-
-/// Direction the key light comes from, in texture space (y grows downward). Tilted off
-/// vertical so the highlight peaks left of top and the capsule does not look symmetric
-/// and flat.
 const LIGHT: (f32, f32) = (-0.32, -1.0);
+const THICKNESS_GAIN: f32 = 0.25;
 
-/// Extra optical path near the rim: light crossing the bevel travels through more
-/// glass, so the tint deepens there.
-const THICKNESS_GAIN: f32 = 0.52;
-
-/// Half-width, in device pixels, of the bright line riding the outer boundary.
-const EDGE_WIDTH: f32 = 1.15;
-
-/// How far inside the boundary that line sits, in device pixels.
-const EDGE_INSET: f32 = 0.85;
-
-/// Half-width of the travelling sheen, as a fraction of the capsule width.
+/// Distances below are at the overlay's 26 logical-pixel reference height. Scaling
+/// them with the lens preserves the same material at 100%, 150% and 200% DPI. The
+/// silhouette's antialiasing coverage still spans one DEVICE pixel.
+const REFERENCE_HEIGHT: f32 = 26.0;
+const OUTLINE_INSET: f32 = 0.45;
+const OUTLINE_WIDTH: f32 = 0.50;
+const HIGHLIGHT_INSET: f32 = 1.55;
+const HIGHLIGHT_WIDTH: f32 = 0.60;
 const SHEEN_WIDTH: f32 = 0.17;
 
-/// Straight-alpha color. Channels are in GPUI's convention, where an `rgba()` literal's
-/// bytes are fed to the GPU unconverted, so these match the palette used by the quads
-/// this module replaces.
+/// Straight-alpha color; byte conventions match GPUI's rgba() literals.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgba {
     pub r: f32,
@@ -65,14 +37,8 @@ pub struct Rgba {
 }
 
 impl Rgba {
-    const TRANSPARENT: Self = Self {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 0.0,
-    };
+    const TRANSPARENT: Self = Self { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 
-    /// Build from a `0xRRGGBBAA` literal, the same spelling GPUI's `rgba()` takes.
     const fn hex(value: u32) -> Self {
         Self {
             r: ((value >> 24) & 0xff) as f32 / 255.0,
@@ -83,10 +49,7 @@ impl Rgba {
     }
 
     fn with_alpha(self, alpha: f32) -> Self {
-        Self {
-            a: alpha.clamp(0.0, 1.0),
-            ..self
-        }
+        Self { a: alpha.clamp(0.0, 1.0), ..self }
     }
 
     fn lerp(self, other: Self, t: f32) -> Self {
@@ -99,15 +62,12 @@ impl Rgba {
         }
     }
 
-    /// Source-over composite in straight alpha. Stacking these reproduces what the CSS
-    /// version gets from stacking translucent pseudo-elements.
     fn over(self, under: Self) -> Self {
         let out_a = self.a + under.a * (1.0 - self.a);
-        if out_a <= f32::EPSILON {
-            return Self::TRANSPARENT;
-        }
-        let blend =
-            |top: f32, bottom: f32| (top * self.a + bottom * under.a * (1.0 - self.a)) / out_a;
+        if out_a <= f32::EPSILON { return Self::TRANSPARENT; }
+        let blend = |top: f32, bottom: f32| {
+            (top * self.a + bottom * under.a * (1.0 - self.a)) / out_a
+        };
         Self {
             r: blend(self.r, under.r),
             g: blend(self.g, under.g),
@@ -117,57 +77,46 @@ impl Rgba {
     }
 }
 
-/// The palette for one lighting environment. Two instances exist, picked by whatever
-/// the overlay sampled from the desktop behind it.
 struct Palette {
     tint_top: Rgba,
     tint_bottom: Rgba,
-    /// Darkening of the inner wall, just inside the bevel, that gives the slab depth.
     inner_wall: Rgba,
-    /// The two dispersion tints. Light leaving the rim splits, cool on one flank and
-    /// warm on the other.
+    /// Artistic edge reflections, not spectral sampling of the desktop.
     dispersion_cool: Rgba,
     dispersion_warm: Rgba,
-    /// Specular response of the rim to the key light and to bounce from below.
+    /// A restrained contrast line, independent of specular lighting.
+    outline: Rgba,
     key_light: Rgba,
     bounce_light: Rgba,
-    edge_line: Rgba,
     sheen: Rgba,
 }
 
 const DARK_PALETTE: Palette = Palette {
     tint_top: Rgba::hex(0x5f7f9660),
     tint_bottom: Rgba::hex(0x07121f8a),
-    inner_wall: Rgba::hex(0x040c1626),
-    dispersion_cool: Rgba::hex(0x8ee9ff8c),
-    dispersion_warm: Rgba::hex(0xffc8f166),
+    inner_wall: Rgba::hex(0x040c1618),
+    dispersion_cool: Rgba::hex(0x8ee9ff23),
+    dispersion_warm: Rgba::hex(0xffc8f11a),
+    outline: Rgba::hex(0x0e1c2b28),
     key_light: Rgba::hex(0xffffffec),
-    bounce_light: Rgba::hex(0xa7dcff68),
-    edge_line: Rgba::hex(0xffffffff),
+    bounce_light: Rgba::hex(0xdbeeff58),
     sheen: Rgba::hex(0xdff2ff1c),
 };
 
-/// The light palette cannot mirror the dark one.
-///
-/// The dark palette separates from its background in both directions at once: a body
-/// darker than the desktop and a rim brighter than it. Over a white document there is no
-/// "brighter" left to use, so a palette built the same way -- white tint, white rim,
-/// white bounce -- disappears into the page. Glass on paper reads the other way round:
-/// what you see is the edge bending light *away*, so the rim is darker than the surface,
-/// not lighter, and the body carries a faint cool cast rather than a white wash.
+/// White backgrounds need a little contour contrast, not an opaque body. The dark
+/// contour is painted BEFORE the inward, neutral highlight so it cannot erase it.
 const LIGHT_PALETTE: Palette = Palette {
     tint_top: Rgba::hex(0xeaf2fa46),
     tint_bottom: Rgba::hex(0xbfd0e246),
-    inner_wall: Rgba::hex(0x3a587238),
-    dispersion_cool: Rgba::hex(0x3dbcff70),
-    dispersion_warm: Rgba::hex(0xff86cf58),
+    inner_wall: Rgba::hex(0x3a587218),
+    dispersion_cool: Rgba::hex(0x3dbcff1c),
+    dispersion_warm: Rgba::hex(0xff86cf16),
+    outline: Rgba::hex(0x4a648448),
     key_light: Rgba::hex(0xffffffe6),
-    bounce_light: Rgba::hex(0xeaf4ff8c),
-    edge_line: Rgba::hex(0x4a648482),
-    sheen: Rgba::hex(0xffffff40),
+    bounce_light: Rgba::hex(0xeaf4ff68),
+    sheen: Rgba::hex(0xffffff30),
 };
 
-/// A capsule-shaped glass lens, measured in device pixels.
 pub struct CapsuleGlass {
     width: f32,
     height: f32,
@@ -178,27 +127,20 @@ pub struct CapsuleGlass {
 }
 
 impl CapsuleGlass {
-    /// `width` and `height` are device pixels, so the caller multiplies logical size by
-    /// the window scale factor before calling. The lens is a full capsule: the corner
-    /// radius is half the height.
+    /// Dimensions are device pixels. The caller applies the window scale factor.
     pub fn new(width: u32, height: u32, dark: bool) -> Self {
         let width = width.max(1) as f32;
         let height = height.max(1) as f32;
-        let radius = (width.min(height)) / 2.0;
+        let radius = width.min(height) / 2.0;
         let bevel = (radius * BEVEL_RATIO).max(1.0);
         Self {
-            width,
-            height,
-            radius,
-            bevel,
+            width, height, radius, bevel,
             displacement: bevel * DISPLACEMENT_RATIO,
             palette: if dark { &DARK_PALETTE } else { &LIGHT_PALETTE },
         }
     }
 
-    /// Signed distance to the capsule boundary plus the outward unit normal there.
-    /// Negative distance is inside. This is the field the CSS version's canvas walks to
-    /// build its displacement map.
+    /// Signed distance and outward unit normal of the rounded rectangle.
     fn field(&self, x: f32, y: f32) -> (f32, f32, f32) {
         let qx = x - self.width / 2.0;
         let qy = y - self.height / 2.0;
@@ -206,12 +148,9 @@ impl CapsuleGlass {
         let ay = qy.abs() - (self.height / 2.0 - self.radius);
         let sx = if qx < 0.0 { -1.0 } else { 1.0 };
         let sy = if qy < 0.0 { -1.0 } else { 1.0 };
-
         if ax > 0.0 && ay > 0.0 {
             let len = (ax * ax + ay * ay).sqrt();
-            if len <= f32::EPSILON {
-                return (-self.radius, sx, 0.0);
-            }
+            if len <= f32::EPSILON { return (-self.radius, sx, 0.0); }
             (len - self.radius, sx * ax / len, sy * ay / len)
         } else if ax > ay {
             (ax - self.radius, sx, 0.0)
@@ -220,668 +159,448 @@ impl CapsuleGlass {
         }
     }
 
-    /// What the slab looks like before the rim bends anything: a vertical tint gradient.
-    ///
-    /// This is the single point where the lens reads its content. A backdrop-sampling
-    /// build — Windows acrylic, or a KWin blur surface — would replace this body and
-    /// leave every other layer untouched.
+    /// Synthetic body color, not a captured desktop texture. Integrating a live
+    /// backdrop also requires changing invalidation, caching and GPU composition.
     fn sample_interior(&self, _x: f32, y: f32) -> Rgba {
-        let v = (y / self.height).clamp(0.0, 1.0);
-        self.palette.tint_top.lerp(self.palette.tint_bottom, v)
+        self.palette.tint_top.lerp(
+            self.palette.tint_bottom, (y / self.height).clamp(0.0, 1.0),
+        )
     }
 
-    /// Shade one pixel of one sheen phase, returning straight-alpha color.
     pub fn shade(&self, x: f32, y: f32, phase: f32) -> Rgba {
         let (distance, nx, ny) = self.field(x, y);
         let coverage = (0.5 - distance).clamp(0.0, 1.0);
-        if coverage <= 0.0 {
-            return Rgba::TRANSPARENT;
-        }
-
-        // Position across the bevel: 0 where the slab is still flat, 1 at the boundary.
+        if coverage <= 0.0 { return Rgba::TRANSPARENT; }
         let t = (1.0 + distance / self.bevel).clamp(0.0, 1.0);
         let rim = bevel_profile(t);
-
-        // The displacement vector. In the CSS version this is what gets packed into the
-        // red and green channels of the map; here we apply it ourselves.
         let offset = rim * self.displacement;
-        let sample_x = x - nx * offset;
-        let sample_y = y - ny * offset;
-
-        // How square-on the rim faces the key light. Drives every specular term, so the
-        // whole highlight set stays consistent with one light position.
         let light_len = (LIGHT.0 * LIGHT.0 + LIGHT.1 * LIGHT.1).sqrt();
         let facing = ((nx * LIGHT.0 + ny * LIGHT.1) / light_len).max(0.0);
+        let scale = self.height / REFERENCE_HEIGHT;
 
-        // 1. Refracted body. Sampling at the displaced point compresses the gradient
-        //    into the rim, and the extra optical path there deepens the tint.
-        let mut color = self.sample_interior(sample_x, sample_y);
+        let mut color = self.sample_interior(x - nx * offset, y - ny * offset);
         color = color.with_alpha(color.a * (1.0 + THICKNESS_GAIN * rim));
 
-        // 2. Inner wall: a soft dark ring just inside the bevel, the thickness cue.
-        let wall = gaussian(t - 0.34, 0.26) * (1.0 - 0.6 * facing);
-        color = self
-            .palette
-            .inner_wall
-            .with_alpha(self.palette.inner_wall.a * wall)
-            .over(color);
+        // Clamping t to zero used to leave exp(-(0.34/0.26)^2) of this ring
+        // EVERYWHERE in the interior. The gate makes both value and slope vanish
+        // at the flat boundary, including where the SDF normal changes direction.
+        let wall = inner_wall_band(t) * (1.0 - 0.6 * facing);
+        color = self.palette.inner_wall
+            .with_alpha(self.palette.inner_wall.a * wall).over(color);
 
-        // 3. Chromatic dispersion across the bevel, cool on the left flank and warm on
-        //    the right. Because it is driven by the normal it wraps the round ends
-        //    instead of stopping at a rectangle's edge.
-        let cool = (-nx).max(0.0);
-        let warm = nx.max(0.0);
-        let dispersion = self
-            .palette
-            .dispersion_cool
-            .with_alpha(self.palette.dispersion_cool.a * rim * cool)
-            .over(
-                self.palette
-                    .dispersion_warm
-                    .with_alpha(self.palette.dispersion_warm.a * rim * warm),
-            );
+        let dispersion = self.palette.dispersion_cool
+            .with_alpha(self.palette.dispersion_cool.a * rim * (-nx).max(0.0))
+            .over(self.palette.dispersion_warm
+                .with_alpha(self.palette.dispersion_warm.a * rim * nx.max(0.0)));
         color = dispersion.over(color);
 
-        // 4. Specular: the key light on the upper rim, plus bounce from the surface the
-        //    overlay floats above.
-        let bounce = ny.max(0.0).powf(3.0) * rim;
-        color = self
-            .palette
-            .bounce_light
-            .with_alpha(self.palette.bounce_light.a * bounce)
-            .over(color);
-        let key = facing.powf(2.2) * rim;
-        color = self
-            .palette
-            .key_light
-            .with_alpha(self.palette.key_light.a * key)
-            .over(color);
+        // Visibility is not illumination: a dark stroke must not become strongest
+        // at the key light or be composited over the specular highlight.
+        let outline = gaussian(distance + OUTLINE_INSET * scale, OUTLINE_WIDTH * scale)
+            * (0.65 + 0.35 * (1.0 - facing));
+        color = self.palette.outline
+            .with_alpha(self.palette.outline.a * outline).over(color);
 
-        // 5. The bright line riding the boundary, dimmed where it turns away from the
-        //    light so it reads as a lit rim rather than a drawn stroke.
-        let line = gaussian(distance + EDGE_INSET, EDGE_WIDTH) * (0.22 + 0.78 * facing);
-        color = self
-            .palette
-            .edge_line
-            .with_alpha(self.palette.edge_line.a * line)
-            .over(color);
+        // Neutral highlights sit inward from the contrast line. Every lighting
+        // term is gated off in the flat interior, independently of image size.
+        let highlight = gaussian(
+            distance + HIGHLIGHT_INSET * scale, HIGHLIGHT_WIDTH * scale,
+        ) * smoothstep((t / 0.18).clamp(0.0, 1.0));
+        let bounce = ny.max(0.0).powf(3.0) * (0.55 * rim + 0.45 * highlight);
+        color = self.palette.bounce_light
+            .with_alpha(self.palette.bounce_light.a * bounce).over(color);
+        let key = facing.powf(2.2) * (0.25 * rim + 0.75 * highlight);
+        color = self.palette.key_light
+            .with_alpha(self.palette.key_light.a * key).over(color);
 
-        // 6. Sheen sweeping along the capsule, slanted so it crosses the rim.
         let travel = -0.3 + 1.6 * phase;
         let along = (x + y * 0.45) / self.width;
         let sheen = gaussian(along - travel, SHEEN_WIDTH) * (0.3 + 0.7 * rim);
-        color = self
-            .palette
-            .sheen
-            .with_alpha(self.palette.sheen.a * sheen)
-            .over(color);
-
+        color = self.palette.sheen.with_alpha(self.palette.sheen.a * sheen).over(color);
         color.with_alpha(color.a * coverage)
     }
 
-    /// Render one sheen phase as straight-alpha BGRA, the layout GPUI's `RenderImage`
-    /// expects.
     pub fn render_bgra(&self, frame: usize) -> Vec<u8> {
         let width = self.width as usize;
         let height = self.height as usize;
         let phase = (frame % SHEEN_FRAMES) as f32 / SHEEN_FRAMES as f32;
         let mut pixels = Vec::with_capacity(width * height * 4);
-
         for y in 0..height {
             for x in 0..width {
-                let color = self.shade(x as f32 + 0.5, y as f32 + 0.5, phase);
-                pixels.push(to_byte(color.b));
-                pixels.push(to_byte(color.g));
-                pixels.push(to_byte(color.r));
-                pixels.push(to_byte(color.a));
+                let c = self.shade(x as f32 + 0.5, y as f32 + 0.5, phase);
+                pixels.extend_from_slice(&[to_byte(c.b), to_byte(c.g), to_byte(c.r), to_byte(c.a)]);
             }
         }
-
         pixels
     }
 
-    /// Every sheen phase, in order.
     pub fn render_frames(&self) -> Vec<Vec<u8>> {
-        (0..SHEEN_FRAMES)
-            .map(|frame| self.render_bgra(frame))
-            .collect()
+        (0..SHEEN_FRAMES).map(|frame| self.render_bgra(frame)).collect()
     }
 }
 
-/// Mixes two rendered frame sets into a third, `mix` running from all `start` to all
-/// `end`.
-///
-/// This interpolates the finished pixels rather than the palettes behind them, which is
-/// what keeps alpha linear across the range: a capsule halfway between the two is
-/// halfway as opaque. Painting one glass on top of the other instead would compound
-/// their alpha and make the capsule visibly thicker in the middle of a change -- the
-/// thing that separates a transition from a dissolve.
-///
-/// Both sides must share a frame count and frame length; they come from the same
-/// `render_frames` shape, so a mismatch is a programming error rather than input.
-/// How far a fully saturated desktop is allowed to push a channel before the cast is
-/// clamped, so a scarlet wallpaper tints the glass rather than dyeing it.
-///
-/// Reading a colour off the desktop is Windows-only for now -- Wayland hands out no
-/// screen pixels -- so everything on the measuring side of `Tint` is genuinely dead
-/// elsewhere. The allow is scoped to those targets rather than blanket, so it starts
-/// warning again the day Windows stops calling it.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const MAX_CAST: f32 = 0.45;
+fn smoothstep(t: f32) -> f32 { t * t * (3.0 - 2.0 * t) }
 
-/// How much of the clamped cast is actually applied. The capsule should read as glass
-/// that picked up the colour of what is behind it, not as coloured glass.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const CAST_STRENGTH: f32 = 0.35;
-
-/// A colour cast borrowed from the desktop, held as one multiplier per channel.
-///
-/// The cast carries hue only. It is normalised against the sampled colour's own
-/// luminance before use, so a navy wall and a powder-blue one push the glass the same
-/// way, and neither changes how light or dark it is. That separation is what keeps this
-/// from undoing the palette: the palette decides whether the capsule sits lighter or
-/// darker than its background, which is the whole reason it stays legible, and a tint
-/// that moved brightness could erase exactly that.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Tint {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
+fn inner_wall_band(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    smoothstep((t / 0.18).clamp(0.0, 1.0)) * gaussian(t - 0.34, 0.26)
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-impl Tint {
-    pub const NEUTRAL: Self = Self {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-    };
+const MAX_CAST: f32 = 0.45;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const CAST_STRENGTH: f32 = 0.35;
 
-    /// `NEUTRAL.quantized()`, spelled out because rounding is not available in a const
-    /// context and the value is needed to initialise an atomic. A test pins the two
-    /// together.
+/// A restrained relative color cast. Normalizing the measured color makes this
+/// exposure-invariant; it does not guarantee identical luminance after grading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tint { pub r: f32, pub g: f32, pub b: f32 }
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl Tint {
+    pub const NEUTRAL: Self = Self { r: 1.0, g: 1.0, b: 1.0 };
     pub const NEUTRAL_KEY: u32 = 0x888;
 
-    /// Derives the cast from an averaged desktop colour.
     pub fn from_background(red: u8, green: u8, blue: u8) -> Self {
         let (r, g, b) = (f32::from(red), f32::from(green), f32::from(blue));
         let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        if luminance <= 1.0 {
-            // Black carries no hue to borrow.
-            return Self::NEUTRAL;
-        }
-
+        if luminance <= 1.0 { return Self::NEUTRAL; }
         let channel = |c: f32| {
             let ratio = (c / luminance).clamp(1.0 - MAX_CAST, 1.0 + MAX_CAST);
             1.0 + (ratio - 1.0) * CAST_STRENGTH
         };
-        Self {
-            r: channel(r),
-            g: channel(g),
-            b: channel(b),
-        }
+        Self { r: channel(r), g: channel(g), b: channel(b) }
     }
 
-    /// Packs the cast into a cache key.
-    ///
-    /// Deliberately coarse. Changing the cast rebakes the whole texture ladder, so every
-    /// shade of one wall has to land in the same bucket; a fine key would rebake on the
-    /// noise between two neighbouring pixels of the same wallpaper.
-    /// Steps are centred on 1.0 rather than spread across a range, so "no cast" survives
-    /// the round trip exactly. A grey desktop has to come back as untouched glass.
     pub fn quantized(self) -> u32 {
-        let step =
-            |v: f32| (((v - 1.0) * 16.0).round() as i32 + 8).clamp(0, 15) as u32;
+        let step = |v: f32| (((v - 1.0) * 16.0).round() as i32 + 8).clamp(0, 15) as u32;
         (step(self.r) << 8) | (step(self.g) << 4) | step(self.b)
     }
 
-    /// The canonical cast for a bucket. Rendering goes through this rather than the raw
-    /// measurement, so the pixels in the cache always match the key they are filed under.
+    /// A Schmitt band of 0.15 bucket widths around each rounding boundary. A small
+    /// oscillation around one boundary cannot alternate cache keys every sample.
+    pub fn quantized_near(self, previous: u32) -> u32 {
+        let channel = |v: f32, shift: u32| {
+            let old = ((previous >> shift) & 0xf) as f32;
+            let measured = (v - 1.0) * 16.0 + 8.0;
+            if (measured - old).abs() <= 0.65 {
+                old as u32
+            } else {
+                measured.round().clamp(0.0, 15.0) as u32
+            }
+        };
+        (channel(self.r, 8) << 8) | (channel(self.g, 4) << 4) | channel(self.b, 0)
+    }
+
     pub fn from_quantized(key: u32) -> Self {
         let value = |shift: u32| 1.0 + (((key >> shift) & 0xf) as f32 - 8.0) / 16.0;
-        Self {
-            r: value(8),
-            g: value(4),
-            b: value(0),
-        }
+        Self { r: value(8), g: value(4), b: value(0) }
     }
 }
 
-/// Applies a colour cast to already-shaded frames.
-///
-/// Grading finished pixels rather than re-shading from a tinted palette is what makes
-/// this affordable: re-shading both ends costs around 120ms in an unoptimised build,
-/// while a per-channel multiply is in the same class as `blend_frames`. Alpha is left
-/// alone -- the cast changes what colour the glass is, never how much it hides.
 pub fn tint_frames(frames: &[Vec<u8>], tint: Tint) -> Vec<Vec<u8>> {
-    frames
-        .iter()
-        .map(|frame| {
-            frame
-                .chunks_exact(4)
-                .flat_map(|pixel| {
-                    let scale = |channel: u8, multiplier: f32| {
-                        (f32::from(channel) * multiplier).round().clamp(0.0, 255.0) as u8
-                    };
-                    // BGRA, matching `render_bgra`.
-                    [
-                        scale(pixel[0], tint.b),
-                        scale(pixel[1], tint.g),
-                        scale(pixel[2], tint.r),
-                        pixel[3],
-                    ]
-                })
-                .collect()
-        })
-        .collect()
+    frames.iter().map(|frame| {
+        frame.chunks_exact(4).flat_map(|p| {
+            let scale = |c: u8, m: f32| (f32::from(c) * m).round().clamp(0.0, 255.0) as u8;
+            [scale(p[0], tint.b), scale(p[1], tint.g), scale(p[2], tint.r), p[3]]
+        }).collect()
+    }).collect()
 }
 
-/// The mix is carried as a 0..=256 fixed-point weight so each byte costs one multiply,
-/// one add and a shift. The float form needed two conversions and a `round` per byte,
-/// which is 16ms for a single capsule in an unoptimised build -- a whole frame's budget
-/// spent on one step of a transition that has twelve of them.
 const BLEND_ONE: u32 = 256;
 
+/// Interpolate straight-alpha bytes, including alpha (not source-over). This
+/// retains the existing transition policy; it is not premultiplied color blending.
 pub fn blend_frames(start: &[Vec<u8>], end: &[Vec<u8>], mix: f32) -> Vec<Vec<u8>> {
-    debug_assert_eq!(start.len(), end.len(), "frame sets differ in length");
+    assert_eq!(start.len(), end.len(), "frame sets differ in length");
     let mix = (mix.clamp(0.0, 1.0) * BLEND_ONE as f32).round() as u32;
-
-    start
-        .iter()
-        .zip(end)
-        .map(|(from, to)| {
-            debug_assert_eq!(from.len(), to.len(), "frames differ in size");
-            from.iter()
-                .zip(to)
-                .map(|(&from, &to)| {
-                    // The half added before the shift rounds to nearest rather than
-                    // always towards zero, which would otherwise drag every mixed
-                    // capsule slightly darker than the two ends it sits between.
-                    let blended = (u32::from(from) * (BLEND_ONE - mix)
-                        + u32::from(to) * mix
-                        + BLEND_ONE / 2)
-                        >> 8;
-                    blended as u8
-                })
-                .collect()
-        })
-        .collect()
+    start.iter().zip(end).map(|(from, to)| {
+        assert_eq!(from.len(), to.len(), "frames differ in size");
+        from.iter().zip(to).map(|(&a, &b)| {
+            ((u32::from(a) * (BLEND_ONE - mix) + u32::from(b) * mix + BLEND_ONE / 2) >> 8) as u8
+        }).collect()
+    }).collect()
 }
 
-/// Refraction strength across the bevel, from 0 where the slab is flat to 1 at the
-/// boundary.
-///
-/// This is the slope of a squircle cross-section `z = (1 - t^N)^(1/N)`, saturated
-/// through `s / (1 + s)` so the mathematically infinite slope at the boundary lands on
-/// 1 instead of blowing up. Raising `BEVEL_SHARPNESS` pushes the bend further out and
-/// makes the glass read as thinner and harder.
 fn bevel_profile(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     let dome = (1.0 - t.powf(BEVEL_SHARPNESS)).max(1.0e-4);
     let slope = t.powf(BEVEL_SHARPNESS - 1.0) * dome.powf(1.0 / BEVEL_SHARPNESS - 1.0);
     slope / (1.0 + slope)
 }
-
-/// Unnormalized gaussian falloff, used wherever a layer needs a soft band.
 fn gaussian(offset: f32, width: f32) -> f32 {
     let n = offset / width;
     (-n * n).exp()
 }
-
-fn to_byte(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
-}
+fn to_byte(value: f32) -> u8 { (value.clamp(0.0, 1.0) * 255.0).round() as u8 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     const WIDTH: u32 = 216;
     const HEIGHT: u32 = 52;
-
-    fn glass() -> CapsuleGlass {
-        CapsuleGlass::new(WIDTH, HEIGHT, true)
-    }
+    fn glass() -> CapsuleGlass { CapsuleGlass::new(WIDTH, HEIGHT, true) }
+    fn luminance(c: Rgba) -> f32 { c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722 }
+    fn over_white(c: Rgba) -> f32 { luminance(c) * c.a + 1.0 - c.a }
 
     #[test]
     fn distance_field_matches_capsule_geometry() {
-        let glass = glass();
-        let center = glass.field(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0);
-        assert!((center.0 + glass.radius).abs() < 0.01, "{center:?}");
-
-        // Straight top edge: the normal points up and distance is the gap to it.
-        let (distance, nx, ny) = glass.field(WIDTH as f32 / 2.0, 4.0);
-        assert!((distance + 4.0).abs() < 0.01);
-        assert_eq!(nx, 0.0);
-        assert_eq!(ny, -1.0);
-
-        // Leftmost point of the left cap: the normal points left, distance is zero.
-        let (distance, nx, ny) = glass.field(0.0, HEIGHT as f32 / 2.0);
-        assert!(distance.abs() < 0.01);
-        assert_eq!(nx, -1.0);
-        assert_eq!(ny, 0.0);
+        let g = glass();
+        assert!((g.field(108.0, 26.0).0 + g.radius).abs() < 0.01);
+        assert_eq!(g.field(108.0, 4.0), (-4.0, 0.0, -1.0));
+        assert_eq!(g.field(0.0, 26.0), (0.0, -1.0, 0.0));
     }
-
     #[test]
     fn distance_field_is_positive_outside_the_round_cap() {
-        let glass = glass();
-        // The texture corner sits outside the capsule silhouette.
-        let (distance, _, _) = glass.field(0.5, 0.5);
-        assert!(distance > 0.0, "corner should be outside: {distance}");
+        assert!(glass().field(0.5, 0.5).0 > 0.0);
     }
-
     #[test]
     fn bevel_profile_runs_from_flat_to_full_bend() {
         assert_eq!(bevel_profile(0.0), 0.0);
         assert!(bevel_profile(1.0) > 0.99);
-        // Monotonic, and weighted toward the outer half of the bevel.
         let mut previous = 0.0;
         for step in 0..=100 {
             let value = bevel_profile(step as f32 / 100.0);
-            assert!(value >= previous, "not monotonic at {step}");
+            assert!(value >= previous);
             previous = value;
         }
-        assert!(bevel_profile(0.5) < 0.25, "bend should stay near the edge");
+        assert!(bevel_profile(0.5) < 0.25);
     }
-
+    #[test]
+    fn inner_wall_is_zero_throughout_the_flat_interior() {
+        for t in [-20.0, -1.0, -0.01, 0.0] { assert_eq!(inner_wall_band(t), 0.0); }
+        assert!(inner_wall_band(0.001) < 0.0001);
+        assert!(inner_wall_band(0.34) > 0.99);
+    }
+    #[test]
+    fn the_flat_slab_has_no_normal_driven_midline_seam() {
+        // The original wall had a nonzero tail at t=0; flipping ny across the
+        // midline changed that tail abruptly. Remove the smooth body and sheen
+        // analytically, then check that nothing else contributes in the flat slab.
+        for dark in [false, true] {
+            let g = CapsuleGlass::new(WIDTH, HEIGHT, dark);
+            for y in [13.0, 25.99, 26.0, 26.01, 39.0] {
+                let x = 108.0;
+                let phase = 0.2;
+                let strength = gaussian((x + y * 0.45) / g.width - (-0.3 + 1.6 * phase), SHEEN_WIDTH) * 0.3;
+                let expected = g.palette.sheen.with_alpha(g.palette.sheen.a * strength)
+                    .over(g.sample_interior(x, y));
+                let actual = g.shade(x, y, phase);
+                for (a, b) in [(actual.r, expected.r), (actual.g, expected.g),
+                    (actual.b, expected.b), (actual.a, expected.a)] {
+                    assert!((a - b).abs() < 1.0e-5, "y={y}: {actual:?} vs {expected:?}");
+                }
+            }
+        }
+    }
     #[test]
     fn corners_are_transparent_and_the_slab_is_not() {
-        let glass = glass();
-        assert_eq!(glass.shade(0.5, 0.5, 0.0).a, 0.0);
-        assert!(glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.0).a > 0.1);
+        let g = glass();
+        assert_eq!(g.shade(0.5, 0.5, 0.0).a, 0.0);
+        assert!(g.shade(108.0, 26.0, 0.0).a > 0.1);
     }
-
     #[test]
     fn rim_is_brighter_than_the_slab_interior() {
-        let glass = glass();
-        let center = glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.5);
-        let top_rim = glass.shade(WIDTH as f32 / 2.0, 1.2, 0.5);
-        let luminance = |c: Rgba| c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722;
-        assert!(
-            luminance(top_rim) > luminance(center) + 0.2,
-            "rim {:?} vs center {:?}",
-            top_rim,
-            center
-        );
-        assert!(top_rim.a > center.a);
+        let g = glass();
+        let center = g.shade(108.0, 26.0, 0.5);
+        let top = g.shade(108.0, HIGHLIGHT_INSET * 2.0, 0.5);
+        assert!(luminance(top) > luminance(center) + 0.2);
+        assert!(top.a > center.a);
+        assert!(luminance(top) * top.a > 0.5);
     }
-
     #[test]
-    fn the_light_capsule_separates_from_a_white_page() {
-        // The regression this guards against: a light palette built the way the dark one
-        // is -- white tint, white rim, white bounce -- vanishes on a white document,
-        // because against white there is no "brighter than the background" left to use.
-        // Composited onto the page, the rim has to come out materially *darker* than it.
-        let glass = CapsuleGlass::new(WIDTH, HEIGHT, false);
-        let luminance = |c: Rgba| c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722;
-        let over_white = |c: Rgba| luminance(c) * c.a + (1.0 - c.a);
-
-        let rim = over_white(glass.shade(WIDTH as f32 / 2.0, 1.2, 0.5));
-        let body = over_white(glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.5));
-        assert!(rim < 0.80, "rim over white is {rim}, too close to the page");
-        assert!(rim < body, "the rim has to read darker than the body it encloses");
-        // The body is deliberately *not* asserted to be dark. Separation is the rim's
-        // job; darkening the body to help is what turns glass into a painted pill, and
-        // `the_capsule_stays_see_through` guards the other side of that line.
+    fn the_light_capsule_separates_from_a_white_page_without_a_heavy_top_stroke() {
+        let g = CapsuleGlass::new(WIDTH, HEIGHT, false);
+        // Sample the full contour rather than requiring the lit top pixel to be
+        // dark. Both endpoints of each cap and both straight edges contribute.
+        let r = g.radius - OUTLINE_INSET * 2.0;
+        let mut contrast = 0.0;
+        for step in 0..64 {
+            let a = step as f32 * core::f32::consts::TAU / 64.0;
+            let cx = if a.cos() < 0.0 { g.radius } else { g.width - g.radius };
+            contrast += 1.0 - over_white(g.shade(cx + r * a.cos(), g.radius + r * a.sin(), 0.0));
+        }
+        assert!(contrast / 64.0 > 0.08, "outline disappeared: {}", contrast / 64.0);
+        let outline = over_white(g.shade(108.0, OUTLINE_INSET * 2.0, 0.0));
+        let highlight = over_white(g.shade(108.0, HIGHLIGHT_INSET * 2.0, 0.0));
+        assert!(highlight > outline + 0.04, "highlight {highlight}, outline {outline}");
+        assert!(highlight > 0.93, "dark outline erased the highlight: {highlight}");
     }
-
     #[test]
     fn the_capsule_stays_see_through() {
-        // The guard that was missing the first time the light palette was made visible.
-        // It is entirely possible to score well on rim separation and still have turned
-        // the glass into a solid lozenge, because nothing here was measuring the one
-        // thing the eye actually reads as glass: the page surviving through the body.
-        //
-        // Straight alpha means a pattern behind the capsule keeps exactly `1 - alpha` of
-        // its contrast, so the body's alpha is that number directly.
-        let survives = |dark: bool| {
-            let glass = CapsuleGlass::new(WIDTH, HEIGHT, dark);
-            1.0 - glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.5).a
-        };
-
-        let light = survives(false);
-        let dark = survives(true);
-        assert!(
-            light > 0.6,
-            "only {:.0}% of the page survives the light capsule",
-            light * 100.0
-        );
-        assert!(
-            dark > 0.45,
-            "only {:.0}% of the desktop survives the dark capsule",
-            dark * 100.0
-        );
-        // A page is busier than a desktop and shows through a thinner glass, so the
-        // light capsule is the more transparent of the two by design.
-        assert!(light > dark, "light {light} should out-transmit dark {dark}");
+        let survives = |dark| 1.0 - CapsuleGlass::new(WIDTH, HEIGHT, dark).shade(108.0, 26.0, 0.5).a;
+        assert!(survives(false) > 0.6);
+        assert!(survives(true) > 0.45);
+        assert!(survives(false) > survives(true));
     }
-
-    #[test]
-    fn each_palette_leans_away_from_its_own_background() {
-        // The two palettes are not mirror images: the dark one is legible because its rim
-        // is brighter than the desktop behind it, the light one because its rim is
-        // darker. Losing either direction is what makes a capsule disappear.
-        let luminance = |c: Rgba| c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722;
-        let rim_of = |dark: bool| {
-            let glass = CapsuleGlass::new(WIDTH, HEIGHT, dark);
-            glass.shade(WIDTH as f32 / 2.0, 1.2, 0.5)
-        };
-
-        let on_black = |c: Rgba| luminance(c) * c.a;
-        let on_white = |c: Rgba| luminance(c) * c.a + (1.0 - c.a);
-        assert!(on_black(rim_of(true)) > 0.5, "the dark rim must light up a dark desktop");
-        assert!(on_white(rim_of(false)) < 0.8, "the light rim must darken a light one");
-    }
-
     #[test]
     fn highlight_wraps_the_round_cap() {
-        // The rim treatment follows the normal, so a point on the curved cap that faces
-        // the light is lit — the axis-aligned gradients this replaces could not do that.
-        let glass = glass();
-        let radius = glass.radius;
-        let angle = 2.4_f32; // up and to the left, on the left cap
-        let cap = glass.shade(
-            radius + (radius - 1.0) * -angle.sin(),
-            radius - (radius - 1.0) * angle.cos(),
-            0.5,
-        );
-        let interior = glass.shade(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0, 0.5);
-        assert!(cap.a > interior.a, "cap {:?} interior {:?}", cap, interior);
+        let g = glass();
+        let r = g.radius - HIGHLIGHT_INSET * 2.0;
+        let lit = g.shade(g.radius - r * 0.6, g.radius - r * 0.8, 0.0);
+        let unlit = g.shade(g.width - g.radius + r * 0.6, g.radius - r * 0.8, 0.0);
+        assert!(luminance(lit) * lit.a > luminance(unlit) * unlit.a);
     }
-
+    #[test]
+    fn edge_reflections_are_restrained() {
+        for p in [&LIGHT_PALETTE, &DARK_PALETTE] {
+            assert!(p.dispersion_cool.a < 0.15);
+            assert!(p.dispersion_warm.a < 0.15);
+        }
+    }
     #[test]
     fn dispersion_splits_across_the_two_flanks() {
-        let glass = glass();
-        let y = HEIGHT as f32 / 2.0;
-        let left = glass.shade(1.0, y, 0.5);
-        let right = glass.shade(WIDTH as f32 - 1.0, y, 0.5);
-        // Cool flank keeps more blue than red; warm flank does the opposite.
-        assert!(left.b - left.r > right.b - right.r, "{left:?} {right:?}");
+        let g = glass();
+        let left = g.shade(1.0, 26.0, 0.5);
+        let right = g.shade(215.0, 26.0, 0.5);
+        assert!(left.b - left.r > right.b - right.r);
     }
-
+    #[test]
+    fn shading_scales_with_device_pixel_ratio() {
+        for dark in [false, true] {
+            let base = CapsuleGlass::new(108, 26, dark);
+            for scale in [1.25, 1.5, 2.0] {
+                let height = (26.0_f32 * scale).round() as u32;
+                let g = CapsuleGlass::new((108.0_f32 * scale).round() as u32, height, dark);
+                let actual_scale = height as f32 / 26.0;
+                for y in [OUTLINE_INSET, HIGHLIGHT_INSET, 6.0, 13.0] {
+                    // Turn off the moving sheen by putting it far outside the lens.
+                    let a = base.shade(54.0, y, 10.0);
+                    let b = g.shade(g.width / 2.0, y * actual_scale, 10.0);
+                    // AA is intentionally device-based, so compare unassociated RGB.
+                    for (a, b) in [(a.r, b.r), (a.g, b.g), (a.b, b.b)] {
+                        assert!((a - b).abs() < 0.001, "scale={scale}, y={y}: {a} vs {b}");
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn sheen_moves_between_phases() {
-        let glass = glass();
-        let probe = |phase: f32| glass.shade(WIDTH as f32 * 0.25, HEIGHT as f32 * 0.3, phase);
-        assert!((probe(0.0).a - probe(0.5).a).abs() > 1.0e-4);
+        let g = glass();
+        assert!((g.shade(54.0, 15.6, 0.0).a - g.shade(54.0, 15.6, 0.5).a).abs() > 1.0e-4);
     }
-
     #[test]
     fn rendered_frames_have_the_expected_shape() {
-        let glass = CapsuleGlass::new(40, 20, false);
-        let frames = glass.render_frames();
+        let frames = CapsuleGlass::new(40, 20, false).render_frames();
         assert_eq!(frames.len(), SHEEN_FRAMES);
-        for frame in &frames {
-            assert_eq!(frame.len(), 40 * 20 * 4);
-        }
-        // Top-left texture corner is outside the capsule in every frame.
-        for frame in &frames {
-            assert_eq!(frame[3], 0);
-        }
+        for f in frames { assert_eq!(f.len(), 40 * 20 * 4); assert_eq!(f[3], 0); }
     }
-
     #[test]
     fn over_composites_like_source_over() {
         let opaque = Rgba::hex(0xff0000ff);
-        let clear = Rgba::TRANSPARENT;
-        assert_eq!(opaque.over(clear), opaque);
-        assert_eq!(clear.over(opaque), opaque);
-
-        let half_white = Rgba::hex(0xffffff80);
-        let black = Rgba::hex(0x000000ff);
-        let blended = half_white.over(black);
-        assert!((blended.a - 1.0).abs() < 1.0e-6);
-        assert!((blended.r - 128.0 / 255.0).abs() < 0.01, "{blended:?}");
+        assert_eq!(opaque.over(Rgba::TRANSPARENT), opaque);
+        assert_eq!(Rgba::TRANSPARENT.over(opaque), opaque);
+        let c = Rgba::hex(0xffffff80).over(Rgba::hex(0x000000ff));
+        assert!((c.a - 1.0).abs() < 1.0e-6);
+        assert!((c.r - 128.0 / 255.0).abs() < 0.01);
     }
-
     #[test]
     fn blending_returns_each_end_untouched() {
-        let light = CapsuleGlass::new(24, 12, false).render_frames();
-        let dark = CapsuleGlass::new(24, 12, true).render_frames();
-        assert_eq!(blend_frames(&light, &dark, 0.0), light);
-        assert_eq!(blend_frames(&light, &dark, 1.0), dark);
+        let a = CapsuleGlass::new(24, 12, false).render_frames();
+        let b = CapsuleGlass::new(24, 12, true).render_frames();
+        assert_eq!(blend_frames(&a, &b, 0.0), a);
+        assert_eq!(blend_frames(&a, &b, 1.0), b);
     }
-
     #[test]
     fn blending_stays_between_the_two_ends() {
-        let light = CapsuleGlass::new(24, 12, false).render_frames();
-        let dark = CapsuleGlass::new(24, 12, true).render_frames();
-        let middle = blend_frames(&light, &dark, 0.5);
-
-        for (frame, (light, dark)) in middle.iter().zip(light.iter().zip(&dark)) {
-            for ((&mixed, &light), &dark) in frame.iter().zip(light).zip(dark) {
-                let low = light.min(dark);
-                let high = light.max(dark);
-                assert!(
-                    (low..=high).contains(&mixed),
-                    "{mixed} escaped the range {low}..={high}"
-                );
-            }
+        let a = CapsuleGlass::new(24, 12, false).render_frames();
+        let b = CapsuleGlass::new(24, 12, true).render_frames();
+        for (mixed, (a, b)) in blend_frames(&a, &b, 0.5).iter().zip(a.iter().zip(&b)) {
+            for ((&m, &a), &b) in mixed.iter().zip(a).zip(b) { assert!((a.min(b)..=a.max(b)).contains(&m)); }
         }
     }
-
     #[test]
     fn alpha_moves_linearly_so_the_capsule_never_thickens() {
-        // A capsule painted over itself would compound alpha; mixing must not. Halfway
-        // through, every pixel's alpha has to sit on the straight line between the ends.
-        let light = CapsuleGlass::new(24, 12, false).render_frames();
-        let dark = CapsuleGlass::new(24, 12, true).render_frames();
-        let middle = blend_frames(&light, &dark, 0.5);
-
-        for (frame, (light, dark)) in middle.iter().zip(light.iter().zip(&dark)) {
-            for offset in (3..frame.len()).step_by(4) {
-                let expected = (f32::from(light[offset]) + f32::from(dark[offset])) / 2.0;
-                let actual = f32::from(frame[offset]);
-                assert!(
-                    (actual - expected).abs() <= 0.5,
-                    "alpha {actual} is not the midpoint {expected}"
-                );
+        let a = CapsuleGlass::new(24, 12, false).render_frames();
+        let b = CapsuleGlass::new(24, 12, true).render_frames();
+        for (m, (a, b)) in blend_frames(&a, &b, 0.5).iter().zip(a.iter().zip(&b)) {
+            for i in (3..m.len()).step_by(4) {
+                assert!((f32::from(m[i]) - (f32::from(a[i]) + f32::from(b[i])) / 2.0).abs() <= 0.5);
             }
         }
     }
-
     #[test]
-    fn a_cast_carries_hue_without_moving_brightness() {
-        // The palette's whole job is to sit lighter or darker than the desktop; a cast
-        // that moved brightness would undo that. The same wall under a dimmer lamp is
-        // the same colour scaled, so it has to produce the same cast.
-        let dim = Tint::from_background(24, 40, 96);
-        let lit = Tint::from_background(48, 80, 192);
-        let close = |a: f32, b: f32| (a - b).abs() < 1.0e-4;
-        assert!(
-            close(dim.r, lit.r) && close(dim.g, lit.g) && close(dim.b, lit.b),
-            "{dim:?} vs {lit:?}"
-        );
-        // Blue background, so blue is lifted and red held back.
-        assert!(dim.b > 1.0 && dim.r < 1.0, "{dim:?}");
+    fn a_cast_is_invariant_under_exposure_scaling() {
+        let a = Tint::from_background(24, 40, 96);
+        let b = Tint::from_background(48, 80, 192);
+        for (a, b) in [(a.r, b.r), (a.g, b.g), (a.b, b.b)] { assert!((a - b).abs() < 1.0e-4); }
+        assert!(a.b > 1.0 && a.r < 1.0);
     }
-
     #[test]
     fn a_paler_colour_casts_more_weakly_than_a_saturated_one() {
-        // Saturation is what the cast follows, once brightness has been divided out.
         let saturated = Tint::from_background(24, 40, 96);
         let pale = Tint::from_background(160, 190, 240);
-        assert!(pale.b > 1.0, "a pale blue should still lean blue: {pale:?}");
-        assert!(
-            pale.b < saturated.b,
-            "pale {pale:?} should cast less than saturated {saturated:?}"
-        );
+        assert!(pale.b > 1.0 && pale.b < saturated.b);
     }
-
     #[test]
     fn the_spelled_out_neutral_key_matches_the_computed_one() {
         assert_eq!(Tint::NEUTRAL.quantized(), Tint::NEUTRAL_KEY);
         assert_eq!(Tint::from_quantized(Tint::NEUTRAL_KEY), Tint::NEUTRAL);
     }
-
     #[test]
     fn a_grey_desktop_produces_no_cast() {
-        for level in [0u8, 64, 128, 200, 255] {
-            let tint = Tint::from_background(level, level, level);
-            let off = (tint.r - 1.0).abs() + (tint.g - 1.0).abs() + (tint.b - 1.0).abs();
-            assert!(off < 0.02, "grey {level} produced {tint:?}");
+        for level in [0, 64, 128, 200, 255] {
+            assert_eq!(Tint::from_background(level, level, level).quantized(), Tint::NEUTRAL_KEY);
         }
     }
-
     #[test]
     fn a_saturated_desktop_is_clamped_rather_than_followed() {
-        let scarlet = Tint::from_background(255, 0, 0);
-        assert!(scarlet.r <= 1.0 + MAX_CAST * CAST_STRENGTH + 1.0e-4, "{scarlet:?}");
-        assert!(scarlet.g >= 1.0 - MAX_CAST * CAST_STRENGTH - 1.0e-4, "{scarlet:?}");
+        let c = Tint::from_background(255, 0, 0);
+        assert!(c.r <= 1.0 + MAX_CAST * CAST_STRENGTH + 1.0e-4);
+        assert!(c.g >= 1.0 - MAX_CAST * CAST_STRENGTH - 1.0e-4);
     }
-
     #[test]
     fn quantising_a_cast_round_trips_through_its_bucket() {
-        for background in [(20, 30, 90), (200, 190, 160), (128, 128, 128), (10, 90, 40)] {
-            let tint = Tint::from_background(background.0, background.1, background.2);
-            let canonical = Tint::from_quantized(tint.quantized());
-            assert_eq!(canonical.quantized(), tint.quantized(), "{tint:?}");
-            let close = |a: f32, b: f32| (a - b).abs() < 0.05;
-            assert!(close(canonical.r, tint.r) && close(canonical.b, tint.b), "{tint:?} -> {canonical:?}");
+        for (r, g, b) in [(20, 30, 90), (200, 190, 160), (128, 128, 128), (10, 90, 40)] {
+            let c = Tint::from_background(r, g, b);
+            let canonical = Tint::from_quantized(c.quantized());
+            assert_eq!(canonical.quantized(), c.quantized());
+            assert!((canonical.r - c.r).abs() < 0.05 && (canonical.b - c.b).abs() < 0.05);
         }
     }
-
+    #[test]
+    fn tint_quantization_does_not_chatter_at_a_bucket_boundary() {
+        let mut key = Tint::NEUTRAL_KEY;
+        for step in 0..100 {
+            let r = 1.0 + (if step % 2 == 0 { 0.49 } else { 0.51 }) / 16.0;
+            key = Tint { r, ..Tint::NEUTRAL }.quantized_near(key);
+            assert_eq!(key, Tint::NEUTRAL_KEY);
+        }
+        key = Tint { r: 1.0 + 0.70 / 16.0, ..Tint::NEUTRAL }.quantized_near(key);
+        assert_eq!(key, 0x988);
+        key = Tint { r: 1.0 + 0.49 / 16.0, ..Tint::NEUTRAL }.quantized_near(key);
+        assert_eq!(key, 0x988);
+        assert_eq!(Tint::NEUTRAL.quantized_near(key), Tint::NEUTRAL_KEY);
+    }
     #[test]
     fn tinting_leaves_alpha_untouched() {
-        // The capsule must hide exactly as much of the desktop after a cast as before,
-        // or the transparency the palette was tuned against shifts under it.
         let frames = CapsuleGlass::new(24, 12, false).render_frames();
         let tinted = tint_frames(&frames, Tint::from_background(30, 60, 200));
-        for (before, after) in frames.iter().zip(&tinted) {
-            for offset in (3..before.len()).step_by(4) {
-                assert_eq!(before[offset], after[offset]);
-            }
+        for (a, b) in frames.iter().zip(tinted) {
+            for i in (3..a.len()).step_by(4) { assert_eq!(a[i], b[i]); }
         }
     }
-
     #[test]
     fn a_neutral_cast_changes_nothing() {
         let frames = CapsuleGlass::new(24, 12, true).render_frames();
         assert_eq!(tint_frames(&frames, Tint::NEUTRAL), frames);
     }
-
     #[test]
     fn a_blue_cast_moves_the_glass_towards_blue() {
         let frames = CapsuleGlass::new(24, 12, false).render_frames();
         let tinted = tint_frames(&frames, Tint::from_background(20, 40, 220));
-        let mean = |fs: &[Vec<u8>], offset: usize| {
-            let (sum, count) = fs.iter().fold((0u64, 0u64), |(s, c), f| {
-                (
-                    s + f.chunks_exact(4).map(|p| u64::from(p[offset])).sum::<u64>(),
-                    c + (f.len() / 4) as u64,
-                )
-            });
-            sum as f64 / count as f64
+        let sum = |fs: &[Vec<u8>], channel: usize| -> u64 {
+            fs.iter().flat_map(|f| f.chunks_exact(4)).map(|p| u64::from(p[channel])).sum()
         };
-        assert!(mean(&tinted, 0) > mean(&frames, 0), "blue channel should rise");
-        assert!(mean(&tinted, 2) < mean(&frames, 2), "red channel should fall");
+        assert!(sum(&tinted, 0) > sum(&frames, 0));
+        assert!(sum(&tinted, 2) < sum(&frames, 2));
     }
-
     #[test]
     fn blending_clamps_a_mix_outside_the_range() {
-        let light = CapsuleGlass::new(16, 8, false).render_frames();
-        let dark = CapsuleGlass::new(16, 8, true).render_frames();
-        assert_eq!(blend_frames(&light, &dark, -1.0), light);
-        assert_eq!(blend_frames(&light, &dark, 2.0), dark);
+        let a = CapsuleGlass::new(16, 8, false).render_frames();
+        let b = CapsuleGlass::new(16, 8, true).render_frames();
+        assert_eq!(blend_frames(&a, &b, -1.0), a);
+        assert_eq!(blend_frames(&a, &b, 2.0), b);
     }
 }
