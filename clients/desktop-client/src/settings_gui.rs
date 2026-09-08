@@ -7,12 +7,12 @@ use gpui::{
 
 use crate::client_settings::ClientSettings;
 use crate::linux_shortcut;
-use crate::linux_transcript_input::{self, TranscriptInput};
+use crate::linux_text_input::{self, TextInput};
 use crate::native_voice;
 
 struct SettingsWindow {
-    server: Entity<TranscriptInput>,
-    port: Entity<TranscriptInput>,
+    server: Entity<TextInput>,
+    port: Entity<TextInput>,
     shortcut: Entity<ShortcutCapture>,
     status: String,
     connection_tests: ConnectionTestTracker,
@@ -319,7 +319,7 @@ impl Render for SettingsWindow {
     }
 }
 
-fn field(label: &'static str, input: Entity<TranscriptInput>) -> impl IntoElement {
+fn field(label: &'static str, input: Entity<TextInput>) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -341,7 +341,7 @@ fn field(label: &'static str, input: Entity<TranscriptInput>) -> impl IntoElemen
 
 fn field_with_action(
     label: &'static str,
-    input: Entity<TranscriptInput>,
+    input: Entity<TextInput>,
     action: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -408,63 +408,63 @@ pub fn run() {
         cx.bind_keys([
             KeyBinding::new(
                 "backspace",
-                linux_transcript_input::Backspace,
-                Some("TranscriptInput"),
+                linux_text_input::Backspace,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "delete",
-                linux_transcript_input::Delete,
-                Some("TranscriptInput"),
+                linux_text_input::Delete,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "left",
-                linux_transcript_input::Left,
-                Some("TranscriptInput"),
+                linux_text_input::Left,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "right",
-                linux_transcript_input::Right,
-                Some("TranscriptInput"),
+                linux_text_input::Right,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "shift-left",
-                linux_transcript_input::SelectLeft,
-                Some("TranscriptInput"),
+                linux_text_input::SelectLeft,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "shift-right",
-                linux_transcript_input::SelectRight,
-                Some("TranscriptInput"),
+                linux_text_input::SelectRight,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "cmd-a",
-                linux_transcript_input::SelectAll,
-                Some("TranscriptInput"),
+                linux_text_input::SelectAll,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "cmd-v",
-                linux_transcript_input::Paste,
-                Some("TranscriptInput"),
+                linux_text_input::Paste,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "cmd-c",
-                linux_transcript_input::Copy,
-                Some("TranscriptInput"),
+                linux_text_input::Copy,
+                Some("TextInput"),
             ),
             KeyBinding::new(
                 "home",
-                linux_transcript_input::Home,
-                Some("TranscriptInput"),
+                linux_text_input::Home,
+                Some("TextInput"),
             ),
-            KeyBinding::new("end", linux_transcript_input::End, Some("TranscriptInput")),
+            KeyBinding::new("end", linux_text_input::End, Some("TextInput")),
         ]);
         let settings = ClientSettings::load().unwrap_or_default();
-        let server = cx.new(|cx| TranscriptInput::new(cx));
-        let port = cx.new(|cx| TranscriptInput::new(cx));
+        let server = cx.new(|cx| TextInput::new(cx));
+        let port = cx.new(|cx| TextInput::new(cx));
         let shortcut = cx.new(|cx| ShortcutCapture::new(settings.voice_shortcut.clone(), cx));
-        server.update(cx, |input, _| input.set_voice_text(&settings.server));
+        server.update(cx, |input, _| input.set_text(&settings.server));
         port.update(cx, |input, _| {
-            input.set_voice_text(&settings.audio_port.to_string())
+            input.set_text(&settings.audio_port.to_string())
         });
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(

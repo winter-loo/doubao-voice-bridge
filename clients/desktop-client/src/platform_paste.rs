@@ -321,8 +321,7 @@ mod implementation {
         }
 
         /// Partial recognition is not written to the focused application yet.
-        /// The transcript window shows it while it is still being revised; the
-        /// preedit path that will replace this lands with the next layer.
+        /// Showing it there as provisional preedit lands with the next layer.
         pub fn update(&self, _text: &str) -> Result<(), String> {
             Ok(())
         }
@@ -341,7 +340,7 @@ mod implementation {
                 })?;
             if !delivered {
                 return Err(
-                    "no application held the input focus; the text stayed in the transcript window"
+                    "no application held the input focus, so the recognized text was not delivered"
                         .to_string(),
                 );
             }

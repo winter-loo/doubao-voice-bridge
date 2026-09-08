@@ -5,8 +5,7 @@ Linux. It captures the selected microphone through CPAL, normalizes audio to
 48 kHz mono s16le PCM, streams it to the Mac bridge, receives bridge events,
 and delivers recognized text without launching Python or FFmpeg. Windows writes
 live recognition into the focused application; Linux commits the final text into
-the focused application through fcitx5 and keeps the running recognition in its
-GPUI transcript editor.
+the focused application through fcitx5.
 
 ## Linux
 
@@ -23,8 +22,8 @@ sudo cmake --install ../../build/fcitx5-addon
 fcitx5-remote -r
 ```
 
-Without the addon the client still records and shows the transcript, and the
-session reports that the text could not be committed.
+Without the addon the client still records, and the session reports that the
+text could not be committed.
 
 Build and start the client from an interactive desktop terminal. Keep the
 process running and press the configured global shortcut to start or finish
@@ -61,22 +60,12 @@ The environment variable overrides the JSON setting. Invalid values disable
 the keyboard shortcut and leave the tray available instead of silently
 grabbing `F13`.
 
-The first shortcut press starts recording and shows both the original compact
-overlay near the bottom of the screen and a separate, resizable Linux text
-window. Its text area is a GPUI `EntityInputHandler`: partial recognition
-appears there live, committed or final text replaces the partial result, and
-the result can then be selected or edited with the keyboard. The **复制** button
-copies the editor's complete current contents. Before the first voice session,
-no editor window is created at all. The first voice activation asks the GPUI
-main thread to create it, horizontally centered 14 logical px above the compact
-overlay. It remains visible after the session finishes so the result can be
-reviewed, edited, and copied; the next session clears and reuses the same
-editor. This does not replace or resize the compact overlay. The next shortcut
-press, an overlay click, or `Ctrl+C` finishes the session. The client waits up
-to eight seconds for the final bridge event and falls back to the latest
-committed text if needed. On Linux the result stays in the GPUI editor and is
-never automatically pasted with `Ctrl+V`; use the **复制** button when clipboard
-output is wanted. Launching the binary again while it is already running exits
+The first shortcut press starts recording and shows the compact overlay near
+the bottom of the screen. The next shortcut press, an overlay click, or `Ctrl+C`
+finishes the session. The client waits up to eight seconds for the final bridge
+event and falls back to the latest committed text if needed. The overlay never
+takes the input focus, so the application being dictated into keeps it for the
+whole session. Launching the binary again while it is already running exits
 without creating a second shortcut or recording session.
 
 The Linux client adds a system tray icon with a live status row, a
@@ -151,8 +140,13 @@ and native Wayland applications through the IBus channel fcitx5 serves. Nothing
 touches the clipboard, and no input-injection permission is involved.
 
 If no application holds the input focus when the session finishes, the text is
-not committed anywhere and stays in the transcript editor, where the **复制**
-button can still copy it.
+not committed anywhere and the session reports that. To see what fcitx5
+considers focused:
+
+```bash
+busctl --user call org.fcitx.Fcitx5 /voicebridge \
+  local.doubao.VoiceBridge1 FocusedProgram
+```
 
 The Linux client includes a small GPUI settings window. Open it from the
 system-tray **打开设置** action, or launch `DoubaoVoiceClient --settings`.

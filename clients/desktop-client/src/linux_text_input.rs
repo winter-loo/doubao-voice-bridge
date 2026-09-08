@@ -10,7 +10,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation as _;
 
 actions!(
-    transcript_input,
+    text_input,
     [
         Backspace,
         Delete,
@@ -27,39 +27,34 @@ actions!(
     ]
 );
 
-pub struct TranscriptInput {
+pub struct TextInput {
     focus_handle: Option<FocusHandle>,
     content: SharedString,
     placeholder: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_layout: Option<TranscriptLayout>,
+    last_layout: Option<TextLayout>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     scroll_y: Pixels,
-    follow_voice_end: bool,
+    follow_end: bool,
 }
 
-impl TranscriptInput {
+impl TextInput {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        #[cfg(debug_assertions)]
-        let content = std::env::var("DOUBAO_TRANSCRIPT_TEST_TEXT").unwrap_or_default();
-        #[cfg(not(debug_assertions))]
-        let content = String::new();
-        let cursor = content.len();
         Self {
             focus_handle: Some(cx.focus_handle()),
-            content: content.into(),
-            placeholder: "识别到的文字会显示在这里".into(),
-            selected_range: cursor..cursor,
+            content: SharedString::default(),
+            placeholder: SharedString::default(),
+            selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
             scroll_y: px(0.0),
-            follow_voice_end: true,
+            follow_end: true,
         }
     }
 
@@ -67,21 +62,12 @@ impl TranscriptInput {
         &self.content
     }
 
-    pub fn set_voice_text(&mut self, text: &str) {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("DOUBAO_TRANSCRIPT_TEST_TEXT").is_some() {
-            return;
-        }
+    pub fn set_text(&mut self, text: &str) {
         self.content = text.to_owned().into();
         self.selected_range = text.len()..text.len();
         self.selection_reversed = false;
         self.marked_range = None;
-        self.follow_voice_end = true;
-    }
-
-    pub fn set_voice_text_and_notify(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.set_voice_text(text);
-        cx.notify();
+        self.follow_end = true;
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -167,7 +153,7 @@ impl TranscriptInput {
         window.focus(
             self.focus_handle
                 .as_ref()
-                .expect("transcript input is missing its focus handle"),
+                .expect("text input is missing its focus handle"),
         );
         self.is_selecting = true;
         let offset = self.index_for_mouse_position(event.position);
@@ -247,7 +233,7 @@ impl TranscriptInput {
             self.last_bounds
                 .map_or(px(0.0), |bounds| bounds.size.height),
         );
-        self.follow_voice_end = false;
+        self.follow_end = false;
         cx.notify();
     }
 
@@ -322,7 +308,7 @@ impl TranscriptInput {
             last_bounds: None,
             is_selecting: false,
             scroll_y: px(0.0),
-            follow_voice_end: true,
+            follow_end: true,
         }
     }
 
@@ -352,7 +338,7 @@ impl TranscriptInput {
     }
 }
 
-impl EntityInputHandler for TranscriptInput {
+impl EntityInputHandler for TextInput {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -458,14 +444,14 @@ impl EntityInputHandler for TranscriptInput {
 }
 
 #[derive(Clone)]
-struct TranscriptLayout {
+struct TextLayout {
     lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
     line_height: Pixels,
     content_height: Pixels,
 }
 
-impl TranscriptLayout {
+impl TextLayout {
     fn position_for_index(
         &self,
         index: usize,
@@ -516,18 +502,18 @@ fn clamp_scroll_offset(offset: Pixels, content_height: Pixels, viewport_height: 
         .min((content_height - viewport_height).max(px(0.0)))
 }
 
-struct TranscriptTextElement {
-    input: Entity<TranscriptInput>,
+struct TextElement {
+    input: Entity<TextInput>,
 }
 
 struct PrepaintState {
-    layout: TranscriptLayout,
+    layout: TextLayout,
     scroll_y: Pixels,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
 }
 
-impl IntoElement for TranscriptTextElement {
+impl IntoElement for TextElement {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -535,7 +521,7 @@ impl IntoElement for TranscriptTextElement {
     }
 }
 
-impl Element for TranscriptTextElement {
+impl Element for TextElement {
     type RequestLayoutState = ();
     type PrepaintState = PrepaintState;
 
@@ -620,7 +606,7 @@ impl Element for TranscriptTextElement {
         let lines = window
             .text_system()
             .shape_text(display, font_size, &runs, Some(bounds.size.width), None)
-            .expect("failed to shape wrapped transcript text");
+            .expect("failed to shape wrapped text");
         let mut line_starts = Vec::with_capacity(lines.len());
         let mut start = 0;
         let mut content_height = px(0.0);
@@ -629,13 +615,13 @@ impl Element for TranscriptTextElement {
             start += line.len() + 1;
             content_height += line.size(window.line_height()).height;
         }
-        let layout = TranscriptLayout {
+        let layout = TextLayout {
             lines: lines.into_iter().collect(),
             line_starts,
             line_height: window.line_height(),
             content_height,
         };
-        let scroll_y = if input.follow_voice_end {
+        let scroll_y = if input.follow_end {
             clamp_scroll_offset(content_height, content_height, bounds.size.height)
         } else {
             clamp_scroll_offset(input.scroll_y, content_height, bounds.size.height)
@@ -701,7 +687,7 @@ impl Element for TranscriptTextElement {
             .read(cx)
             .focus_handle
             .clone()
-            .expect("transcript input is missing its focus handle");
+            .expect("text input is missing its focus handle");
         window.handle_input(
             &focus,
             ElementInputHandler::new(bounds, self.input.clone()),
@@ -720,7 +706,7 @@ impl Element for TranscriptTextElement {
                 window,
                 cx,
             )
-            .expect("failed to paint transcript text");
+            .expect("failed to paint text");
             origin.y += line.size(window.line_height()).height;
         }
         if focus.is_focused(window)
@@ -736,12 +722,12 @@ impl Element for TranscriptTextElement {
     }
 }
 
-impl Render for TranscriptInput {
+impl Render for TextInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .bg(rgba(0x00000001))
-            .key_context("TranscriptInput")
+            .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -763,26 +749,26 @@ impl Render for TranscriptInput {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .line_height(px(24.0))
             .text_size(px(14.0))
-            .child(TranscriptTextElement { input: cx.entity() })
+            .child(TextElement { input: cx.entity() })
     }
 }
 
-impl Focusable for TranscriptInput {
+impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle
             .clone()
-            .expect("transcript input is missing its focus handle")
+            .expect("text input is missing its focus handle")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TranscriptInput, clamp_scroll_offset};
+    use super::{TextInput, clamp_scroll_offset};
     use gpui::px;
 
     #[test]
-    fn transcript_input_replaces_the_selected_utf8_text() {
-        let mut input = TranscriptInput::for_test("你好 world");
+    fn text_input_replaces_the_selected_utf8_text() {
+        let mut input = TextInput::for_test("你好 world");
         input.select_for_test(7..12);
         input.replace_for_test("世界");
 
@@ -791,8 +777,8 @@ mod tests {
     }
 
     #[test]
-    fn transcript_input_moves_across_whole_graphemes() {
-        let input = TranscriptInput::for_test("a👨‍👩‍👧b");
+    fn text_input_moves_across_whole_graphemes() {
+        let input = TextInput::for_test("a👨‍👩‍👧b");
         let family_end = "a👨‍👩‍👧".len();
 
         assert_eq!(input.next_boundary_for_test(1), family_end);
@@ -800,9 +786,9 @@ mod tests {
     }
 
     #[test]
-    fn voice_text_replaces_content_and_moves_the_cursor_to_the_end() {
-        let mut input = TranscriptInput::for_test("manual edit");
-        input.set_voice_text("语音结果");
+    fn setting_text_replaces_content_and_moves_the_cursor_to_the_end() {
+        let mut input = TextInput::for_test("manual edit");
+        input.set_text("语音结果");
 
         assert_eq!(input.content(), "语音结果");
         assert_eq!(

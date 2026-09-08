@@ -6,7 +6,7 @@
 use std::{
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,7 +17,6 @@ use gpui::{
     canvas, div, fill, point, prelude::*, px, rgb, rgba, size,
 };
 #[cfg(target_os = "linux")]
-use gpui::{ClipboardItem, Entity, Focusable, KeyBinding};
 use image::{Frame, RgbaImage};
 
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
@@ -31,7 +30,7 @@ mod linux_gnome_shortcuts;
 #[cfg(any(target_os = "linux", test))]
 mod linux_shortcut;
 #[cfg(target_os = "linux")]
-mod linux_transcript_input;
+mod linux_text_input;
 #[cfg(target_os = "linux")]
 mod linux_tray;
 mod liquid_glass;
@@ -57,12 +56,6 @@ const LISTENING_CAPSULE_WIDTH: f32 = WAVEFORM_BARS_WIDTH + LISTENING_HORIZONTAL_
 const LISTENING_CAPSULE_HEIGHT: f32 = 26.0;
 const OVERLAY_WIDTH: f32 = 128.0;
 const OVERLAY_HEIGHT: f32 = 42.0;
-#[cfg(target_os = "linux")]
-const TRANSCRIPT_WINDOW_WIDTH: f32 = 560.0;
-#[cfg(target_os = "linux")]
-const TRANSCRIPT_WINDOW_HEIGHT: f32 = 240.0;
-#[cfg(target_os = "linux")]
-const TRANSCRIPT_OVERLAY_GAP: f32 = 14.0;
 const BAR_AMPLITUDES: [f32; BAR_COUNT] = [
     0.24, 0.32, 0.44, 0.58, 0.42, 0.64, 0.88, 1.0, 0.78, 0.56, 0.92, 0.74, 0.58, 0.68, 0.49, 0.42,
     0.35, 0.3, 0.25, 0.2,
@@ -75,165 +68,6 @@ enum OverlayPhase {
     Activating,
     Listening,
     Optimizing,
-}
-
-#[cfg(any(target_os = "linux", test))]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct VoiceTranscript {
-    partial: String,
-    committed: String,
-    final_text: String,
-}
-
-#[cfg(any(target_os = "linux", test))]
-impl VoiceTranscript {
-    fn begin_session(&mut self) {
-        self.partial.clear();
-        self.committed.clear();
-        self.final_text.clear();
-    }
-
-    fn partial(&mut self, text: String) {
-        self.partial = text;
-    }
-
-    fn committed(&mut self, text: String) {
-        self.committed = text;
-        self.partial.clear();
-    }
-
-    fn final_text(&mut self, text: String) {
-        self.final_text = text;
-        self.partial.clear();
-    }
-
-    fn visible_text(&self) -> &str {
-        if !self.final_text.is_empty() {
-            &self.final_text
-        } else if !self.partial.is_empty() {
-            &self.partial
-        } else {
-            &self.committed
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn transcript_presentation(phase: OverlayPhase, text: &str) -> (&'static str, &str) {
-    if text.is_empty() {
-        let label = match phase {
-            OverlayPhase::Activating => "正在连接",
-            OverlayPhase::Listening => "正在聆听",
-            OverlayPhase::Optimizing => "正在整理",
-            OverlayPhase::Hidden => "语音输入",
-        };
-        (label, "识别到的文字会显示在这里")
-    } else {
-        let label = if phase == OverlayPhase::Optimizing {
-            "识别结果"
-        } else {
-            "实时转写"
-        };
-        (label, text)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn transcript_window_should_be_visible(phase: OverlayPhase, session_completed: bool) -> bool {
-    phase != OverlayPhase::Hidden || session_completed
-}
-
-#[cfg(target_os = "linux")]
-fn transcript_window_state_atoms() -> [&'static str; 1] {
-    ["_NET_WM_STATE_ABOVE"]
-}
-
-#[cfg(target_os = "linux")]
-fn should_apply_voice_snapshot(last_applied: &str, next: &str) -> bool {
-    last_applied != next
-}
-
-#[cfg(target_os = "linux")]
-fn transcript_window_geometry(visible: bool, saved: (i32, i32, u32, u32)) -> (i32, i32, u32, u32) {
-    if visible { saved } else { (-100, -100, 1, 1) }
-}
-
-#[cfg(target_os = "linux")]
-fn transcript_geometry_above_overlay(overlay: (i32, i32, u32, u32)) -> (i32, i32, u32, u32) {
-    let (overlay_x, overlay_y, overlay_width, _) = overlay;
-    let width = TRANSCRIPT_WINDOW_WIDTH.round() as u32;
-    let height = TRANSCRIPT_WINDOW_HEIGHT.round() as u32;
-    let x = overlay_x + (overlay_width as i32 - width as i32) / 2;
-    let y = overlay_y - height as i32 - TRANSCRIPT_OVERLAY_GAP.round() as i32;
-    (x, y, width, height)
-}
-
-#[cfg(target_os = "linux")]
-fn transcript_bootstrap_size() -> gpui::Size<gpui::Pixels> {
-    size(px(1.0), px(1.0))
-}
-
-#[cfg(target_os = "linux")]
-fn transcript_geometry_for_frame(
-    geometry: (i32, i32, u32, u32),
-    frame_extents: (u32, u32, u32, u32),
-) -> (i32, i32, u32, u32) {
-    (
-        geometry.0 - frame_extents.0 as i32,
-        geometry.1 - frame_extents.2 as i32,
-        geometry.2,
-        geometry.3,
-    )
-}
-
-#[cfg(target_os = "linux")]
-const fn net_wm_state_action(enabled: bool) -> u32 {
-    if enabled { 1 } else { 0 }
-}
-
-#[cfg(target_os = "linux")]
-const fn should_create_transcript_window(requested: bool, created: bool) -> bool {
-    requested && !created
-}
-
-#[cfg(target_os = "linux")]
-const fn transcript_state_after_user_close(_requested: bool, _created: bool) -> (bool, bool) {
-    (false, false)
-}
-
-#[cfg(target_os = "linux")]
-fn reset_transcript_window_state() {
-    let (requested, created) = transcript_state_after_user_close(
-        TRANSCRIPT_WINDOW_REQUESTED.load(Ordering::Acquire),
-        TRANSCRIPT_WINDOW_CREATED.load(Ordering::Acquire),
-    );
-    TRANSCRIPT_WINDOW_REQUESTED.store(requested, Ordering::Release);
-    TRANSCRIPT_WINDOW_CREATED.store(created, Ordering::Release);
-    platform::forget_transcript_window();
-}
-
-#[cfg(target_os = "linux")]
-static VOICE_TRANSCRIPT: OnceLock<Mutex<VoiceTranscript>> = OnceLock::new();
-#[cfg(target_os = "linux")]
-static TRANSCRIPT_WINDOW_REQUESTED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "linux")]
-static TRANSCRIPT_WINDOW_CREATED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(target_os = "linux")]
-fn with_voice_transcript(update: impl FnOnce(&mut VoiceTranscript)) {
-    let transcript = VOICE_TRANSCRIPT.get_or_init(|| Mutex::new(VoiceTranscript::default()));
-    if let Ok(mut transcript) = transcript.lock() {
-        update(&mut transcript);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn voice_transcript() -> VoiceTranscript {
-    VOICE_TRANSCRIPT
-        .get_or_init(|| Mutex::new(VoiceTranscript::default()))
-        .lock()
-        .map(|transcript| transcript.clone())
-        .unwrap_or_default()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -519,26 +353,16 @@ fn apply_native_voice_event(event: native_voice::NativeVoiceEvent) -> NativeVoic
             }
             NativeVoiceEventOutcome::Continue
         }
+        // Recognized text reaches the focused application from the session
+        // thread in `native_voice`, which owns the platform text output. The
+        // overlay only tracks speech activity.
         NativeVoiceEvent::Partial(text) => {
             if !text.trim().is_empty() {
                 mark_speech_activity();
             }
-            #[cfg(target_os = "linux")]
-            with_voice_transcript(|transcript| transcript.partial(text));
             NativeVoiceEventOutcome::Continue
         }
-        NativeVoiceEvent::Committed(text) => {
-            #[cfg(target_os = "linux")]
-            with_voice_transcript(|transcript| transcript.committed(text));
-            #[cfg(target_os = "windows")]
-            let _ = text;
-            NativeVoiceEventOutcome::Continue
-        }
-        NativeVoiceEvent::Final(text) => {
-            #[cfg(target_os = "linux")]
-            with_voice_transcript(|transcript| transcript.final_text(text));
-            #[cfg(target_os = "windows")]
-            let _ = text;
+        NativeVoiceEvent::Committed(_) | NativeVoiceEvent::Final(_) => {
             NativeVoiceEventOutcome::Continue
         }
         NativeVoiceEvent::AudioLevel {
@@ -839,144 +663,6 @@ fn optimizing_capsule(delta: f32) -> impl IntoElement {
         )
 }
 
-#[cfg(target_os = "linux")]
-struct TranscriptWindow {
-    input: Entity<linux_transcript_input::TranscriptInput>,
-    last_voice_text: String,
-}
-
-#[cfg(target_os = "linux")]
-impl Render for TranscriptWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
-        let phase = overlay_phase();
-        let transcript = voice_transcript();
-        let (label, text) = transcript_presentation(phase, transcript.visible_text());
-        if should_apply_voice_snapshot(&self.last_voice_text, text) {
-            self.last_voice_text = text.to_string();
-            self.input.update(cx, |input, cx| {
-                input.set_voice_text_and_notify(text, cx);
-            });
-        }
-        let input_for_copy = self.input.clone();
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_5()
-            .bg(rgb(0x0b1120))
-            .text_color(rgba(0xfffffff2))
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("豆包语音文本"),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgba(0x7dd3fccc))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .id("copy-transcript")
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgba(0x38bdf833))
-                            .border_1()
-                            .border_color(rgba(0x7dd3fc88))
-                            .text_xs()
-                            .text_color(rgba(0xdff7ffff))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgba(0x38bdf855)))
-                            .on_click(move |_, _, cx| {
-                                let text = input_for_copy.read(cx).content().to_string();
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            })
-                            .child("复制"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .px_4()
-                    .py_3()
-                    .rounded_lg()
-                    .overflow_hidden()
-                    .bg(rgb(0x111827))
-                    .border_1()
-                    .border_color(rgba(0xffffff24))
-                    .text_color(rgba(0xfffffff2))
-                    .child(self.input.clone()),
-            )
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn transcript_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {
-    let overlay = overlay_bounds(cx);
-    let transcript_size = size(px(TRANSCRIPT_WINDOW_WIDTH), px(TRANSCRIPT_WINDOW_HEIGHT));
-    Bounds {
-        origin: point(
-            overlay.origin.x + (overlay.size.width - transcript_size.width) / 2.0,
-            overlay.origin.y - transcript_size.height - px(TRANSCRIPT_OVERLAY_GAP),
-        ),
-        // Mutter can place a normal window before our X11 correction arrives.
-        // Make that first mapped frame visually empty, then expand it in place.
-        size: transcript_bootstrap_size(),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn open_transcript_window(cx: &mut App) {
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(transcript_window_bounds(cx))),
-        app_id: Some(CLIENT_APP_ID.to_string()),
-        focus: false,
-        kind: WindowKind::Normal,
-        is_movable: true,
-        is_resizable: true,
-        is_minimizable: true,
-        window_background: WindowBackgroundAppearance::Opaque,
-        ..Default::default()
-    };
-
-    let transcript_window = cx
-        .open_window(options, |_, cx| {
-            let input = cx.new(linux_transcript_input::TranscriptInput::new);
-            cx.new(|_| TranscriptWindow {
-                input,
-                last_voice_text: String::new(),
-            })
-        })
-        .expect("failed to open transcript window");
-    transcript_window
-        .update(cx, |view, window, cx| {
-            window.focus(&view.input.focus_handle(cx));
-            window.on_window_should_close(cx, |_, _| {
-                reset_transcript_window_state();
-                true
-            });
-        })
-        .expect("failed to focus transcript editor");
-    cx.on_window_closed(|_| reset_transcript_window_state())
-        .detach();
-    platform::configure_transcript_window();
-    platform::set_transcript_window_visible(true);
-}
-
 struct VoiceOverlay;
 
 impl Render for VoiceOverlay {
@@ -984,18 +670,7 @@ impl Render for VoiceOverlay {
         window.request_animation_frame();
         let phase = overlay_phase();
         #[cfg(target_os = "linux")]
-        {
-            platform::sync_overlay_window(window, phase);
-            let requested = TRANSCRIPT_WINDOW_REQUESTED.load(Ordering::Acquire);
-            let created = TRANSCRIPT_WINDOW_CREATED.load(Ordering::Acquire);
-            if should_create_transcript_window(requested, created)
-                && TRANSCRIPT_WINDOW_CREATED
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                _cx.defer(open_transcript_window);
-            }
-        }
+        platform::sync_overlay_window(window, phase);
 
         div()
             .size_full()
@@ -1060,65 +735,6 @@ fn main() {
     }
 
     Application::new().run(|cx: &mut App| {
-        #[cfg(target_os = "linux")]
-        cx.bind_keys([
-            KeyBinding::new(
-                "backspace",
-                linux_transcript_input::Backspace,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "delete",
-                linux_transcript_input::Delete,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "left",
-                linux_transcript_input::Left,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "right",
-                linux_transcript_input::Right,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "shift-left",
-                linux_transcript_input::SelectLeft,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "shift-right",
-                linux_transcript_input::SelectRight,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "cmd-a",
-                linux_transcript_input::SelectAll,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "cmd-c",
-                linux_transcript_input::Copy,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "cmd-x",
-                linux_transcript_input::Cut,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "cmd-v",
-                linux_transcript_input::Paste,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new(
-                "home",
-                linux_transcript_input::Home,
-                Some("TranscriptInput"),
-            ),
-            KeyBinding::new("end", linux_transcript_input::End, Some("TranscriptInput")),
-        ]);
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(overlay_bounds(cx))),
@@ -1712,10 +1328,9 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        BAR_COUNT, OverlayPhase, VoiceHotkeyAction, VoiceTranscript, decoded_voice_activity,
+        BAR_COUNT, OverlayPhase, VoiceHotkeyAction, decoded_voice_activity,
         is_partial_speech_line, is_strong_voice_activity_line, overlay_phase_from_bridge_line,
-        lerp_rgba, transcript_presentation, voice_activity_from_audio_line, voice_hotkey_action,
-        waveform_bar_height,
+        lerp_rgba, voice_activity_from_audio_line, voice_hotkey_action, waveform_bar_height,
     };
     #[cfg(target_os = "windows")]
     use super::{GLASS_MIX_STEPS, decide_dark_background, step_glass_mix_level};
@@ -1806,156 +1421,6 @@ mod tests {
     fn colour_interpolation_clamps_out_of_range_positions() {
         assert_eq!(lerp_rgba(0x11223344, 0xaabbccdd, -1.0), 0x11223344);
         assert_eq!(lerp_rgba(0x11223344, 0xaabbccdd, 2.0), 0xaabbccdd);
-    }
-
-    #[test]
-    fn transcript_tracks_partial_committed_and_final_text() {
-        let mut transcript = VoiceTranscript::default();
-        transcript.committed("上一段".to_string());
-        transcript.begin_session();
-        assert_eq!(transcript.visible_text(), "");
-
-        transcript.partial("正在识别".to_string());
-        assert_eq!(transcript.visible_text(), "正在识别");
-
-        transcript.committed("已经识别".to_string());
-        assert_eq!(transcript.visible_text(), "已经识别");
-
-        transcript.final_text("最终文本".to_string());
-        assert_eq!(transcript.visible_text(), "最终文本");
-    }
-
-    #[test]
-    fn transcript_presentation_explains_empty_and_live_states() {
-        assert_eq!(
-            transcript_presentation(OverlayPhase::Listening, ""),
-            ("正在聆听", "识别到的文字会显示在这里")
-        );
-        assert_eq!(
-            transcript_presentation(OverlayPhase::Listening, "你好"),
-            ("实时转写", "你好")
-        );
-        assert_eq!(
-            transcript_presentation(OverlayPhase::Optimizing, "你好世界"),
-            ("识别结果", "你好世界")
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_window_does_not_resize_the_voice_overlay() {
-        assert_eq!((super::OVERLAY_WIDTH, super::OVERLAY_HEIGHT), (128.0, 42.0));
-        assert_eq!(
-            (
-                super::TRANSCRIPT_WINDOW_WIDTH,
-                super::TRANSCRIPT_WINDOW_HEIGHT
-            ),
-            (560.0, 240.0)
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_window_stays_visible_after_a_result() {
-        assert!(!super::transcript_window_should_be_visible(
-            OverlayPhase::Hidden,
-            false,
-        ));
-        assert!(super::transcript_window_should_be_visible(
-            OverlayPhase::Hidden,
-            true,
-        ));
-        assert!(super::transcript_window_should_be_visible(
-            OverlayPhase::Activating,
-            false,
-        ));
-        assert!(super::transcript_window_should_be_visible(
-            OverlayPhase::Listening,
-            false,
-        ));
-        assert!(super::transcript_window_should_be_visible(
-            OverlayPhase::Optimizing,
-            false,
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn closing_transcript_allows_the_next_activation_to_recreate_it() {
-        assert_eq!(
-            super::transcript_state_after_user_close(true, true),
-            (false, false)
-        );
-        assert!(super::should_create_transcript_window(true, false));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_window_is_kept_above_the_active_application() {
-        assert_eq!(
-            super::transcript_window_state_atoms(),
-            ["_NET_WM_STATE_ABOVE"]
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_editor_sync_preserves_manual_edits_until_voice_text_changes() {
-        assert!(!super::should_apply_voice_snapshot("语音原文", "语音原文"));
-        assert!(super::should_apply_voice_snapshot("语音原文", "新的识别"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn hidden_transcript_geometry_is_offscreen_without_unmapping() {
-        let saved = (680, 420, 560, 240);
-        assert_eq!(
-            super::transcript_window_geometry(false, saved),
-            (-100, -100, 1, 1)
-        );
-        assert_eq!(super::transcript_window_geometry(true, saved), saved);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn visible_transcript_requests_ewmh_state_add() {
-        assert_eq!(super::net_wm_state_action(true), 1);
-        assert_eq!(super::net_wm_state_action(false), 0);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_window_is_created_lazily_on_first_activation() {
-        assert!(!super::should_create_transcript_window(false, false));
-        assert!(super::should_create_transcript_window(true, false));
-        assert!(!super::should_create_transcript_window(true, true));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_window_is_centered_just_above_the_overlay() {
-        assert_eq!(
-            super::transcript_geometry_above_overlay((898, 1016, 128, 42)),
-            (682, 762, 560, 240)
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_bootstrap_is_invisible_at_its_final_origin() {
-        assert_eq!(
-            super::transcript_bootstrap_size(),
-            gpui::size(gpui::px(1.0), gpui::px(1.0))
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transcript_position_accounts_for_window_manager_frame() {
-        assert_eq!(
-            super::transcript_geometry_for_frame((682, 762, 560, 240), (0, 0, 37, 0)),
-            (682, 725, 560, 240)
-        );
     }
 
     #[test]
@@ -2084,10 +1549,7 @@ mod platform {
     use std::{
         fs::{File, OpenOptions},
         path::PathBuf,
-        sync::{
-            Mutex, OnceLock,
-            atomic::{AtomicU32, Ordering},
-        },
+        sync::{Mutex, OnceLock},
         thread,
         time::{Duration, Instant},
     };
@@ -2101,7 +1563,7 @@ mod platform {
             Event,
             xkb::{BoolCtrl, ConnectionExt as _, ID, PerClientFlag},
             xproto::{
-                AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt as _,
+                AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _,
                 EventMask, GrabMode, Keycode, ModMask, StackMode, Window as X11Window,
             },
         },
@@ -2113,21 +1575,14 @@ mod platform {
     use super::linux_tray::TrayPhase;
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController, NativeVoiceEvent};
     use super::{
-        NativeVoiceEventOutcome, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPhase,
-        TRANSCRIPT_WINDOW_CREATED, TRANSCRIPT_WINDOW_HEIGHT, TRANSCRIPT_WINDOW_REQUESTED,
-        TRANSCRIPT_WINDOW_WIDTH, VoiceHotkeyAction, apply_native_voice_event, clear_voice_activity,
-        net_wm_state_action, next_overlay_generation, overlay_generation, overlay_phase, px,
-        reset_transcript_window_state, set_overlay_phase, size, transcript_geometry_above_overlay,
-        transcript_geometry_for_frame, transcript_window_geometry,
-        transcript_window_should_be_visible, transcript_window_state_atoms, voice_hotkey_action,
-        with_voice_transcript,
+        NativeVoiceEventOutcome, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPhase, VoiceHotkeyAction,
+        apply_native_voice_event, clear_voice_activity, next_overlay_generation,
+        overlay_generation, overlay_phase, px, set_overlay_phase, size, voice_hotkey_action,
     };
 
     static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
     static X11_OVERLAY_SIZE: OnceLock<(u32, u32)> = OnceLock::new();
     static X11_OVERLAY_WINDOW: OnceLock<X11Window> = OnceLock::new();
-    static TRANSCRIPT_X11_WINDOW: AtomicU32 = AtomicU32::new(0);
-    static TRANSCRIPT_X11_GEOMETRY: OnceLock<(i32, i32, u32, u32)> = OnceLock::new();
     static VOICE_ACTION_LOCK: Mutex<()> = Mutex::new(());
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
@@ -2281,30 +1736,6 @@ mod platform {
                 start_wayland_shortcut_listener(None, shortcut, tray_available);
             }
         }
-    }
-
-    pub fn configure_transcript_window() {
-        let Some(overlay_window) = X11_OVERLAY_WINDOW.get().copied() else {
-            return;
-        };
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline {
-            match find_x11_window_for_current_process_excluding(overlay_window) {
-                Ok(Some(window)) => {
-                    if let Ok(geometry) = connection_geometry(window) {
-                        let _ = TRANSCRIPT_X11_GEOMETRY.set(geometry);
-                    }
-                    TRANSCRIPT_X11_WINDOW.store(window, Ordering::Release);
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(20)),
-                Err(error) => {
-                    eprintln!("[linux-client] could not discover transcript window: {error}");
-                    return;
-                }
-            }
-        }
-        eprintln!("[linux-client] could not discover transcript window");
     }
 
     fn fall_back_to_tray(mode: LinuxSessionMode, allow_legacy_one_shot: bool) {
@@ -2461,13 +1892,7 @@ mod platform {
 
     fn begin_input(mode: LinuxSessionMode) {
         clear_voice_activity();
-        with_voice_transcript(|transcript| transcript.begin_session());
         set_overlay_phase(OverlayPhase::Activating);
-        if TRANSCRIPT_WINDOW_CREATED.load(Ordering::Acquire) && !transcript_window_exists() {
-            reset_transcript_window_state();
-        }
-        TRANSCRIPT_WINDOW_REQUESTED.store(true, Ordering::Release);
-        set_transcript_window_visible(true);
         eprintln!(
             "[linux-client] voice input starting; overlay_window={:?}",
             mode.x11_window()
@@ -2478,10 +1903,6 @@ mod platform {
         if let Err(error) = start_voice_client(mode) {
             eprintln!("[linux-client] failed to start voice client: {error}");
             set_overlay_phase(OverlayPhase::Hidden);
-            if !TRANSCRIPT_WINDOW_CREATED.load(Ordering::Acquire) {
-                TRANSCRIPT_WINDOW_REQUESTED.store(false, Ordering::Release);
-            }
-            set_transcript_window_visible(false);
             if let Some(x_window) = mode.x11_window() {
                 set_x11_window_visible(x_window, false);
             }
@@ -2508,10 +1929,6 @@ mod platform {
                     eprintln!("[linux-client] finished");
                     clear_voice_activity();
                     set_overlay_phase(OverlayPhase::Hidden);
-                    set_transcript_window_visible(transcript_window_should_be_visible(
-                        OverlayPhase::Hidden,
-                        true,
-                    ));
                     match mode {
                         LinuxSessionMode::OneShot => std::process::exit(0),
                         LinuxSessionMode::X11(x_window)
@@ -2607,45 +2024,6 @@ mod platform {
         Ok(None)
     }
 
-    fn find_x11_window_for_current_process_excluding(
-        excluded: X11Window,
-    ) -> Result<Option<X11Window>, String> {
-        let (connection, screen_num) =
-            RustConnection::connect(None).map_err(|error| error.to_string())?;
-        let pid_atom = connection
-            .intern_atom(false, b"_NET_WM_PID")
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?
-            .atom;
-        let root = connection.setup().roots[screen_num].root;
-        let current_pid = std::process::id();
-        let mut pending = vec![root];
-
-        while let Some(parent) = pending.pop() {
-            let tree = connection
-                .query_tree(parent)
-                .map_err(|error| error.to_string())?
-                .reply()
-                .map_err(|error| error.to_string())?;
-            for window in tree.children.into_iter().rev() {
-                if window != excluded {
-                    let property = connection
-                        .get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)
-                        .map_err(|error| error.to_string())?
-                        .reply()
-                        .map_err(|error| error.to_string())?;
-                    if property.value32().and_then(|mut values| values.next()) == Some(current_pid)
-                    {
-                        return Ok(Some(window));
-                    }
-                }
-                pending.push(window);
-            }
-        }
-        Ok(None)
-    }
-
     fn remember_x11_overlay_size(window: X11Window) {
         if X11_OVERLAY_SIZE.get().is_some() {
             return;
@@ -2694,148 +2072,6 @@ mod platform {
         } else {
             eprintln!("[linux-client] overlay visible={visible} size={width}x{height}");
         }
-    }
-
-    pub fn set_transcript_window_visible(visible: bool) {
-        let window = TRANSCRIPT_X11_WINDOW.load(Ordering::Acquire);
-        if window == 0 {
-            return;
-        }
-        let Ok((connection, _)) = RustConnection::connect(None) else {
-            eprintln!("[linux-client] could not connect to X11 to update the transcript window");
-            return;
-        };
-        let fallback = TRANSCRIPT_X11_GEOMETRY.get().copied().unwrap_or((
-            0,
-            0,
-            TRANSCRIPT_WINDOW_WIDTH.round() as u32,
-            TRANSCRIPT_WINDOW_HEIGHT.round() as u32,
-        ));
-        let aligned = X11_OVERLAY_WINDOW
-            .get()
-            .copied()
-            .and_then(|overlay| connection_geometry(overlay).ok())
-            .map(transcript_geometry_above_overlay)
-            .unwrap_or(fallback);
-        let aligned = transcript_geometry_for_frame(
-            aligned,
-            window_frame_extents(&connection, window).unwrap_or_default(),
-        );
-        let (x, y, width, height) = transcript_window_geometry(visible, aligned);
-        let state_result = apply_transcript_window_state(&connection, window, visible);
-        let result = state_result.and_then(|_| {
-            connection
-                .configure_window(
-                    window,
-                    &x11rb::protocol::xproto::ConfigureWindowAux::new()
-                        .x(x)
-                        .y(y)
-                        .width(width)
-                        .height(height)
-                        .stack_mode(StackMode::ABOVE),
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        });
-        if result.is_err() || connection.flush().is_err() {
-            eprintln!("[linux-client] could not update transcript window visibility");
-        } else {
-            eprintln!("[linux-client] transcript visible={visible}");
-        }
-    }
-
-    pub fn forget_transcript_window() {
-        TRANSCRIPT_X11_WINDOW.store(0, Ordering::Release);
-    }
-
-    pub fn transcript_window_exists() -> bool {
-        let window = TRANSCRIPT_X11_WINDOW.load(Ordering::Acquire);
-        if window == 0 {
-            return false;
-        }
-        let Ok((connection, _)) = RustConnection::connect(None) else {
-            return false;
-        };
-        connection
-            .get_window_attributes(window)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .is_some()
-    }
-
-    fn connection_geometry(window: X11Window) -> Result<(i32, i32, u32, u32), String> {
-        let (connection, _) = RustConnection::connect(None).map_err(|error| error.to_string())?;
-        let geometry = connection
-            .get_geometry(window)
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?;
-        Ok((
-            i32::from(geometry.x),
-            i32::from(geometry.y),
-            u32::from(geometry.width),
-            u32::from(geometry.height),
-        ))
-    }
-
-    fn window_frame_extents(
-        connection: &RustConnection,
-        window: X11Window,
-    ) -> Result<(u32, u32, u32, u32), String> {
-        let atom = connection
-            .intern_atom(false, b"_NET_FRAME_EXTENTS")
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?
-            .atom;
-        let property = connection
-            .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 4)
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?;
-        let values = property
-            .value32()
-            .ok_or_else(|| "_NET_FRAME_EXTENTS is not CARDINAL".to_string())?
-            .collect::<Vec<_>>();
-        if values.len() < 4 {
-            return Err("_NET_FRAME_EXTENTS is incomplete".to_string());
-        }
-        Ok((values[0], values[1], values[2], values[3]))
-    }
-
-    fn apply_transcript_window_state(
-        connection: &RustConnection,
-        window: X11Window,
-        visible: bool,
-    ) -> Result<(), String> {
-        let state_property = connection
-            .intern_atom(false, b"_NET_WM_STATE")
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?
-            .atom;
-        let above = connection
-            .intern_atom(false, transcript_window_state_atoms()[0].as_bytes())
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?
-            .atom;
-        let root = connection.setup().roots[0].root;
-        let event = ClientMessageEvent::new(
-            32,
-            window,
-            state_property,
-            [net_wm_state_action(visible), above, 0, 1, 0],
-        );
-        connection
-            .send_event(
-                false,
-                root,
-                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-                event,
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
     }
 
     fn start_x11_hotkey_thread(
