@@ -58,8 +58,11 @@ The first implementation targets a push-to-talk style flow:
 - Add real-time provisional text mirroring with replacement/diff handling.
 - Add per-platform text injection backends:
   - Windows: SendInput plus clipboard fallback.
-  - Linux X11: xdotool/clipboard.
-  - Linux Wayland: compositor-specific clipboard/input fallback.
+  - Linux: commit through fcitx5 via the addon in `clients/fcitx5-addon`.
+    Wayland has no input-injection path that can carry CJK, so the input
+    method is the delivery mechanism on both X11 and Wayland.
+  - Linux without fcitx5: an IBus engine, which needs no native plugin
+    because IBus engines are plain D-Bus services.
 - Package the Mac bridge as a launchable app or launch agent with clear permission onboarding.
 
 ## Local Mac facts observed on this machine

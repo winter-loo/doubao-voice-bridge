@@ -291,179 +291,138 @@ mod implementation {
 
 #[cfg(target_os = "linux")]
 mod implementation {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::path::PathBuf;
-    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
 
+    use crate::linux_notification;
+
+    /// Linux delivers text through fcitx5, which already owns the input focus
+    /// of every application on the desktop, so there is no per-window target to
+    /// capture the way Windows captures a foreground `HWND`.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct PasteTarget;
 
-    #[derive(Debug, Default)]
-    pub struct RealtimeTextOutput;
+    /// The `local.doubao.VoiceBridge1` object the Doubao fcitx5 addon publishes
+    /// on fcitx5's own bus connection. `clients/fcitx5-addon` builds it.
+    #[zbus::proxy(
+        interface = "local.doubao.VoiceBridge1",
+        default_service = "org.fcitx.Fcitx5",
+        default_path = "/voicebridge"
+    )]
+    trait VoiceBridge {
+        /// Shows `text` in the focused application as provisional preedit, or
+        /// withdraws the preedit when `text` is empty. `false` means nothing
+        /// was focused.
+        fn update_preedit(&self, text: &str) -> zbus::Result<bool>;
+
+        /// Withdraws the preedit and delivers `text`. Answers "committed" when
+        /// it reached the focused application, or "held" when nothing was
+        /// focused and the addon kept it for the next application to be
+        /// focused.
+        fn commit_string(&self, text: &str) -> zbus::Result<String>;
+    }
+
+    #[derive(Debug)]
+    pub struct RealtimeTextOutput {
+        bridge: Result<VoiceBridgeProxyBlocking<'static>, String>,
+        /// The preedit the focused application is currently showing. Repeated
+        /// snapshots are not resent, and an abandoned session withdraws
+        /// whatever it left behind instead of stranding provisional text.
+        preedit: Mutex<String>,
+    }
 
     impl RealtimeTextOutput {
         pub fn new(_target: PasteTarget) -> Self {
-            Self
-        }
-
-        pub fn update(&self, _text: &str) -> Result<(), String> {
-            Ok(())
-        }
-
-        pub fn finish(&self, _text: &str) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum LinuxClipboardTool {
-        WlCopy,
-        Xclip,
-        Xsel,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum LinuxPasteTool {
-        Ydotool,
-        Xdotool,
-    }
-
-    fn choose_clipboard_tool<F>(wayland: bool, mut available: F) -> Option<LinuxClipboardTool>
-    where
-        F: FnMut(&str) -> bool,
-    {
-        if wayland && available("wl-copy") {
-            return Some(LinuxClipboardTool::WlCopy);
-        }
-        if available("xclip") {
-            return Some(LinuxClipboardTool::Xclip);
-        }
-        if available("xsel") {
-            return Some(LinuxClipboardTool::Xsel);
-        }
-        None
-    }
-
-    fn choose_paste_tool<F>(mut available: F) -> Option<LinuxPasteTool>
-    where
-        F: FnMut(&str) -> bool,
-    {
-        if available("ydotool") {
-            return Some(LinuxPasteTool::Ydotool);
-        }
-        if available("xdotool") {
-            return Some(LinuxPasteTool::Xdotool);
-        }
-        None
-    }
-
-    fn command_exists(command: &str) -> bool {
-        let Some(path) = std::env::var_os("PATH") else {
-            return false;
-        };
-        std::env::split_paths(&path).any(|directory| {
-            let candidate: PathBuf = directory.join(command);
-            candidate.metadata().is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
-    }
-
-    fn write_clipboard(command: &str, args: &[&str], text: &str) -> Result<(), String> {
-        let mut child = Command::new(command)
-            .args(args)
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("could not start {command}: {error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("could not open {command} stdin"))?
-            .write_all(text.as_bytes())
-            .map_err(|error| format!("could not send text to {command}: {error}"))?;
-        let status = child
-            .wait()
-            .map_err(|error| format!("could not wait for {command}: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("{command} exited with {status}"))
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn paste_text(text: &str, _target: PasteTarget) -> Result<(), String> {
-        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-        match choose_clipboard_tool(wayland, command_exists) {
-            Some(LinuxClipboardTool::WlCopy) => write_clipboard("wl-copy", &[], text)?,
-            Some(LinuxClipboardTool::Xclip) => {
-                write_clipboard("xclip", &["-selection", "clipboard"], text)?
+            Self {
+                bridge: connect(),
+                preedit: Mutex::new(String::new()),
             }
-            Some(LinuxClipboardTool::Xsel) => {
-                write_clipboard("xsel", &["--clipboard", "--input"], text)?
+        }
+
+        /// Each bridge event carries the whole recognition so far, so the
+        /// preedit is replaced wholesale. Unlike the Windows keystroke path,
+        /// revising the text needs no erasure of what was written before.
+        ///
+        /// Everything stays provisional until the session ends, because Doubao
+        /// revises text it has already shown: measured over four sessions, a
+        /// partial snapshot rewrote up to 24 characters behind its own end, and
+        /// the settled snapshot that arrives on stop rewrote 80 of 84 and 57 of
+        /// 98 characters. Committing a prefix early to shorten the final
+        /// replacement would leave that rewritten text behind, and committed
+        /// text can only be taken back by erasing it.
+        pub fn update(&self, text: &str) -> Result<(), String> {
+            let mut preedit = self.preedit()?;
+            if *preedit == text {
+                return Ok(());
             }
-            None => {
-                return Err(
-                    "install wl-copy, xclip, or xsel to receive recognized text".to_string()
+            let shown = self
+                .bridge
+                .as_ref()
+                .map_err(String::clone)?
+                .update_preedit(text)
+                .map_err(describe_bridge_error)?;
+            preedit.clear();
+            if shown {
+                preedit.push_str(text);
+            }
+            Ok(())
+        }
+
+        /// Losing a whole dictation because the focus moved is the worst thing
+        /// this path can do, so text that cannot be delivered now is kept by
+        /// the addon rather than dropped. The session log is not in front of
+        /// anyone, so say so where the user will see it.
+        pub fn finish(&self, text: &str) -> Result<(), String> {
+            let mut preedit = self.preedit()?;
+            let outcome = self
+                .bridge
+                .as_ref()
+                .map_err(String::clone)?
+                .commit_string(text)
+                .map_err(describe_bridge_error)?;
+            preedit.clear();
+            if outcome == HELD {
+                linux_notification::show(
+                    "语音文字已保留",
+                    "刚才没有输入框处于焦点。点击任意输入框，文字会自动写入（2 分钟内有效）。",
                 );
             }
+            Ok(())
         }
 
-        let (command, args): (&str, &[&str]) = match choose_paste_tool(command_exists) {
-            Some(LinuxPasteTool::Ydotool) => ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]),
-            Some(LinuxPasteTool::Xdotool) => ("xdotool", &["key", "--clearmodifiers", "ctrl+v"]),
-            None => {
-                return Err(
-                    "recognized text is on the clipboard; install ydotool or xdotool to paste it"
-                        .to_string(),
-                );
-            }
-        };
-        let status = Command::new(command)
-            .args(args)
-            .status()
-            .map_err(|error| format!("could not start {command}: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "recognized text is on the clipboard, but {command} exited with {status}"
-            ))
+        fn preedit(&self) -> Result<std::sync::MutexGuard<'_, String>, String> {
+            self.preedit
+                .lock()
+                .map_err(|_| "the preedit state lock is poisoned".to_string())
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::{LinuxClipboardTool, LinuxPasteTool, choose_clipboard_tool, choose_paste_tool};
-
-        #[test]
-        fn prefers_session_native_clipboard_then_x11_fallbacks() {
-            assert_eq!(
-                choose_clipboard_tool(true, |tool| matches!(tool, "wl-copy" | "xclip")),
-                Some(LinuxClipboardTool::WlCopy)
-            );
-            assert_eq!(
-                choose_clipboard_tool(false, |tool| matches!(tool, "wl-copy" | "xclip")),
-                Some(LinuxClipboardTool::Xclip)
-            );
-            assert_eq!(
-                choose_clipboard_tool(false, |tool| tool == "xsel"),
-                Some(LinuxClipboardTool::Xsel)
-            );
+    impl Drop for RealtimeTextOutput {
+        fn drop(&mut self) {
+            let outstanding = self.preedit.get_mut().is_ok_and(|text| !text.is_empty());
+            if !outstanding {
+                return;
+            }
+            if let Ok(bridge) = &self.bridge {
+                let _ = bridge.update_preedit("");
+            }
         }
+    }
 
-        #[test]
-        fn prefers_wayland_capable_global_input_injector() {
-            assert_eq!(
-                choose_paste_tool(|tool| matches!(tool, "ydotool" | "xdotool")),
-                Some(LinuxPasteTool::Ydotool)
-            );
-            assert_eq!(
-                choose_paste_tool(|tool| tool == "xdotool"),
-                Some(LinuxPasteTool::Xdotool)
-            );
-        }
+    fn connect() -> Result<VoiceBridgeProxyBlocking<'static>, String> {
+        let connection = zbus::blocking::Connection::session()
+            .map_err(|error| format!("could not reach the session bus: {error}"))?;
+        VoiceBridgeProxyBlocking::new(&connection)
+            .map_err(|error| format!("could not address the fcitx5 voice bridge: {error}"))
+    }
+
+    /// The addon kept the text because nothing was focused to receive it.
+    const HELD: &str = "held";
+
+    fn describe_bridge_error(error: zbus::Error) -> String {
+        format!(
+            "could not hand the text to fcitx5; build and install the addon from \
+             clients/fcitx5-addon, then restart fcitx5 ({error})"
+        )
     }
 }
 

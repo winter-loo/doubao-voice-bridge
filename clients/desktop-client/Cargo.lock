@@ -1504,6 +1504,7 @@ dependencies = [
  "windows 0.61.3",
  "x11rb",
  "xkbcommon",
+ "zbus",
 ]
 
 [[package]]

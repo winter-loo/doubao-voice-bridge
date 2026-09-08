@@ -1,0 +1,14 @@
+[Addon]
+Name=Doubao Voice Bridge
+Name[zh_CN]=豆包语音桥
+Comment=Commits speech recognized by the Doubao voice client into the focused application
+Comment[zh_CN]=把豆包语音客户端识别到的文字送进当前焦点应用
+Type=@FCITX_ADDON_TYPE@
+Library=libdoubaovoicebridge
+Category=Module
+Version=@PROJECT_VERSION@
+OnDemand=False
+Configurable=False
+
+[Addon/Dependencies]
+0=dbus

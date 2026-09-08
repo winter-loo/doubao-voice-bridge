@@ -4,23 +4,26 @@ The release executable contains the native Rust voice client for Windows and
 Linux. It captures the selected microphone through CPAL, normalizes audio to
 48 kHz mono s16le PCM, streams it to the Mac bridge, receives bridge events,
 and delivers recognized text without launching Python or FFmpeg. Windows writes
-live recognition into the focused application; Linux keeps it in its dedicated
-GPUI transcript editor.
+live recognition into the focused application; Linux commits the final text into
+the focused application through fcitx5.
 
 ## Linux
 
-Install a clipboard tool and an input injector. On Arch Linux with GNOME
-Wayland/XWayland:
+Text delivery goes through fcitx5. Wayland has no equivalent of the Windows
+`SendInput` path, so the client hands the recognized text to the input method
+that already owns the focus of every application on the desktop. Build and
+install the addon from [`clients/fcitx5-addon`](../fcitx5-addon/README.md)
+first:
 
 ```bash
-sudo pacman -S xclip xdotool
+cmake -S ../fcitx5-addon -B ../../build/fcitx5-addon -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build ../../build/fcitx5-addon
+sudo cmake --install ../../build/fcitx5-addon
+fcitx5-remote -r
 ```
 
-On Debian or Ubuntu:
-
-```bash
-sudo apt install xclip xdotool
-```
+Without the addon the client still records, and the session reports that the
+text could not be committed.
 
 Build and start the client from an interactive desktop terminal. Keep the
 process running and press the configured global shortcut to start or finish
@@ -57,22 +60,12 @@ The environment variable overrides the JSON setting. Invalid values disable
 the keyboard shortcut and leave the tray available instead of silently
 grabbing `F13`.
 
-The first shortcut press starts recording and shows both the original compact
-overlay near the bottom of the screen and a separate, resizable Linux text
-window. Its text area is a GPUI `EntityInputHandler`: partial recognition
-appears there live, committed or final text replaces the partial result, and
-the result can then be selected or edited with the keyboard. The **复制** button
-copies the editor's complete current contents. Before the first voice session,
-no editor window is created at all. The first voice activation asks the GPUI
-main thread to create it, horizontally centered 14 logical px above the compact
-overlay. It remains visible after the session finishes so the result can be
-reviewed, edited, and copied; the next session clears and reuses the same
-editor. This does not replace or resize the compact overlay. The next shortcut
-press, an overlay click, or `Ctrl+C` finishes the session. The client waits up
-to eight seconds for the final bridge event and falls back to the latest
-committed text if needed. On Linux the result stays in the GPUI editor and is
-never automatically pasted with `Ctrl+V`; use the **复制** button when clipboard
-output is wanted. Launching the binary again while it is already running exits
+The first shortcut press starts recording and shows the compact overlay near
+the bottom of the screen. The next shortcut press, an overlay click, or `Ctrl+C`
+finishes the session. The client waits up to eight seconds for the final bridge
+event and falls back to the latest committed text if needed. The overlay never
+takes the input focus, so the application being dictated into keeps it for the
+whole session. Launching the binary again while it is already running exits
 without creating a second shortcut or recording session.
 
 The Linux client adds a system tray icon with a live status row, a
@@ -139,11 +132,32 @@ The default PipeWire/PulseAudio microphone is selected automatically. Set
 `DOUBAO_VOICE_INPUT_DEVICE` to an exact CPAL device name to override it. The
 audio port can be changed with `DOUBAO_BRIDGE_AUDIO_PORT`.
 
-On XWayland, the client writes the result with `xclip` (or `xsel`) and injects
-`Ctrl+V` with `xdotool`. For native Wayland applications, install and configure
-`wl-clipboard` plus `ydotool`; compositor security rules may still require
-explicit input-device permissions. If injection is unavailable, the recognized
-text remains in the clipboard for manual paste.
+While a session runs, each recognition update is shown in the focused
+application as provisional preedit, the same underlined text an input method
+shows for what is still being typed. Every bridge event carries the whole
+recognition so far, so the preedit is replaced wholesale and revisions need no
+erasure of what was already written. When the session finishes, the preedit is
+withdrawn and the final text is committed. Abandoning a session withdraws the
+preedit instead of stranding it.
+
+fcitx5 inserts the text into whatever application holds the input focus, the
+same way it inserts what a user types. This reaches GTK and Qt applications
+through their fcitx5 input-method modules, XWayland applications through XIM,
+and native Wayland applications through the IBus channel fcitx5 serves. Nothing
+touches the clipboard, and no input-injection permission is involved.
+
+If no application holds the input focus when the session finishes -- the focus
+moved to another window mid-dictation, say -- the text is not dropped. The
+addon keeps it and writes it into the next application to take the input focus,
+for up to two minutes, and the client raises a desktop notification saying so.
+Clicking back into the field being dictated into delivers the text there.
+
+To see what fcitx5 considers focused:
+
+```bash
+busctl --user call org.fcitx.Fcitx5 /voicebridge \
+  local.doubao.VoiceBridge1 FocusedProgram
+```
 
 The Linux client includes a small GPUI settings window. Open it from the
 system-tray **打开设置** action, or launch `DoubaoVoiceClient --settings`.
