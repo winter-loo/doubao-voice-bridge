@@ -52,3 +52,6 @@ ksni = { version = "0.3.6", default-features = false, features = ["async-io", "b
 png = "0.18"
 x11rb = { version = "0.13", features = ["xkb"] }
 xkbcommon = "0.8"
+# Talks to the Doubao fcitx5 addon in clients/fcitx5-addon. Same version and
+# async-io runtime ashpd already resolves, so the two share one zbus build.
+zbus = "5"
