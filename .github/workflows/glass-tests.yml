@@ -1,0 +1,54 @@
+name: Glass regression tests
+
+on:
+  pull_request:
+    paths:
+      - 'clients/desktop-client/src/liquid_glass.rs'
+      - 'clients/desktop-client/src/glass_*.rs'
+      - 'clients/desktop-client/src/main.rs'
+      - 'clients/desktop-client/Cargo.toml'
+      - 'clients/desktop-client/Cargo.lock'
+      - '.github/workflows/glass-tests.yml'
+  push:
+    branches: ['feat/liquid-glass-overlay']
+    paths:
+      - 'clients/desktop-client/src/liquid_glass.rs'
+      - 'clients/desktop-client/src/glass_*.rs'
+      - 'clients/desktop-client/src/main.rs'
+      - '.github/workflows/glass-tests.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glass-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse application source without changing formatting
+        shell: bash
+        run: rustfmt --edition=2024 --config skip_children=true --emit stdout clients/desktop-client/src/main.rs > /dev/null
+      - name: Test shading, background policy and bake coordination
+        shell: bash
+        run: |
+          for source in liquid_glass glass_background glass_bake; do
+            rustc --edition=2024 --test "clients/desktop-client/src/$source.rs" -o "$RUNNER_TEMP/$source-tests"
+            "$RUNNER_TEMP/$source-tests"
+          done
+  windows:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile the Windows GPUI client and run glass tests
+        run: cargo test --locked --manifest-path clients/desktop-client/Cargo.toml glass_

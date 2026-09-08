@@ -11,9 +11,9 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, ColorSpace, Context, FontWeight,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill,
-    linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
+    Animation, AnimationExt as _, App, Application, Bounds, Context, Corners, FontWeight,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    canvas, div, fill, point, prelude::*, px, rgb, rgba, size,
 };
 #[cfg(target_os = "linux")]
 use gpui::{ClipboardItem, Entity, Focusable, KeyBinding};
@@ -22,6 +22,11 @@ use gpui::{ClipboardItem, Entity, Focusable, KeyBinding};
 mod client_core;
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod client_settings;
+#[cfg(any(target_os = "windows", test))]
+mod glass_background;
+mod glass_bake;
+mod glass_texture;
+use glass_texture::glass_texture;
 #[cfg(target_os = "linux")]
 mod linux_global_shortcuts;
 #[cfg(target_os = "linux")]
@@ -32,6 +37,7 @@ mod linux_shortcut;
 mod linux_transcript_input;
 #[cfg(target_os = "linux")]
 mod linux_tray;
+mod liquid_glass;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod native_voice;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -253,7 +259,28 @@ fn voice_hotkey_action(phase: OverlayPhase) -> VoiceHotkeyAction {
 static OVERLAY_PHASE: AtomicU8 = AtomicU8::new(OverlayPhase::Hidden as u8);
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 static OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Whether the probes have settled on the dark palette.
+///
+/// Windows-only, and structurally so: reading the desktop's brightness needs screen
+/// pixels, which Wayland does not hand out. Elsewhere the capsule has nothing to decide
+/// from, `GLASS_MIX_LEVEL` stays at its light end, and this whole mechanism is absent
+/// rather than merely idle.
+#[cfg(target_os = "windows")]
 static DARK_BACKGROUND: AtomicBool = AtomicBool::new(false);
+/// How far the capsule has travelled from the light palette (0) towards the dark one
+/// (`GLASS_MIX_STEPS`).
+///
+/// `DARK_BACKGROUND` is the palette the probes have settled on; this is the palette
+/// actually on screen, walking towards that target a step at a time. Without the walk
+/// the capsule snaps between two very different looks the instant the background crosses
+/// a threshold, which reads as the glass blinking rather than responding.
+static GLASS_MIX_LEVEL: AtomicU32 = AtomicU32::new(0);
+/// The settled target colour cast, packed by `Tint::quantized`.
+///
+/// The probes that decide light or dark already read colour; this keeps the hue they
+/// were throwing away, so the capsule picks up the tone of whatever it is floating over
+/// instead of being one of two fixed greys.
+static GLASS_TINT: AtomicU32 = AtomicU32::new(liquid_glass::Tint::NEUTRAL_KEY);
 static VOICE_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 static VOICE_ACTIVITY_UPDATED_AT: AtomicU64 = AtomicU64::new(0);
 static SPEECH_ACTIVITY_UNTIL: AtomicU64 = AtomicU64::new(0);
@@ -295,14 +322,61 @@ fn overlay_generation() -> u64 {
     OVERLAY_GENERATION.load(Ordering::Acquire)
 }
 
+#[cfg(target_os = "windows")]
 fn dark_background() -> bool {
     DARK_BACKGROUND.load(Ordering::Acquire)
+}
+
+/// Steps between the light and dark palettes.
+///
+/// Each step that gets displayed costs one baked texture, so this trades transition
+/// smoothness against memory; the whole ladder for one capsule size is a few megabytes.
+const GLASS_MIX_STEPS: u32 = 12;
+
+fn glass_mix_level() -> u32 {
+    GLASS_MIX_LEVEL.load(Ordering::Acquire).min(GLASS_MIX_STEPS)
+}
+
+/// The palette currently on screen as a fraction: 0.0 fully light, 1.0 fully dark.
+fn glass_mix() -> f32 {
+    glass_mix_level() as f32 / GLASS_MIX_STEPS as f32
+}
+
+#[cfg(target_os = "windows")]
+fn set_glass_mix_level(level: u32) {
+    GLASS_MIX_LEVEL.store(level.min(GLASS_MIX_STEPS), Ordering::Release);
+}
+
+fn glass_tint() -> u32 {
+    GLASS_TINT.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "windows")]
+fn set_glass_tint(tint: u32) {
+    GLASS_TINT.store(tint, Ordering::Release);
+}
+
+/// One step of the walk from `level` towards `target`.
+///
+/// Kept separate from the thread that drives it so the walk can be checked without a
+/// screen: it has to move by exactly one step, in the right direction, and stop on
+/// arrival rather than stepping past it.
+#[cfg(target_os = "windows")]
+fn step_glass_mix_level(level: u32, target: u32) -> u32 {
+    match level.cmp(&target) {
+        std::cmp::Ordering::Less => level + 1,
+        std::cmp::Ordering::Greater => level - 1,
+        std::cmp::Ordering::Equal => level,
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn set_dark_background(dark: bool) {
     DARK_BACKGROUND.store(dark, Ordering::Release);
 }
+
+#[cfg(target_os = "windows")]
+use glass_background::decide_dark_background;
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -486,6 +560,20 @@ fn waveform_bar_height(index: usize, delta: f32, voice_level: f32) -> f32 {
     3.0 + 13.0 * BAR_AMPLITUDES[index] * voice_level.sqrt() * (0.24 + 0.76 * movement)
 }
 
+/// Interpolates a `0xRRGGBBAA` colour, alpha included.
+///
+/// The capsule's text and its flat fallback both have to travel with the glass; leaving
+/// either on a hard switch would put a jump back into a transition that is otherwise
+/// continuous.
+fn lerp_rgba(start: u32, end: u32, t: f32) -> u32 {
+    let channel = |shift: u32| {
+        let from = ((start >> shift) & 0xffu32) as f32;
+        let to = ((end >> shift) & 0xffu32) as f32;
+        (from + (to - from) * t.clamp(0.0, 1.0)).round() as u32
+    };
+    (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 fn lerp_rgb(start: u32, end: u32, t: f32) -> u32 {
     let channel = |shift: u32| {
         let from = ((start >> shift) & 0xffu32) as f32;
@@ -500,151 +588,21 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
         |_, _, _| {},
         move |bounds, _, window, _| {
             let radius = bounds.size.height / 2.0;
-            let dark = dark_background();
-            let (glass_top, glass_bottom) = if dark {
-                (rgba(0x5f7f966e), rgba(0x07121f9c))
-            } else {
-                (rgba(0xffffff38), rgba(0xd8efff1c))
-            };
-            window.paint_quad(
-                fill(
-                    bounds,
-                    linear_gradient(
-                        180.0,
-                        linear_color_stop(glass_top, 0.0),
-                        linear_color_stop(glass_bottom, 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
+            let scale = window.scale_factor();
+            let width = (f32::from(bounds.size.width) * scale).round().max(1.0) as u32;
+            let height = (f32::from(bounds.size.height) * scale).round().max(1.0) as u32;
+            let sheen = ((delta * liquid_glass::SHEEN_FRAMES as f32) as usize)
+                .min(liquid_glass::SHEEN_FRAMES - 1);
+            let level = glass_mix_level();
+            let texture = glass_texture(window, width, height, glass_tint(), level);
 
-            let top_lens = Bounds::new(
-                bounds.origin + point(px(4.0), px(1.0)),
-                size(bounds.size.width - px(8.0), px(10.0)),
-            );
-            window.paint_quad(
-                fill(
-                    top_lens,
-                    linear_gradient(
-                        180.0,
-                        linear_color_stop(
-                            if dark {
-                                rgba(0xffffffec)
-                            } else {
-                                rgba(0xffffffb8)
-                            },
-                            0.0,
-                        ),
-                        linear_color_stop(rgba(0xffffff00), 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let lower_reflection = Bounds::new(
-                bounds.origin + point(px(3.0), bounds.size.height - px(8.0)),
-                size(bounds.size.width - px(6.0), px(6.0)),
-            );
-            window.paint_quad(
-                fill(
-                    lower_reflection,
-                    linear_gradient(
-                        180.0,
-                        linear_color_stop(rgba(0xffffff00), 0.0),
-                        linear_color_stop(
-                            if dark {
-                                rgba(0xa7dcff68)
-                            } else {
-                                rgba(0xffffff4c)
-                            },
-                            1.0,
-                        ),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let left_refraction = Bounds::new(
-                bounds.origin + point(px(1.0), px(4.0)),
-                size(px(8.0), bounds.size.height - px(8.0)),
-            );
-            window.paint_quad(
-                fill(
-                    left_refraction,
-                    linear_gradient(
-                        90.0,
-                        linear_color_stop(rgba(0x8ee9ff42), 0.0),
-                        linear_color_stop(rgba(0xffffff00), 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let right_refraction = Bounds::new(
-                point(
-                    bounds.origin.x + bounds.size.width - px(9.0),
-                    bounds.origin.y + px(4.0),
-                ),
-                size(px(8.0), bounds.size.height - px(8.0)),
-            );
-            window.paint_quad(
-                fill(
-                    right_refraction,
-                    linear_gradient(
-                        270.0,
-                        linear_color_stop(rgba(0xffc8f12e), 0.0),
-                        linear_color_stop(rgba(0xffffff00), 1.0),
-                    )
-                    .color_space(ColorSpace::Oklab),
-                )
-                .corner_radii(radius),
-            );
-
-            let upper_rim = Bounds::new(
-                bounds.origin + point(px(13.0), px(1.0)),
-                size(bounds.size.width - px(26.0), px(1.0)),
-            );
-            window.paint_quad(
-                fill(
-                    upper_rim,
-                    linear_gradient(
-                        90.0,
-                        linear_color_stop(rgba(0xffffff22), 0.0),
-                        linear_color_stop(rgba(0xffffffea), 0.5),
-                    ),
-                )
-                .corner_radii(px(0.5)),
-            );
-
-            let lower_rim = Bounds::new(
-                bounds.origin + point(px(15.0), bounds.size.height - px(2.0)),
-                size(bounds.size.width - px(30.0), px(1.0)),
-            );
-            window.paint_quad(
-                fill(
-                    lower_rim,
-                    linear_gradient(
-                        90.0,
-                        linear_color_stop(rgba(0xaeeaff18), 0.0),
-                        linear_color_stop(rgba(0xffffff78), 0.55),
-                    ),
-                )
-                .corner_radii(px(0.5)),
-            );
-
-            for x in [
-                bounds.origin.x + px(1.0),
-                bounds.origin.x + bounds.size.width - px(2.0),
-            ] {
-                let edge_caustic = Bounds::new(
-                    point(x, bounds.origin.y + px(6.0)),
-                    size(px(1.0), bounds.size.height - px(12.0)),
-                );
-                window.paint_quad(fill(edge_caustic, rgba(0xffffff62)).corner_radii(px(0.5)));
+            if texture.is_none_or(|texture| {
+                window.paint_image(bounds, Corners::all(radius), texture, sheen, false).is_err()
+            }) {
+                // The first bake is pending, or the atlas refused the tile. Keep a
+                // readable flat capsule; never wait for the worker on the paint thread.
+                let flat = lerp_rgba(0xffffffbc, 0x0c1a2ad8, glass_mix());
+                window.paint_quad(fill(bounds, rgba(flat)).corner_radii(radius));
             }
 
             if !show_waveform {
@@ -681,8 +639,10 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
     .h(px(LISTENING_CAPSULE_HEIGHT))
 }
 
+/// The capsule shell. It carries layout and text color only: the fill, the rim and the
+/// outline all come out of the glass texture, which shapes them to the real silhouette
+/// instead of to an axis-aligned box.
 fn capsule_base() -> gpui::Div {
-    let dark = dark_background();
     div()
         .relative()
         .flex()
@@ -690,22 +650,7 @@ fn capsule_base() -> gpui::Div {
         .justify_center()
         .rounded_full()
         .overflow_hidden()
-        .bg(if dark {
-            rgba(0x06101b38)
-        } else {
-            rgba(0xffffff0c)
-        })
-        .border_1()
-        .border_color(if dark {
-            rgba(0xffffffe0)
-        } else {
-            rgba(0xaec8d55a)
-        })
-        .text_color(if dark {
-            rgba(0xffffffff)
-        } else {
-            rgba(0x07131ff5)
-        })
+        .text_color(rgba(lerp_rgba(0x07131ff5, 0xffffffff, glass_mix())))
 }
 
 fn listening_capsule(delta: f32) -> impl IntoElement {
@@ -1068,10 +1013,12 @@ mod platform {
     use super::native_voice::{NativeVoiceConfig, NativeVoiceController};
     use super::platform_paste::PasteTarget;
     use super::{
-        LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH, NativeVoiceEventOutcome, OVERLAY_HEIGHT,
-        OVERLAY_WIDTH, OverlayPhase, apply_native_voice_event, clear_voice_activity,
-        dark_background, next_overlay_generation, overlay_generation, overlay_phase,
-        set_dark_background, set_overlay_phase,
+        GLASS_MIX_STEPS, LISTENING_CAPSULE_HEIGHT, LISTENING_CAPSULE_WIDTH,
+        NativeVoiceEventOutcome, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPhase,
+        apply_native_voice_event, clear_voice_activity, dark_background, decide_dark_background,
+        glass_mix_level, glass_tint, liquid_glass, next_overlay_generation, overlay_generation,
+        overlay_phase, set_dark_background, set_glass_mix_level, set_glass_tint, set_overlay_phase,
+        step_glass_mix_level,
     };
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1079,39 +1026,45 @@ mod platform {
         ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, RECT, WPARAM,
     };
     use windows::Win32::Graphics::Dwm::{
-        DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
-        DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
-        DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DwmRegisterThumbnail, DwmSetWindowAttribute,
-        DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+        DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
+        DwmSetWindowAttribute,
     };
     use windows::Win32::Graphics::Gdi::{
-        CreateRoundRectRgn, GetDC, GetMonitorInfoW, GetPixel, MONITOR_DEFAULTTOPRIMARY,
-        MONITORINFO, MonitorFromWindow, ReleaseDC, SetWindowRgn,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, DeleteDC,
+        DeleteObject, GetDC, GetMonitorInfoW, GetPixel, MONITOR_DEFAULTTOPRIMARY,
+        MONITORINFO, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject, SetWindowRgn,
     };
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_SPACE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindow,
-        GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IsWindowVisible, MB_ICONERROR, MB_OK, MSG,
-        MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-        WM_HOTKEY, WS_BORDER, WS_DISABLED, WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
+        FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+        HWND_TOPMOST, IsWindowVisible, MB_ICONERROR, MB_OK, MSG, MessageBoxW, SW_HIDE, SW_SHOW,
+        SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_HOTKEY, WS_BORDER,
+        WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
     };
-    use windows::core::{BOOL, w};
+    use windows::core::w;
 
     const HOTKEY_ID: i32 = 0xDB01;
     const OPTIMIZING_DURATION: Duration = Duration::from_millis(2_400);
-    const BACKDROP_SAMPLES: [(i32, i32, u8); 5] = [
-        (0, 0, 255),
-        (-2, 0, 18),
-        (2, 0, 18),
-        (0, -1, 14),
-        (0, 1, 14),
-    ];
-    static BACKDROP_HWND: AtomicIsize = AtomicIsize::new(0);
+    /// How far outside the capsule the background probes sit. The overlay window is
+    /// clipped to the capsule by `clip_overlay_to_capsule`, so pixels this far out are
+    /// desktop rather than glass -- which is what lets the probes run while the capsule
+    /// is on screen instead of only before it appears.
+    const BACKGROUND_PROBE_MARGIN: i32 = 6;
+    /// Re-check often enough that dragging a window under the capsule feels immediate.
+    /// This is latency the user sees before the glass even begins to move, so it is kept
+    /// well under the length of the transition it triggers.
+    const BACKGROUND_SAMPLE_INTERVAL: Duration = Duration::from_millis(80);
+    /// The capsule is hidden for almost the whole life of the process, so the sampler
+    /// idles at a much longer period rather than waking seven times a second forever.
+    const BACKGROUND_IDLE_INTERVAL: Duration = Duration::from_millis(1_000);
+    /// One step of the walk between palettes. Times `GLASS_MIX_STEPS` this sets how long
+    /// a change takes: long enough to read as movement, short enough to keep up with a
+    /// window being dragged across.
+    const GLASS_TRANSITION_STEP: Duration = Duration::from_millis(22);
     static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
     static VOICE_CLIENT: NativeVoiceController = NativeVoiceController::new();
 
@@ -1163,39 +1116,11 @@ mod platform {
         }
         suppress_native_frame(hwnd);
         clip_overlay_to_capsule(hwnd);
-        let backdrop = create_backdrop_window(hwnd);
-        BACKDROP_HWND.store(backdrop.0 as isize, Ordering::Release);
         hide_overlay(hwnd);
-        hide_backdrop(backdrop);
-        start_backdrop_thread(hwnd.0 as isize, backdrop.0 as isize);
         start_hotkey_thread(hwnd.0 as isize);
+        start_background_sampler_thread(hwnd.0 as isize);
+        start_glass_transition_thread(hwnd.0 as isize);
         super::windows_shell::start(hwnd);
-    }
-
-    fn create_backdrop_window(overlay: HWND) -> HWND {
-        let capsule = capsule_screen_rect(overlay).expect("missing overlay bounds");
-        let width = capsule.right - capsule.left;
-        let height = capsule.bottom - capsule.top;
-        unsafe {
-            let backdrop = CreateWindowExW(
-                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
-                w!("STATIC"),
-                w!(""),
-                WS_POPUP | WS_DISABLED,
-                capsule.left,
-                capsule.top,
-                width,
-                height,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("failed to create DWM backdrop window");
-            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
-            let _ = SetWindowRgn(backdrop, Some(region), false);
-            backdrop
-        }
     }
 
     fn suppress_native_frame(hwnd: HWND) {
@@ -1275,8 +1200,6 @@ mod platform {
     fn show_phase(hwnd: HWND, phase: OverlayPhase) {
         set_overlay_phase(phase);
         unsafe {
-            let backdrop = backdrop_hwnd(hwnd);
-            hide_backdrop(backdrop);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(
                 hwnd,
@@ -1295,14 +1218,20 @@ mod platform {
         set_overlay_phase(OverlayPhase::Hidden);
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
-            hide_backdrop(backdrop_hwnd(hwnd));
         }
     }
 
     fn begin_input(hwnd: HWND) {
         let generation = next_overlay_generation();
         clear_voice_activity();
-        set_dark_background(sample_dark_background(hwnd));
+        let reading = sample_background(hwnd, None);
+        let dark = reading.dark;
+        set_dark_background(dark);
+        set_glass_tint(reading.tint);
+        // A capsule that has just appeared should already be wearing the right palette.
+        // Walking to it from wherever the previous session left off would show a wipe
+        // across the glass every time the overlay opens.
+        set_glass_mix_level(if dark { GLASS_MIX_STEPS } else { 0 });
         show_phase(hwnd, OverlayPhase::Activating);
         if let Err(error) = start_voice_client(generation, hwnd) {
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
@@ -1354,28 +1283,103 @@ mod platform {
         VOICE_CLIENT.request_stop()
     }
 
-    fn sample_dark_background(hwnd: HWND) -> bool {
-        let Some(capsule) = capsule_screen_rect(hwnd) else {
-            return false;
+    /// What one look at the desktop behind the capsule yields.
+    #[derive(Clone, Copy)]
+    struct BackgroundReading {
+        dark: bool,
+        tint: u32,
+    }
+
+    /// Reads the desktop in a ring around the capsule and decides which palette the
+    /// glass should wear.
+    ///
+    /// The probes sit outside the capsule on purpose. Sampling inside it only works
+    /// before the overlay is shown -- afterwards the probes would land on the glass and
+    /// the reading would feed back on itself. A ring keeps the answer meaningful at any
+    /// time, which is what allows the palette to follow a window dragged underneath.
+    ///
+    /// `previous` is the palette currently on screen, or `None` for a first look, which
+    /// is judged on a single threshold rather than the hysteresis band.
+    ///
+    /// The same probes answer both questions the glass asks of the desktop: how light it
+    /// is, and what colour. Reading the screen is the expensive part, so the colour comes
+    /// along for free rather than costing a second blit.
+    fn sample_background(hwnd: HWND, previous: Option<bool>) -> BackgroundReading {
+        let fallback = BackgroundReading {
+            dark: previous.unwrap_or(false),
+            tint: glass_tint(),
         };
+        let Some(capsule) = capsule_screen_rect(hwnd) else {
+            return fallback;
+        };
+
+        let width = capsule.right - capsule.left;
+        let height = capsule.bottom - capsule.top;
+        let margin = height.max(3) / 3 + BACKGROUND_PROBE_MARGIN;
+        let block_width = width + margin * 2;
+        let block_height = height + margin * 2;
+        if block_width <= 0 || block_height <= 0 {
+            return fallback;
+        }
+
+        // Five probes along the top and bottom edges, two down each side, as offsets
+        // inside the copied block.
+        let mut probes = Vec::with_capacity(14);
+        for step in 1..=5 {
+            let x = margin + width * step / 6;
+            probes.push((x, 0));
+            probes.push((x, block_height - 1));
+        }
+        for step in 1..=2 {
+            let y = margin + height * step / 3;
+            probes.push((0, y));
+            probes.push((block_width - 1, y));
+        }
 
         unsafe {
             let screen = GetDC(None);
             if screen.is_invalid() {
-                return false;
+                return fallback;
             }
 
-            let width = capsule.right - capsule.left;
-            let height = capsule.bottom - capsule.top;
+            // The ring is copied into memory in one blit and read from there. Reading the
+            // fourteen points off the screen DC directly costs 234ms on this hardware,
+            // because every GetPixel against a composited desktop forces its own readback
+            // from the GPU; one blit plus fourteen reads from ordinary memory is 17ms.
+            let memory = CreateCompatibleDC(Some(screen));
+            if memory.is_invalid() {
+                let _ = ReleaseDC(None, screen);
+                return fallback;
+            }
+            let bitmap = CreateCompatibleBitmap(screen, block_width, block_height);
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(memory);
+                let _ = ReleaseDC(None, screen);
+                return fallback;
+            }
+            let replaced = SelectObject(memory, bitmap.into());
+
+            let copied = BitBlt(
+                memory,
+                0,
+                0,
+                block_width,
+                block_height,
+                Some(screen),
+                capsule.left - margin,
+                capsule.top - margin,
+                SRCCOPY,
+            )
+            .is_ok();
+
             let mut luminance_sum = 0u32;
             let mut dark_samples = 0u32;
             let mut valid_samples = 0u32;
+            let (mut red_sum, mut green_sum, mut blue_sum) = (0u32, 0u32, 0u32);
 
-            for x_step in 1..=7 {
-                for y_step in 1..=3 {
-                    let x = capsule.left + width * x_step / 8;
-                    let y = capsule.top + height * y_step / 4;
-                    let color = GetPixel(screen, x, y).0;
+            if copied {
+                for (x, y) in probes {
+                    let color = GetPixel(memory, x, y).0;
                     if color == u32::MAX {
                         continue;
                     }
@@ -1387,17 +1391,104 @@ mod platform {
                     luminance_sum += luminance;
                     dark_samples += u32::from(luminance < 148);
                     valid_samples += 1;
+                    red_sum += red;
+                    green_sum += green;
+                    blue_sum += blue;
                 }
             }
 
+            SelectObject(memory, replaced);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory);
             let _ = ReleaseDC(None, screen);
+
             if valid_samples == 0 {
-                return false;
+                return fallback;
             }
 
-            let average_luminance = luminance_sum / valid_samples;
-            average_luminance < 150 || dark_samples * 2 >= valid_samples
+            let channel = |sum: u32| (sum / valid_samples).min(255) as u8;
+            BackgroundReading {
+                dark: decide_dark_background(
+                    luminance_sum / valid_samples,
+                    dark_samples,
+                    valid_samples,
+                    previous,
+                ),
+                tint: {
+                    let tint = liquid_glass::Tint::from_background(
+                        channel(red_sum),
+                        channel(green_sum),
+                        channel(blue_sum),
+                    );
+                    if previous.is_some() {
+                        tint.quantized_near(glass_tint())
+                    } else {
+                        tint.quantized()
+                    }
+                },
+            }
         }
+    }
+
+    /// Keeps the palette in step with whatever ends up behind the capsule while it is
+    /// on screen. The one-shot sample in `begin_input` only sees the desktop at the
+    /// instant the overlay opens; without this the glass keeps that opening palette even
+    /// after a window is dragged underneath it.
+    fn start_background_sampler_thread(hwnd_value: isize) {
+        thread::spawn(move || {
+            let hwnd = HWND(hwnd_value as *mut c_void);
+            let mut tint_settler = super::glass_background::TintSettler::default();
+            loop {
+                if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                    let generation = overlay_generation();
+                    let reading = sample_background(hwnd, Some(dark_background()));
+                    // Reject a capture that finished after a hide or a new session.
+                    if overlay_generation() == generation
+                        && unsafe { IsWindowVisible(hwnd) }.as_bool()
+                    {
+                        set_dark_background(reading.dark);
+                        let current = glass_tint();
+                        set_glass_tint(tint_settler.observe(reading.tint, current));
+                    } else {
+                        tint_settler.reset();
+                    }
+                    thread::sleep(BACKGROUND_SAMPLE_INTERVAL);
+                } else {
+                    tint_settler.reset();
+                    thread::sleep(BACKGROUND_IDLE_INTERVAL);
+                }
+            }
+        });
+    }
+
+    /// Advances the displayed palette towards whatever the probes have settled on.
+    ///
+    /// This is deliberately a thread of its own. Reading the desktop is the one slow
+    /// step here, and a walk sharing a thread with it inherits every stall: the palette
+    /// lurches forward in bursts between reads, which is the jump it exists to remove
+    /// wearing a different shape. Separated, the walk keeps its cadence no matter what
+    /// sampling costs.
+    fn start_glass_transition_thread(hwnd_value: isize) {
+        thread::spawn(move || {
+            let hwnd = HWND(hwnd_value as *mut c_void);
+            loop {
+                if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                    thread::sleep(BACKGROUND_IDLE_INTERVAL);
+                    continue;
+                }
+
+                let target = if dark_background() {
+                    GLASS_MIX_STEPS
+                } else {
+                    0
+                };
+                let level = glass_mix_level();
+                if level != target {
+                    set_glass_mix_level(step_glass_mix_level(level, target));
+                }
+                thread::sleep(GLASS_TRANSITION_STEP);
+            }
+        });
     }
 
     fn capsule_screen_rect(hwnd: HWND) -> Option<RECT> {
@@ -1419,218 +1510,6 @@ mod platform {
             right: left + width,
             bottom: top + height,
         })
-    }
-
-    fn backdrop_hwnd(_overlay: HWND) -> HWND {
-        HWND(BACKDROP_HWND.load(Ordering::Acquire) as *mut c_void)
-    }
-
-    fn hide_backdrop(backdrop: HWND) {
-        unsafe {
-            let _ = ShowWindow(backdrop, SW_HIDE);
-        }
-    }
-
-    fn show_backdrop_below_overlay(backdrop: HWND, overlay: HWND) {
-        unsafe {
-            let _ = ShowWindow(backdrop, SW_SHOWNOACTIVATE);
-            let _ = SetWindowPos(
-                backdrop,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-            let _ = SetWindowPos(
-                overlay,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-    }
-
-    fn start_backdrop_thread(overlay_value: isize, backdrop_value: isize) {
-        thread::spawn(move || unsafe {
-            let overlay = HWND(overlay_value as *mut c_void);
-            let backdrop = HWND(backdrop_value as *mut c_void);
-            let mut source = HWND::default();
-            let mut thumbnails: Option<Vec<isize>> = None;
-
-            loop {
-                if IsWindowVisible(overlay).as_bool() {
-                    let window_below = window_beneath_capsule(overlay, backdrop);
-                    let binding_is_current = thumbnails
-                        .as_ref()
-                        .is_some_and(|handles| update_live_backdrop(handles, backdrop, source));
-                    if window_below != source || !binding_is_current {
-                        hide_backdrop(backdrop);
-                        if let Some(handles) = thumbnails.take() {
-                            unregister_live_backdrop(handles);
-                        }
-                        thumbnails = register_live_backdrop(backdrop, window_below);
-                        source = if thumbnails.is_some() {
-                            window_below
-                        } else {
-                            HWND::default()
-                        };
-                    }
-                    if thumbnails.is_some() && !IsWindowVisible(backdrop).as_bool() {
-                        show_backdrop_below_overlay(backdrop, overlay);
-                    }
-                } else if IsWindowVisible(backdrop).as_bool() {
-                    hide_backdrop(backdrop);
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-        });
-    }
-
-    fn window_beneath_capsule(overlay: HWND, backdrop: HWND) -> HWND {
-        unsafe {
-            let mut capsule = RECT::default();
-            if GetWindowRect(backdrop, &mut capsule).is_err() {
-                return HWND::default();
-            }
-            let center_x = (capsule.left + capsule.right) / 2;
-            let center_y = (capsule.top + capsule.bottom) / 2;
-            let mut candidate = GetWindow(overlay, GW_HWNDNEXT).unwrap_or_default();
-
-            while !candidate.is_invalid() {
-                if candidate != overlay
-                    && candidate != backdrop
-                    && IsWindowVisible(candidate).as_bool()
-                {
-                    let mut bounds = RECT::default();
-                    if GetWindowRect(candidate, &mut bounds).is_ok()
-                        && center_x >= bounds.left
-                        && center_x < bounds.right
-                        && center_y >= bounds.top
-                        && center_y < bounds.bottom
-                    {
-                        return candidate;
-                    }
-                }
-                candidate = GetWindow(candidate, GW_HWNDNEXT).unwrap_or_default();
-            }
-            HWND::default()
-        }
-    }
-
-    fn register_live_backdrop(backdrop: HWND, source: HWND) -> Option<Vec<isize>> {
-        unsafe {
-            if source.is_invalid() {
-                return None;
-            }
-
-            let mut thumbnails = Vec::with_capacity(BACKDROP_SAMPLES.len());
-            for _ in BACKDROP_SAMPLES {
-                let Ok(thumbnail) = DwmRegisterThumbnail(backdrop, source) else {
-                    unregister_live_backdrop(thumbnails);
-                    return None;
-                };
-                thumbnails.push(thumbnail);
-            }
-
-            if !update_live_backdrop(&thumbnails, backdrop, source) {
-                unregister_live_backdrop(thumbnails);
-                return None;
-            }
-            Some(thumbnails)
-        }
-    }
-
-    fn unregister_live_backdrop(thumbnails: Vec<isize>) {
-        unsafe {
-            for thumbnail in thumbnails {
-                let _ = DwmUnregisterThumbnail(thumbnail);
-            }
-        }
-    }
-
-    fn update_live_backdrop(thumbnails: &[isize], backdrop: HWND, source: HWND) -> bool {
-        unsafe {
-            if thumbnails.len() != BACKDROP_SAMPLES.len() {
-                return false;
-            }
-
-            let mut source_window = RECT::default();
-            let mut backdrop_window = RECT::default();
-            if GetWindowRect(source, &mut source_window).is_err()
-                || GetWindowRect(backdrop, &mut backdrop_window).is_err()
-            {
-                return false;
-            }
-
-            if backdrop_window.left < source_window.left
-                || backdrop_window.top < source_window.top
-                || backdrop_window.right > source_window.right
-                || backdrop_window.bottom > source_window.bottom
-            {
-                return false;
-            }
-
-            let destination_width = backdrop_window.right - backdrop_window.left;
-            let destination_height = backdrop_window.bottom - backdrop_window.top;
-            let inset_x = (destination_width / 24).max(3);
-            let inset_y = (destination_height / 8).max(1);
-            let source_left = backdrop_window.left - source_window.left + inset_x;
-            let source_top = backdrop_window.top - source_window.top + inset_y;
-            let source_width = destination_width - inset_x * 2;
-            let source_height = destination_height - inset_y * 2;
-            let source_window_width = source_window.right - source_window.left;
-            let source_window_height = source_window.bottom - source_window.top;
-
-            thumbnails.iter().zip(BACKDROP_SAMPLES).enumerate().all(
-                |(index, (thumbnail, (offset_x, offset_y, light_opacity)))| {
-                    let sample_left = source_left + offset_x;
-                    let sample_top = source_top + offset_y;
-                    if sample_left < 0
-                        || sample_top < 0
-                        || sample_left + source_width > source_window_width
-                        || sample_top + source_height > source_window_height
-                    {
-                        return false;
-                    }
-
-                    let opacity = if index == 0 {
-                        255
-                    } else if dark_background() {
-                        52
-                    } else {
-                        light_opacity
-                    };
-                    let properties = DWM_THUMBNAIL_PROPERTIES {
-                        dwFlags: DWM_TNP_RECTDESTINATION
-                            | DWM_TNP_RECTSOURCE
-                            | DWM_TNP_OPACITY
-                            | DWM_TNP_VISIBLE
-                            | DWM_TNP_SOURCECLIENTAREAONLY,
-                        rcDestination: RECT {
-                            left: 0,
-                            top: 0,
-                            right: destination_width,
-                            bottom: destination_height,
-                        },
-                        rcSource: RECT {
-                            left: sample_left,
-                            top: sample_top,
-                            right: sample_left + source_width,
-                            bottom: sample_top + source_height,
-                        },
-                        opacity,
-                        fVisible: BOOL(1),
-                        fSourceClientAreaOnly: BOOL(0),
-                    };
-                    DwmUpdateThumbnailProperties(*thumbnail, &properties).is_ok()
-                },
-            )
-        }
     }
 
     fn finish_input_hwnd(hwnd: HWND) {
@@ -1710,9 +1589,99 @@ mod tests {
     use super::{
         BAR_COUNT, OverlayPhase, VoiceHotkeyAction, VoiceTranscript, decoded_voice_activity,
         is_partial_speech_line, is_strong_voice_activity_line, overlay_phase_from_bridge_line,
-        transcript_presentation, voice_activity_from_audio_line, voice_hotkey_action,
+        lerp_rgba, transcript_presentation, voice_activity_from_audio_line, voice_hotkey_action,
         waveform_bar_height,
     };
+    #[cfg(target_os = "windows")]
+    use super::{GLASS_MIX_STEPS, decide_dark_background, step_glass_mix_level};
+
+    /// A ring where only a couple of probes read dark, so the majority rule stays out of
+    /// the way and the luminance thresholds are what actually decide.
+    #[cfg(target_os = "windows")]
+    const MIXED_RING: (u32, u32) = (2, 14);
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_first_look_uses_one_threshold() {
+        let (dark, valid) = MIXED_RING;
+        assert!(decide_dark_background(140, dark, valid, None));
+        assert!(!decide_dark_background(160, dark, valid, None));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hysteresis_holds_the_palette_through_a_borderline_background() {
+        let (dark, valid) = MIXED_RING;
+        // 140 would read as dark on a first look, but is not dark enough to pull an
+        // already-light capsule across.
+        assert!(!decide_dark_background(140, dark, valid, Some(false)));
+        // 160 would read as light on a first look, yet leaves a dark capsule dark.
+        assert!(decide_dark_background(160, dark, valid, Some(true)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_clearly_changed_background_still_switches_the_palette() {
+        let (dark, valid) = MIXED_RING;
+        assert!(decide_dark_background(120, dark, valid, Some(false)));
+        assert!(!decide_dark_background(175, dark, valid, Some(true)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_mostly_dark_ring_wins_over_a_bright_average() {
+        assert!(decide_dark_background(180, 9, 14, Some(false)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn losing_every_probe_keeps_the_current_palette() {
+        assert!(decide_dark_background(0, 0, 0, Some(true)));
+        assert!(!decide_dark_background(0, 0, 0, Some(false)));
+        assert!(!decide_dark_background(0, 0, 0, None));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_walk_moves_one_step_and_stops_on_arrival() {
+        assert_eq!(step_glass_mix_level(0, GLASS_MIX_STEPS), 1);
+        assert_eq!(step_glass_mix_level(GLASS_MIX_STEPS, 0), GLASS_MIX_STEPS - 1);
+        assert_eq!(step_glass_mix_level(5, 5), 5);
+        // The step before arrival lands exactly on the target rather than past it.
+        assert_eq!(step_glass_mix_level(GLASS_MIX_STEPS - 1, GLASS_MIX_STEPS), GLASS_MIX_STEPS);
+        assert_eq!(step_glass_mix_level(1, 0), 0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_walk_reaches_either_end_in_exactly_one_ladder() {
+        for (start, target) in [(0, GLASS_MIX_STEPS), (GLASS_MIX_STEPS, 0)] {
+            let mut level = start;
+            let mut steps = 0;
+            while level != target {
+                level = step_glass_mix_level(level, target);
+                steps += 1;
+                assert!(steps <= GLASS_MIX_STEPS, "the walk never arrived");
+            }
+            assert_eq!(steps, GLASS_MIX_STEPS);
+        }
+    }
+
+    #[test]
+    fn colour_interpolation_carries_alpha_and_holds_both_ends() {
+        assert_eq!(lerp_rgba(0x07131ff5, 0xffffffff, 0.0), 0x07131ff5);
+        assert_eq!(lerp_rgba(0x07131ff5, 0xffffffff, 1.0), 0xffffffff);
+        // Alpha is the low byte and has to travel with the colour, not stay put.
+        let middle = lerp_rgba(0x00000000, 0xffffffff, 0.5);
+        assert_eq!(middle & 0xff, 128);
+        assert_eq!((middle >> 24) & 0xff, 128);
+    }
+
+    #[test]
+    fn colour_interpolation_clamps_out_of_range_positions() {
+        assert_eq!(lerp_rgba(0x11223344, 0xaabbccdd, -1.0), 0x11223344);
+        assert_eq!(lerp_rgba(0x11223344, 0xaabbccdd, 2.0), 0xaabbccdd);
+    }
 
     #[test]
     fn transcript_tracks_partial_committed_and_final_text() {
