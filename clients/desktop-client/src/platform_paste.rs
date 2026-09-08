@@ -293,6 +293,8 @@ mod implementation {
 mod implementation {
     use std::sync::Mutex;
 
+    use crate::linux_notification;
+
     /// Linux delivers text through fcitx5, which already owns the input focus
     /// of every application on the desktop, so there is no per-window target to
     /// capture the way Windows captures a foreground `HWND`.
@@ -312,9 +314,11 @@ mod implementation {
         /// was focused.
         fn update_preedit(&self, text: &str) -> zbus::Result<bool>;
 
-        /// Withdraws the preedit and commits `text`. `false` means nothing was
-        /// focused, so the text was not delivered anywhere.
-        fn commit_string(&self, text: &str) -> zbus::Result<bool>;
+        /// Withdraws the preedit and delivers `text`. Answers "committed" when
+        /// it reached the focused application, or "held" when nothing was
+        /// focused and the addon kept it for the next application to be
+        /// focused.
+        fn commit_string(&self, text: &str) -> zbus::Result<String>;
     }
 
     #[derive(Debug)]
@@ -363,19 +367,23 @@ mod implementation {
             Ok(())
         }
 
+        /// Losing a whole dictation because the focus moved is the worst thing
+        /// this path can do, so text that cannot be delivered now is kept by
+        /// the addon rather than dropped. The session log is not in front of
+        /// anyone, so say so where the user will see it.
         pub fn finish(&self, text: &str) -> Result<(), String> {
             let mut preedit = self.preedit()?;
-            let delivered = self
+            let outcome = self
                 .bridge
                 .as_ref()
                 .map_err(String::clone)?
                 .commit_string(text)
                 .map_err(describe_bridge_error)?;
             preedit.clear();
-            if !delivered {
-                return Err(
-                    "no application held the input focus, so the recognized text was not delivered"
-                        .to_string(),
+            if outcome == HELD {
+                linux_notification::show(
+                    "语音文字已保留",
+                    "刚才没有输入框处于焦点。点击任意输入框，文字会自动写入（2 分钟内有效）。",
                 );
             }
             Ok(())
@@ -406,6 +414,9 @@ mod implementation {
         VoiceBridgeProxyBlocking::new(&connection)
             .map_err(|error| format!("could not address the fcitx5 voice bridge: {error}"))
     }
+
+    /// The addon kept the text because nothing was focused to receive it.
+    const HELD: &str = "held";
 
     fn describe_bridge_error(error: zbus::Error) -> String {
         format!(

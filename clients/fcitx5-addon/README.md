@@ -22,17 +22,22 @@ address it as `org.fcitx.Fcitx5` without a second well-known name:
 | Service | `org.fcitx.Fcitx5` |
 | Path | `/voicebridge` |
 | Interface | `local.doubao.VoiceBridge1` |
-| Methods | `UpdatePreedit(s text) -> b shown`, `CommitString(s text) -> b delivered`, `FocusedProgram() -> s` |
+| Methods | `UpdatePreedit(s text) -> b shown`, `CommitString(s text) -> s outcome`, `FocusedProgram() -> s` |
 
 `UpdatePreedit` shows `text` as provisional preedit in the focused application
 and remembers which input context it went to, so moving the focus mid-dictation
 withdraws it rather than stranding it. An empty `text` withdraws the preedit,
 addressed to the context still showing it rather than to whatever is focused
-now. `CommitString` withdraws the preedit and commits the text.
+now. `shown` is `false` when no application holds the input focus.
 
-The boolean is `false` when no application holds the input focus, which leaves
-the text with the caller instead of dropping it. An empty `text` commits
-nothing, so `CommitString("")` is a side-effect-free focus probe.
+`CommitString` withdraws the preedit and delivers the text. It answers
+`committed` when the text reached the focused application, or `held` when
+nothing was focused: rather than drop a whole dictation because the focus
+moved, the addon keeps the text and writes it into the next application to
+take the input focus, expiring it after two minutes so a forgotten dictation
+cannot surface much later out of context. An empty `text` commits nothing, so
+`CommitString("")` is a side-effect-free focus probe.
+
 `FocusedProgram` names the focused application, which turns "the text went
 nowhere" into a diagnosable answer.
 

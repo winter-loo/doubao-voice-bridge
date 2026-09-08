@@ -146,9 +146,13 @@ through their fcitx5 input-method modules, XWayland applications through XIM,
 and native Wayland applications through the IBus channel fcitx5 serves. Nothing
 touches the clipboard, and no input-injection permission is involved.
 
-If no application holds the input focus when the session finishes, the text is
-not committed anywhere and the session reports that. To see what fcitx5
-considers focused:
+If no application holds the input focus when the session finishes -- the focus
+moved to another window mid-dictation, say -- the text is not dropped. The
+addon keeps it and writes it into the next application to take the input focus,
+for up to two minutes, and the client raises a desktop notification saying so.
+Clicking back into the field being dictated into delivers the text there.
+
+To see what fcitx5 considers focused:
 
 ```bash
 busctl --user call org.fcitx.Fcitx5 /voicebridge \

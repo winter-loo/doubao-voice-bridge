@@ -30,6 +30,8 @@ mod linux_gnome_shortcuts;
 #[cfg(any(target_os = "linux", test))]
 mod linux_shortcut;
 #[cfg(target_os = "linux")]
+mod linux_notification;
+#[cfg(target_os = "linux")]
 mod linux_text_input;
 #[cfg(target_os = "linux")]
 mod linux_tray;
