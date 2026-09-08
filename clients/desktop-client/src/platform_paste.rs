@@ -291,6 +291,8 @@ mod implementation {
 
 #[cfg(target_os = "linux")]
 mod implementation {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     /// Linux delivers text through fcitx5, which already owns the input focus
     /// of every application on the desktop, so there is no per-window target to
     /// capture the way Windows captures a foreground `HWND`.
@@ -305,24 +307,44 @@ mod implementation {
         default_path = "/voicebridge"
     )]
     trait VoiceBridge {
-        /// Commits `text` into the focused application. `false` means nothing
-        /// was focused, so the text was not delivered anywhere.
+        /// Shows `text` in the focused application as provisional preedit, or
+        /// withdraws the preedit when `text` is empty. `false` means nothing
+        /// was focused.
+        fn update_preedit(&self, text: &str) -> zbus::Result<bool>;
+
+        /// Withdraws the preedit and commits `text`. `false` means nothing was
+        /// focused, so the text was not delivered anywhere.
         fn commit_string(&self, text: &str) -> zbus::Result<bool>;
     }
 
     #[derive(Debug)]
     pub struct RealtimeTextOutput {
         bridge: Result<VoiceBridgeProxyBlocking<'static>, String>,
+        /// Whether a preedit is outstanding, so an abandoned session withdraws
+        /// it instead of stranding provisional text in the application.
+        preedit_shown: AtomicBool,
     }
 
     impl RealtimeTextOutput {
         pub fn new(_target: PasteTarget) -> Self {
-            Self { bridge: connect() }
+            Self {
+                bridge: connect(),
+                preedit_shown: AtomicBool::new(false),
+            }
         }
 
-        /// Partial recognition is not written to the focused application yet.
-        /// Showing it there as provisional preedit lands with the next layer.
-        pub fn update(&self, _text: &str) -> Result<(), String> {
+        /// Each bridge event carries the whole recognition so far, so the
+        /// preedit is replaced wholesale. Unlike the Windows keystroke path,
+        /// revising the text needs no erasure of what was written before.
+        pub fn update(&self, text: &str) -> Result<(), String> {
+            let shown = self
+                .bridge
+                .as_ref()
+                .map_err(String::clone)?
+                .update_preedit(text)
+                .map_err(describe_bridge_error)?;
+            self.preedit_shown
+                .store(shown && !text.is_empty(), Ordering::Release);
             Ok(())
         }
 
@@ -332,12 +354,8 @@ mod implementation {
                 .as_ref()
                 .map_err(String::clone)?
                 .commit_string(text)
-                .map_err(|error| {
-                    format!(
-                        "could not hand the text to fcitx5; build and install the addon from \
-                         clients/fcitx5-addon, then restart fcitx5 ({error})"
-                    )
-                })?;
+                .map_err(describe_bridge_error)?;
+            self.preedit_shown.store(false, Ordering::Release);
             if !delivered {
                 return Err(
                     "no application held the input focus, so the recognized text was not delivered"
@@ -348,11 +366,29 @@ mod implementation {
         }
     }
 
+    impl Drop for RealtimeTextOutput {
+        fn drop(&mut self) {
+            if !self.preedit_shown.load(Ordering::Acquire) {
+                return;
+            }
+            if let Ok(bridge) = &self.bridge {
+                let _ = bridge.update_preedit("");
+            }
+        }
+    }
+
     fn connect() -> Result<VoiceBridgeProxyBlocking<'static>, String> {
         let connection = zbus::blocking::Connection::session()
             .map_err(|error| format!("could not reach the session bus: {error}"))?;
         VoiceBridgeProxyBlocking::new(&connection)
             .map_err(|error| format!("could not address the fcitx5 voice bridge: {error}"))
+    }
+
+    fn describe_bridge_error(error: zbus::Error) -> String {
+        format!(
+            "could not hand the text to fcitx5; build and install the addon from \
+             clients/fcitx5-addon, then restart fcitx5 ({error})"
+        )
     }
 }
 

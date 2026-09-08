@@ -132,7 +132,14 @@ The default PipeWire/PulseAudio microphone is selected automatically. Set
 `DOUBAO_VOICE_INPUT_DEVICE` to an exact CPAL device name to override it. The
 audio port can be changed with `DOUBAO_BRIDGE_AUDIO_PORT`.
 
-When a session finishes, the client calls `CommitString` on the addon and
+While a session runs, each recognition update is shown in the focused
+application as provisional preedit, the same underlined text an input method
+shows for what is still being typed. Every bridge event carries the whole
+recognition so far, so the preedit is replaced wholesale and revisions need no
+erasure of what was already written. When the session finishes, the preedit is
+withdrawn and the final text is committed. Abandoning a session withdraws the
+preedit instead of stranding it.
+
 fcitx5 inserts the text into whatever application holds the input focus, the
 same way it inserts what a user types. This reaches GTK and Qt applications
 through their fcitx5 input-method modules, XWayland applications through XIM,

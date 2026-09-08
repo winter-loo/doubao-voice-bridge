@@ -10,6 +10,9 @@
 #include <fcitx-utils/dbus/objectvtable.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/inputcontext.h>
+#include <fcitx/inputpanel.h>
+#include <fcitx/text.h>
+#include <fcitx/userinterface.h>
 
 namespace doubao {
 
@@ -17,6 +20,29 @@ namespace {
 
 constexpr char VoiceBridgeObjectPath[] = "/voicebridge";
 constexpr char VoiceBridgeInterface[] = "local.doubao.VoiceBridge1";
+
+/// Applications that render preedit themselves get it inline; the rest get it
+/// in fcitx5's own input panel, which is the only feedback they can show.
+void showPreedit(fcitx::InputContext *inputContext, const std::string &text) {
+    fcitx::Text preedit;
+    preedit.append(text, fcitx::TextFormatFlag::Underline);
+    preedit.setCursor(static_cast<int>(text.size()));
+    if (inputContext->capabilityFlags().test(fcitx::CapabilityFlag::Preedit)) {
+        inputContext->inputPanel().setClientPreedit(preedit);
+    } else {
+        inputContext->inputPanel().setPreedit(preedit);
+    }
+    inputContext->updatePreedit();
+    inputContext->updateUserInterface(
+        fcitx::UserInterfaceComponent::InputPanel);
+}
+
+void clearPreedit(fcitx::InputContext *inputContext) {
+    inputContext->inputPanel().reset();
+    inputContext->updatePreedit();
+    inputContext->updateUserInterface(
+        fcitx::UserInterfaceComponent::InputPanel);
+}
 
 } // namespace
 
@@ -27,6 +53,10 @@ class VoiceBridgeService
 public:
     explicit VoiceBridgeService(VoiceBridge *parent) : parent_(parent) {}
 
+    bool updatePreedit(const std::string &text) {
+        return parent_->updatePreedit(text);
+    }
+
     bool commitString(const std::string &text) {
         return parent_->commitString(text);
     }
@@ -34,6 +64,7 @@ public:
     std::string focusedProgram() { return parent_->focusedProgram(); }
 
 private:
+    FCITX_OBJECT_VTABLE_METHOD(updatePreedit, "UpdatePreedit", "s", "b");
     FCITX_OBJECT_VTABLE_METHOD(commitString, "CommitString", "s", "b");
     FCITX_OBJECT_VTABLE_METHOD(focusedProgram, "FocusedProgram", "", "s");
 
@@ -51,7 +82,34 @@ VoiceBridge::VoiceBridge(fcitx::Instance *instance)
 
 VoiceBridge::~VoiceBridge() = default;
 
+void VoiceBridge::withdrawPreedit() {
+    if (auto *shownIn = preeditContext_.get()) {
+        clearPreedit(shownIn);
+    }
+    preeditContext_.unwatch();
+}
+
+bool VoiceBridge::updatePreedit(const std::string &text) {
+    // Withdrawing is addressed to whichever context still shows the preedit,
+    // not to whatever happens to be focused now.
+    if (text.empty()) {
+        withdrawPreedit();
+        return true;
+    }
+    auto *inputContext = instance_->lastFocusedInputContext();
+    if (inputContext == nullptr || !inputContext->hasFocus()) {
+        return false;
+    }
+    if (preeditContext_.get() != inputContext) {
+        withdrawPreedit();
+        preeditContext_ = inputContext->watch();
+    }
+    showPreedit(inputContext, text);
+    return true;
+}
+
 bool VoiceBridge::commitString(const std::string &text) {
+    withdrawPreedit();
     auto *inputContext = instance_->lastFocusedInputContext();
     if (inputContext == nullptr || !inputContext->hasFocus()) {
         return false;

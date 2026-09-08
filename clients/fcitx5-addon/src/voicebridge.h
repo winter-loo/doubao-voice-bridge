@@ -7,8 +7,10 @@
 #include <memory>
 #include <string>
 
+#include <fcitx-utils/trackableobject.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/addonmanager.h>
+#include <fcitx/inputcontext.h>
 #include <fcitx/instance.h>
 
 #include "dbus_public.h"
@@ -25,8 +27,15 @@ public:
     explicit VoiceBridge(fcitx::Instance *instance);
     ~VoiceBridge() override;
 
-    /// Commits `text` to the focused application. Returns false when no
-    /// application is focused, which leaves the text with the caller.
+    /// Shows `text` in the focused application as provisional preedit, the
+    /// same way an input method shows what is still being typed. An empty
+    /// `text` withdraws the preedit instead. Returns false when no application
+    /// is focused.
+    bool updatePreedit(const std::string &text);
+
+    /// Withdraws any outstanding preedit and commits `text` to the focused
+    /// application. Returns false when no application is focused, which leaves
+    /// the text with the caller.
     bool commitString(const std::string &text);
 
     /// Names the application that currently owns the input focus, as its
@@ -37,8 +46,15 @@ public:
 private:
     FCITX_ADDON_DEPENDENCY_LOADER(dbus, instance_->addonManager());
 
+    /// Withdraws the preedit from whichever input context is still showing
+    /// one, so moving the focus mid-dictation never strands provisional text.
+    void withdrawPreedit();
+
     fcitx::Instance *instance_;
     std::unique_ptr<VoiceBridgeService> service_;
+    /// The input context the preedit was last shown in. Weak, because an
+    /// application can disappear between two recognition updates.
+    fcitx::TrackableObjectReference<fcitx::InputContext> preeditContext_;
 };
 
 } // namespace doubao
