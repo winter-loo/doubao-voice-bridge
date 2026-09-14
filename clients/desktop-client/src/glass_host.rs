@@ -7,6 +7,8 @@
 //! to the solid material when any part of initialization is unavailable.
 
 use std::{cell::RefCell, ffi::c_void};
+#[path = "glass_host_probe.rs"]
+mod probe;
 use windows::{
     System::{DispatcherQueue, DispatcherQueueController},
     UI::Composition::{
@@ -91,6 +93,7 @@ pub struct HostBackdrop {
     visual: SpriteVisual,
     geometry: CompositionRoundedRectangleGeometry,
     _opt_in: HostOptIn,
+    probe: Option<probe::Probe>,
 }
 
 impl HostBackdrop {
@@ -112,14 +115,57 @@ impl HostBackdrop {
         checked(visual.SetClip(&clip), "attach compositor capsule clip")?;
         let brush = checked(compositor.CreateHostBackdropBrush(), "create native host backdrop brush")?;
         checked(visual.SetBrush(&brush), "attach native host backdrop brush")?;
-        let mut surface = Self { identity, target, compositor, visual, geometry, _opt_in: opt_in };
+        let mut surface = Self { identity, target, compositor, visual, geometry, _opt_in: opt_in, probe: None };
         surface.resize(width, height)?;
         checked(surface.target.SetRoot(&surface.visual), "attach lower visual tree")?;
+        // Explicit preview-only opt-in. Ordinary client/preview startup is unchanged.
+        surface.probe = probe::Probe::from_args()?;
         eprintln!("[glass-host] native brush attached; compositor capsule clip; legacy-acrylic=off");
         Ok(surface)
     }
 
     pub fn identity(&self) -> isize { self.identity }
+
+    pub fn has_armed_probe(&self) -> bool {
+        self.probe.as_ref().is_some_and(probe::Probe::armed)
+    }
+
+    /// One diagnostic request, serviced on the owning GPUI UI thread. These are
+    /// resource replacements, not a production recovery policy. Neither detaches
+    /// the HWND, disables host backdrop, clears the root, nor redraws the source.
+    pub fn service_probe(&mut self) -> Result<(), String> {
+        let Some(mode) = (match self.probe.as_mut() {
+            Some(probe) => probe.take_request()?, None => None,
+        }) else { return Ok(()); };
+        let started = std::time::Instant::now();
+        let result = self.replace_probe_resource(mode);
+        let signal = self.probe.as_ref().expect("active probe").finish(result.is_ok());
+        eprintln!("[glass-host-probe] mode={mode:?}; applied={}; call-us={}; error={:?}",
+            result.is_ok(), started.elapsed().as_micros(), result.as_ref().err());
+        // Acknowledgement means the API call returned, NOT that pixels presented.
+        result.and(signal)
+    }
+
+    fn replace_probe_resource(&mut self, mode: probe::Mode) -> Result<(), String> {
+        let brush = checked(self.compositor.CreateHostBackdropBrush(), "create replacement host brush")?;
+        match mode {
+            probe::Mode::Brush => checked(self.visual.SetBrush(&brush), "replace host brush"),
+            probe::Mode::Visual => {
+                let replacement = checked(self.compositor.CreateSpriteVisual(), "create replacement visual")?;
+                checked(replacement.SetSize(checked(self.visual.Size(), "read existing size")?), "copy visual size")?;
+                checked(replacement.SetOffset(checked(self.visual.Offset(), "read existing offset")?), "copy visual offset")?;
+                checked(replacement.SetOpacity(checked(self.visual.Opacity(), "read existing opacity")?), "copy visual opacity")?;
+                let clip = checked(self.visual.Clip(), "read existing capsule clip")?;
+                checked(replacement.SetClip(&clip), "copy capsule clip")?;
+                checked(replacement.SetBrush(&brush), "attach replacement brush")?;
+                // Fully configure before replacing the root. Never present an
+                // intentionally empty tree or an unclipped intermediate visual.
+                checked(self.target.SetRoot(&replacement), "replace lower visual root")?;
+                self.visual = replacement;
+                Ok(())
+            }
+        }
+    }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
         let mut rect = RECT::default();
