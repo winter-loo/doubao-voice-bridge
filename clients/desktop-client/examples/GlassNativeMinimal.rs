@@ -5,6 +5,14 @@
 //! backdrop + system Gaussian effect. No recovery operation is performed.
 //! Compare startup to warm pixels WITHIN each mode; a constant output is not a pass.
 
+// windows-implement expands absolute ::windows_core paths. This diagnostic-only
+// crate facade reexports the EXACT runtime used by windows 0.61; it introduces
+// no second windows-core dependency/version or product lockfile change.
+#[cfg(target_os = "windows")]
+extern crate self as windows_core;
+#[cfg(target_os = "windows")]
+pub use windows::core::*;
+
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 #[path = "../src/glass_host.rs"]
@@ -90,10 +98,9 @@ mod native {
 
     unsafe extern "system" fn procedure(hwnd: isize, msg: u32, w: usize, l: isize) -> isize {
         match msg {
-            // Leave the HWND alive until the visual is detached during cleanup.
             0x0010 | 0x0202 => { unsafe { PostQuitMessage(0); } 0 }
             0x0113 if w == 1 => { unsafe { PostQuitMessage(0); } 0 }
-            0x0014 => 1, // WM_ERASEBKGND: no GDI background or redirection bitmap.
+            0x0014 => 1,
             0x000F => {
                 let mut paint: Paint = unsafe { std::mem::zeroed() };
                 if unsafe { BeginPaint(hwnd, &mut paint) } != 0 {
