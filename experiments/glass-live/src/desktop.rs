@@ -146,7 +146,7 @@ unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<
         let old_font=SelectObject(dc,HGDIOBJ(font.0));
         std::ptr::write_bytes(bits,0,(width*height*4)as usize);
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,COLORREF(0x00ffffff));
-        let mut rect=RECT{left:(height as f32*.92)as i32,top:0,right:width as i32-(height as f32*.25)as i32,bottom:height as i32};
+        let mut rect=RECT{left:(height as f32*0.92)as i32,top:0,right:width as i32-(height as f32*0.25)as i32,bottom:height as i32};
         let mut text:Vec<u16>="优化识别中".encode_utf16().collect();
         let drawn=DrawTextW(dc,&mut text,&mut rect,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         let pixels=std::slice::from_raw_parts(bits as *const u8,(width*height*4)as usize);
