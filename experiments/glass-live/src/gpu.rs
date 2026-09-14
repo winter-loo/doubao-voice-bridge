@@ -11,7 +11,8 @@ use windows::{core::{s, Interface, PCSTR}, Win32::{
 
 pub unsafe fn create_device(adapter: Option<&IDXGIAdapter1>) -> AppResult<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None; let mut context = None;
-    D3D11CreateDevice(adapter, if adapter.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_WARP },
+    let base_adapter: Option<IDXGIAdapter> = adapter.map(|a| a.cast()).transpose()?;
+    D3D11CreateDevice(base_adapter.as_ref(), if adapter.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_WARP },
         HMODULE::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, Some(&[D3D_FEATURE_LEVEL_11_0]), D3D11_SDK_VERSION,
         Some(&mut device), None, Some(&mut context))?;
     Ok((device.ok_or("D3D11 returned no device")?, context.ok_or("D3D11 returned no context")?))
