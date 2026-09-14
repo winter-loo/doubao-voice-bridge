@@ -4,6 +4,8 @@
 # -Placement compare preserves the old topmost/restack fixture and adds ordinary
 # non-topmost Show() without touching the already-topmost host's Z order.
 # This compares TWO insertion protocols, not a single-factor OS-bug proof.
+# Crops are bounded by the monitor work area in BOTH arms; ordinary paper must
+# not be asked to cover the taskbar. Host geometry and interior probes do not move.
 # UnfilteredInputMismatches tests raw transparency, NOT blur quality in native modes.
 [CmdletBinding()]
 param([string]$OutputDirectory, [string]$FfmpegPath, [switch]$CompileOnly,
@@ -55,6 +57,7 @@ public static class NativeCaptureAudit23 {
     }
     public sealed class Trial {
         public int Repeat,PaintsWhenShowReturned; public string Source,Placement,Error,Log;
+        public int[] OuterPixels,CropPixels;
         public bool HostStopped,RegionPreserved,PaperUnchangedDuringColdDda,PaperUnchangedDuringWarmDda;
         public bool SourceTopmost,HostTopmost,StackingConfigurationVerified;
         public double? GdiInitialToWarm,DdaFirstInitialToWarm,DdaLastInitialToWarm,GdiAfterDdaToWarm;
@@ -63,7 +66,7 @@ public static class NativeCaptureAudit23 {
     }
     public sealed class Report {
         public bool Completed,FocusPreserved; public string Error,Directory,ExecutableSha256,FfmpegSha256;
-        public string Scope="Native-only diagnostic. Placement restack preserves the old topmost paper Show/host-raise/paper-lower protocol; normal uses non-topmost paper Show only. Compare insertion protocols, not an isolated single flag. Host binary, geometry, colors and capture/repaint phases unchanged. Sequential GDI / four DXGI / GDI before/after TEST-source repaint. Raw mismatch counts are not blur-quality metrics. No automatic acceptance, OS-bug attribution, FPS claim or upload.";
+        public string Scope="Native-only diagnostic. Placement restack preserves the old topmost paper Show/host-raise/paper-lower protocol; normal uses non-topmost paper Show only. Compare insertion protocols, not an isolated single flag. Host binary, geometry, colors and capture/repaint phases unchanged. Crops are bounded by the monitor work area in both arms without moving the host/interior probes. Sequential GDI / four DXGI / GDI before/after TEST-source repaint. Raw mismatch counts are not blur-quality metrics. No automatic acceptance, OS-bug attribution, FPS claim or upload.";
         public Trial[] Trials;
     }
     sealed class Paper : Form {
@@ -151,7 +154,15 @@ public static class NativeCaptureAudit23 {
             Check(h!=IntPtr.Zero&&!host.HasExited,"Minimal host did not appear.");Pump(1500);
             R r;Check(GetWindowRect(h,out r),"Cannot read test host geometry.");var outer=Rectangle.FromLTRB(r.L,r.T,r.Right,r.Bottom);
             Check(outer.Width>=30&&outer.Width<=600&&outer.Height>=10&&outer.Height<=250,"Unexpected host size.");
-            var screen=Screen.PrimaryScreen.Bounds;var crop=Rectangle.Inflate(outer,24,24);Check(screen.Contains(crop),"Insufficient crop margin.");
+            var screen=Screen.PrimaryScreen.Bounds;
+            // The taskbar can cover a non-topmost source near the screen bottom.
+            // Apply the SAME bounded crop to both arms, keeping the entire host
+            // and all interior probes unchanged; never hide/reposition the taskbar.
+            var crop=Rectangle.Intersect(Rectangle.Inflate(outer,24,24),Screen.PrimaryScreen.WorkingArea);
+            Check(screen.Contains(crop)&&crop.Contains(outer)&&outer.Left-crop.Left>=4&&outer.Top-crop.Top>=4
+                &&crop.Right-outer.Right>=4&&crop.Bottom-outer.Bottom>=4,"Insufficient work-area margin; host was not moved.");
+            result.OuterPixels=new int[]{outer.Left,outer.Top,outer.Width,outer.Height};
+            result.CropPixels=new int[]{crop.Left,crop.Top,crop.Width,crop.Height};
             region=CreateRectRgn(0,0,0,0);Check(region!=IntPtr.Zero&&GetWindowRgn(h,region)>1,"No capsule region.");
             R box;Check(GetRgnBox(region,out box)>1,"No capsule bounds.");
             double cx=(box.L+box.Right)/2.0,cy=(box.T+box.Bottom)/2.0,w=box.Right-box.L,ht=box.Bottom-box.T;
@@ -268,6 +279,7 @@ $trials=@($result.Trials | ForEach-Object {
     }
     [ordered]@{Source=$t.Source;Placement=$t.Placement;Repeat=$t.Repeat;Error=$t.Error;Stopped=$t.HostStopped;
         SourceTopmost=$t.SourceTopmost;HostTopmost=$t.HostTopmost;StackingVerified=$t.StackingConfigurationVerified;PaintsAtShowReturn=$t.PaintsWhenShowReturned;
+        OuterPixels=$t.OuterPixels;CropPixels=$t.CropPixels;
         GdiInitialToWarm=$t.GdiInitialToWarm;DdaFirstInitialToWarm=$t.DdaFirstInitialToWarm;DdaLastInitialToWarm=$t.DdaLastInitialToWarm;
         ColdDdaVsGdi=$t.ColdDdaVsGdiBefore;ColdGdiChangeAcrossDda=$t.ColdGdiChangeAcrossDda;WarmDdaVsGdi=$t.WarmDdaVsGdi;
         PaperUnchangedCold=$t.PaperUnchangedDuringColdDda;RegionPreserved=$t.RegionPreserved;
