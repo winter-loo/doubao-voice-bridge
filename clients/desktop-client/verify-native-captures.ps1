@@ -1,14 +1,18 @@
 # Cross-check native-only source modes with GDI and DXGI Desktop Duplication.
 # Diagnostic only: no product changes, foreign repaint, recording, or upload.
 # -Source control alternates host/none. none has no compositor/brush/target at all.
+# -Placement compare preserves the old topmost/restack fixture and adds ordinary
+# non-topmost Show() without touching the already-topmost host's Z order.
+# This compares TWO insertion protocols, not a single-factor OS-bug proof.
 # UnfilteredInputMismatches tests raw transparency, NOT blur quality in native modes.
 [CmdletBinding()]
 param([string]$OutputDirectory, [string]$FfmpegPath, [switch]$CompileOnly,
-    [ValidateSet('host','visual-blur','none','compare','control')][string]$Source = 'host')
+    [ValidateSet('host','visual-blur','none','compare','control')][string]$Source = 'host',
+    [ValidateSet('restack','normal','compare')][string]$Placement = 'restack')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
-if (-not ('NativeCaptureAudit22' -as [type])) {
+if (-not ('NativeCaptureAudit23' -as [type])) {
 Add-Type -ReferencedAssemblies System.Drawing,System.Windows.Forms -TypeDefinition @'
 using System;
 using System.IO;
@@ -19,7 +23,7 @@ using System.Diagnostics;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
-public static class NativeCaptureAudit22 {
+public static class NativeCaptureAudit23 {
     [StructLayout(LayoutKind.Sequential)] struct R { public int L,T,Right,Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct P { public int X,Y; }
     delegate bool EnumProc(IntPtr h,IntPtr p);
@@ -30,6 +34,7 @@ public static class NativeCaptureAudit22 {
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h,out R r);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int ht,uint flags);
+    [DllImport("user32.dll",EntryPoint="GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h,int index);
     [DllImport("user32.dll")] static extern int GetWindowRgn(IntPtr h,IntPtr r);
     [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int l,int t,int r,int b);
     [DllImport("gdi32.dll")] static extern int GetRgnBox(IntPtr r,out R b);
@@ -49,20 +54,21 @@ public static class NativeCaptureAudit22 {
         public double[] LeftRgb,RightRgb;
     }
     public sealed class Trial {
-        public int Repeat; public string Source,Error,Log;
+        public int Repeat,PaintsWhenShowReturned; public string Source,Placement,Error,Log;
         public bool HostStopped,RegionPreserved,PaperUnchangedDuringColdDda,PaperUnchangedDuringWarmDda;
+        public bool SourceTopmost,HostTopmost,StackingConfigurationVerified;
         public double? GdiInitialToWarm,DdaFirstInitialToWarm,DdaLastInitialToWarm,GdiAfterDdaToWarm;
         public double? ColdDdaVsGdiBefore,ColdDdaVsGdiAfter,ColdGdiChangeAcrossDda,ColdDdaFirstToLast,WarmDdaVsGdi;
         public Sample[] Samples;
     }
     public sealed class Report {
         public bool Completed,FocusPreserved; public string Error,Directory,ExecutableSha256,FfmpegSha256;
-        public string Scope="Diagnostic source comparison including optional zero-effect HWND control. none creates no compositor, target, visual, brush or host opt-in; HWND styles, HRGN, dispatcher and source fixture stay unchanged. Sequential GDI / four DXGI frames / GDI before/after TEST-source repaint. Unfiltered mismatch counts are raw-transparency checks, not blur-quality metrics. No automatic product/visual/FPS acceptance. Local cropped PNGs only.";
+        public string Scope="Native-only diagnostic. Placement restack preserves the old topmost paper Show/host-raise/paper-lower protocol; normal uses non-topmost paper Show only. Compare insertion protocols, not an isolated single flag. Host binary, geometry, colors and capture/repaint phases unchanged. Sequential GDI / four DXGI / GDI before/after TEST-source repaint. Raw mismatch counts are not blur-quality metrics. No automatic acceptance, OS-bug attribution, FPS claim or upload.";
         public Trial[] Trials;
     }
     sealed class Paper : Form {
         public int SplitScreenX,Paints;
-        public Paper(){FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;TopMost=true;StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;DoubleBuffered=true;}
+        public Paper(bool topmost){FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;TopMost=topmost;StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;DoubleBuffered=true;}
         protected override bool ShowWithoutActivation {get{return true;}}
         protected override CreateParams CreateParams {get{var p=base.CreateParams;p.ExStyle|=0x08000080;return p;}}
         public Color Expected(int x){return x<SplitScreenX?Color.FromArgb(220,48,64):Color.FromArgb(32,112,224);}
@@ -71,6 +77,7 @@ public static class NativeCaptureAudit22 {
     }
     static void Check(bool ok,string m){if(!ok)throw new InvalidOperationException(m);}
     static uint Owner(IntPtr h){uint p;GetWindowThreadProcessId(h,out p);return p;}
+    static bool Topmost(IntPtr h){return (GetWindowLongPtr(h,-20).ToInt64()&8)!=0;}
     static IntPtr Root(int x,int y){return GetAncestor(WindowFromPoint(new P{X=x,Y=y}),2);}
     static void Pump(int ms){var t=Stopwatch.StartNew();do{Application.DoEvents();System.Threading.Thread.Sleep(10);}while(t.ElapsedMilliseconds<ms);}
     static void ClearOfOtherHosts(){
@@ -86,7 +93,8 @@ public static class NativeCaptureAudit22 {
         if(!p.WaitForExit(2500)){p.Kill();Check(p.WaitForExit(5000),"Test host did not exit.");}}
     static void LayerCheck(Rectangle crop,IntPtr host,Paper paper){
         Check(IsWindowVisible(host)&&Root(crop.Left+crop.Width/2,crop.Top+crop.Height/2)==host,"Capture center is not the test host.");
-        Check(Root(crop.Left+3,crop.Top+3)==paper.Handle&&Root(crop.Right-4,crop.Bottom-4)==paper.Handle,"Synthetic capture margins are covered.");}
+        Check(Root(crop.Left+3,crop.Top+3)==paper.Handle&&Root(crop.Right-4,crop.Bottom-4)==paper.Handle,"Synthetic capture margins are covered.");
+        Check(Topmost(host)&&Topmost(paper.Handle)==paper.TopMost,"Actual topmost configuration changed.");}
     static Bitmap Gdi(Rectangle crop,IntPtr host,Paper paper){LayerCheck(crop,host,paper);
         var b=new Bitmap(crop.Width,crop.Height,PixelFormat.Format32bppRgb);
         try{using(var g=Graphics.FromImage(b)){IntPtr src=GetDC(IntPtr.Zero),dst=IntPtr.Zero;
@@ -131,8 +139,8 @@ public static class NativeCaptureAudit22 {
         return new Sample{Name=name,Api=api,StartMs=start,EndMs=end,Paints=paper.Paints,BackgroundRowValid=valid,OutsideChanged=bad,
             ProbeCount=left.Count+right.Count,UnfilteredInputMismatches=rawBad,LeftRgb=Mean(b,left),RightRgb=Mean(b,right)};
     }
-    static Trial RunTrial(string exe,string ffmpeg,string dir,int repeat,string source){
-        var result=new Trial{Repeat=repeat,Source=source};var notes=new List<Sample>();var images=new List<Bitmap>();
+    static Trial RunTrial(string exe,string ffmpeg,string dir,int repeat,string source,string placement){
+        var result=new Trial{Repeat=repeat,Source=source,Placement=placement};var notes=new List<Sample>();var images=new List<Bitmap>();
         Process host=null;Paper paper=null;IntPtr h=IntPtr.Zero,region=IntPtr.Zero;
         System.Threading.Tasks.Task<string> logs=null,stdout=null;var clock=Stopwatch.StartNew();
         try{var si=new ProcessStartInfo(exe,"--glass-backend=native --theme=dark --content=optimizing --seconds=60 --backdrop-source="+source){
@@ -152,10 +160,24 @@ public static class NativeCaptureAudit22 {
                 double dx=Math.Abs(x+.5-cx),dy=Math.Abs(y+.5-cy);if(dx>w*.34&&dx<w*.42&&dy<ht*.16&&PtInRegion(region,x,y)){
                     var p=new Point(x+outer.Left-crop.Left,y+outer.Top-crop.Top);points.Add(p);if(x+.5<cx)left.Add(p);else right.Add(p);}}
             Check(left.Count>=20&&right.Count>=20,"Insufficient probes.");Pump(400);
-            paper=new Paper();paper.SplitScreenX=outer.Left+(int)cx;int pw=Math.Min(800,screen.Width),ph=Math.Min(340,screen.Height);
-            paper.Bounds=new Rectangle(screen.Left+(screen.Width-pw)/2,screen.Bottom-ph,pw,ph);Check(paper.Bounds.Contains(crop),"Paper does not cover crop.");
-            paper.Show();Check(SetWindowPos(h,new IntPtr(-1),0,0,0,0,0x0213),"Cannot stack host.");
-            Check(SetWindowPos(paper.Handle,h,paper.Left,paper.Top,paper.Width,paper.Height,0x0250),"Cannot stack paper.");Pump(1600);
+            Check(Topmost(h),"Host is not topmost before source creation.");
+            paper=new Paper(placement=="restack");paper.SplitScreenX=outer.Left+(int)cx;
+            int pw=Math.Min(800,screen.Width),ph=Math.Min(340,screen.Height);
+            paper.Bounds=new Rectangle(screen.Left+(screen.Width-pw)/2,screen.Bottom-ph,pw,ph);
+            Check(paper.Bounds.Contains(crop),"Paper does not cover crop.");
+            paper.Show();result.PaintsWhenShowReturned=paper.Paints;
+            if(placement=="restack"){
+                // Preserve the old fixture exactly: topmost Show(), then reorder.
+                Check(SetWindowPos(h,new IntPtr(-1),0,0,0,0,0x0213),"Cannot stack host.");
+                Check(SetWindowPos(paper.Handle,h,paper.Left,paper.Top,paper.Width,paper.Height,0x0250),"Cannot stack paper.");
+            }
+            // normal: NO host raise, source restack, explicit repaint or activation.
+            // Ordinary non-topmost windows should remain below the topmost host.
+            // Obstruction by another window is a test error, never corrected silently.
+            Pump(1600);
+            result.SourceTopmost=Topmost(paper.Handle);result.HostTopmost=Topmost(h);
+            result.StackingConfigurationVerified=result.HostTopmost&&result.SourceTopmost==(placement=="restack");
+            Check(result.StackingConfigurationVerified,"Requested source/host topmost styles were not applied.");
             for(int stage=0;stage<2;stage++){
                 if(stage==1){paper.Refresh();Pump(1600);}
                 string label=stage==0?"cold":"warm";string prefix=Path.Combine(dir,"r"+repeat+"-"+label);
@@ -195,8 +217,10 @@ public static class NativeCaptureAudit22 {
             }catch(Exception e){result.Error=(result.Error??"")+" Log: "+e.Message;}if(host!=null)host.Dispose();}
         return result;
     }
-    public static Report Run(string exe,string ffmpeg,string dir,string source){
+    public static Report Run(string exe,string ffmpeg,string dir,string source,string placement){
         Check(source=="host"||source=="visual-blur"||source=="none"||source=="compare"||source=="control","Invalid source choice.");
+        Check(placement=="restack"||placement=="normal"||placement=="compare","Invalid source-placement choice.");
+        Check(placement!="compare"||(source!="compare"&&source!="control"),"Select one backdrop source when comparing source placement.");
         Check(IntPtr.Size==8&&File.Exists(exe)&&File.Exists(ffmpeg),"64-bit PowerShell, minimal host and FFmpeg are required.");
         ClearOfOtherHosts();Check(!Directory.Exists(dir),"Refusing to overwrite output directory.");
         var report=new Report{Directory=dir};var trials=new List<Trial>();IntPtr old=IntPtr.Zero,focus=GetForegroundWindow();
@@ -207,9 +231,10 @@ public static class NativeCaptureAudit22 {
                 if(source=="compare")modes=i%2==1?new string[]{"host","visual-blur"}:new string[]{"visual-blur","host"};
                 else if(source=="control")modes=i%2==1?new string[]{"host","none"}:new string[]{"none","host"};
                 else modes=new string[]{source};
-                foreach(string mode in modes){
-                    string sub=Path.Combine(dir,mode+"-r"+i);Directory.CreateDirectory(sub);
-                    var trial=RunTrial(exe,ffmpeg,sub,i,mode);trials.Add(trial);
+                string[] placements=placement=="compare"?(i%2==1?new string[]{"restack","normal"}:new string[]{"normal","restack"}):new string[]{placement};
+                foreach(string mode in modes)foreach(string position in placements){
+                    string sub=Path.Combine(dir,mode+"-"+position+"-r"+i);Directory.CreateDirectory(sub);
+                    var trial=RunTrial(exe,ffmpeg,sub,i,mode,position);trials.Add(trial);
                     Check(trial.Error==null&&trial.HostStopped,trial.Error??"Test cleanup failed.");
                 }
             }report.Completed=true;
@@ -229,7 +254,7 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build GlassNativ
 $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
 $ffhash=(Get-FileHash -LiteralPath $FfmpegPath -Algorithm SHA256).Hash
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { $OutputDirectory=Join-Path $env:TEMP ('doubao-capture-paths-'+[Guid]::NewGuid().ToString('N')) }
-$result=[NativeCaptureAudit22]::Run($exe,$FfmpegPath,$OutputDirectory,$Source)
+$result=[NativeCaptureAudit23]::Run($exe,$FfmpegPath,$OutputDirectory,$Source,$Placement)
 $result.ExecutableSha256=$hash; $result.FfmpegSha256=$ffhash
 if (Test-Path -LiteralPath $OutputDirectory -PathType Container) { [IO.File]::WriteAllText((Join-Path $OutputDirectory 'result.json'),($result|ConvertTo-Json -Depth 8 -Compress)) }
 # Bound the paired six-trial output. Full before/after RGB and capture intervals stay local.
@@ -241,7 +266,8 @@ $trials=@($result.Trials | ForEach-Object {
         $wl=@($warm[0].LeftRgb); $wr=@($warm[0].RightRgb); $warmBad=$warm[0].UnfilteredInputMismatches
         if ($wl.Count -eq 3 -and $wr.Count -eq 3) { $order=$wl[0] -gt $wl[2] -and $wr[2] -gt $wr[0] }
     }
-    [ordered]@{Source=$t.Source;Repeat=$t.Repeat;Error=$t.Error;Stopped=$t.HostStopped;
+    [ordered]@{Source=$t.Source;Placement=$t.Placement;Repeat=$t.Repeat;Error=$t.Error;Stopped=$t.HostStopped;
+        SourceTopmost=$t.SourceTopmost;HostTopmost=$t.HostTopmost;StackingVerified=$t.StackingConfigurationVerified;PaintsAtShowReturn=$t.PaintsWhenShowReturned;
         GdiInitialToWarm=$t.GdiInitialToWarm;DdaFirstInitialToWarm=$t.DdaFirstInitialToWarm;DdaLastInitialToWarm=$t.DdaLastInitialToWarm;
         ColdDdaVsGdi=$t.ColdDdaVsGdiBefore;ColdGdiChangeAcrossDda=$t.ColdGdiChangeAcrossDda;WarmDdaVsGdi=$t.WarmDdaVsGdi;
         PaperUnchangedCold=$t.PaperUnchangedDuringColdDda;RegionPreserved=$t.RegionPreserved;
