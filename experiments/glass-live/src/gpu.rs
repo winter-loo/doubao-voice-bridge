@@ -1,5 +1,5 @@
 use crate::{ensure, AppResult};
-use std::{ffi::c_void, mem::size_of, path::Path, slice};
+use std::{mem::size_of, path::Path, slice};
 use windows::{core::{s, Interface, PCSTR}, Win32::{
     Foundation::{HMODULE, HWND},
     Graphics::{
@@ -66,11 +66,11 @@ impl Pipeline {
     pub unsafe fn new(device: ID3D11Device, context: ID3D11DeviceContext, width: u32, height: u32, mask: &[u8]) -> AppResult<Self> {
         ensure(width >= height && height >= 20 && height <= 120 && width <= 1024, "Invalid pipeline geometry")?;
         ensure(mask.len() == width as usize * height as usize, "Invalid foreground mask")?;
-        let padding = (height as f32 * .65).ceil() as u32;
+        let padding = (height as f32 * 0.65).ceil() as u32;
         let rw = width + padding * 2; let rh = height + padding * 2;
         let mut vertex = None; let b = compile(s!("fullscreen_vs"), s!("vs_5_0"))?;
         device.CreateVertexShader(blob_bytes(&b), None, Some(&mut vertex))?;
-        let mut make_ps = |entry| -> AppResult<ID3D11PixelShader> {
+        let make_ps = |entry| -> AppResult<ID3D11PixelShader> {
             let b = compile(entry, s!("ps_5_0"))?; let mut ps = None;
             device.CreatePixelShader(blob_bytes(&b), None, Some(&mut ps))?; Ok(ps.ok_or("No pixel shader")?)
         };
@@ -122,7 +122,7 @@ impl Pipeline {
     pub unsafe fn prepare(&self) {
         let mut c = self.params();
         self.pass(&self.linear, &self.convert, &[Some(self.raw.view.clone())], c);
-        for (sigma, target) in [(self.output.height as f32 * .16, &self.wide), (self.output.height as f32 * .035, &self.narrow)] {
+        for (sigma, target) in [(self.output.height as f32 * 0.16, &self.wide), (self.output.height as f32 * 0.035, &self.narrow)] {
             c.filter = [self.padding as f32, sigma.min(20.), 1., 0.];
             self.pass(&self.temporary, &self.blur, &[Some(self.linear.view.clone())], c);
             c.filter[2] = 0.; c.filter[3] = 1.;
