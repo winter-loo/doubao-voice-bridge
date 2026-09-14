@@ -1,8 +1,10 @@
 //! Reduction baseline, NOT a replacement voice client or a visual design.
 //! No GPUI Application, renderer, texture baking, animation, capture, or voice.
 //! Default 'host' retains the product's lower-target HostBackdrop setup.
-//! 'host-upper' changes ONLY the composition target slot in this bare HWND;
-//! it does not alter WS_EX_TOPMOST, and it cannot occupy GPUI's target.
+//! 'host-upper' changes only the target slot in this bare HWND.
+//! 'host-alpha100/99/50' set the lower visual opacity before attaching its root.
+//! These are not tints or recovery operations. 50% is a diagnostic stress case,
+//! not a usable glass material; less opacity also leaks unfiltered background.
 //! 'visual-blur' selects standard backdrop + system Gaussian on the lower slot.
 //! 'none' creates NO compositor, target, visual, brush or host opt-in.
 //! Compare startup to warm pixels WITHIN each mode; a constant output is not a pass.
@@ -129,7 +131,7 @@ mod native {
         let sh = unsafe { GetSystemMetrics(1) };
         require(sw >= 640 && sh >= 480, "primary monitor dimensions")?;
         // TOPMOST | TOOLWINDOW | NOACTIVATE | NOREDIRECTIONBITMAP. These stay
-        // identical in both target-slot arms. No accent, layered alpha or GDI fill.
+        // identical in all arms. No accent, layered-window alpha or GDI fill.
         let ex_style = 0x08200088;
         let raw = unsafe { CreateWindowExW(ex_style, registration.name.as_ptr(), title.as_ptr(),
             0x80000000, sw / 2 - 64, sh - 180, 128, 42, 0, 0, instance, ptr::null()) };
@@ -148,13 +150,16 @@ mod native {
             unsafe { DeleteObject(region); }
             return Err("install reduction capsule region".into());
         }
-        // Both host arms call exactly the same shared constructor and verify
-        // DesktopWindowTarget.IsTopmost. Only its creation-time bool differs.
-        // The product still calls HostBackdrop::new(), fixed to lower.
+        // Probe values are explicit, fixed before root attachment/window show.
+        // Production still calls HostBackdrop::new(), without an opacity override.
         let surface = match source {
             "host" | "host-upper" => (Some(HostBackdrop::new_for_target_probe(
                 raw, width as u32, height as u32, source == "host-upper",
             )?), None),
+            "host-alpha100" | "host-alpha99" | "host-alpha50" => {
+                let opacity = match source { "host-alpha99" => 0.99, "host-alpha50" => 0.5, _ => 1.0 };
+                (Some(HostBackdrop::new_for_opacity_probe(raw, width as u32, height as u32, opacity)?), None)
+            }
             "visual-blur" => (None, Some(VisualBlur::new(raw, width as u32, height as u32)?)),
             "none" => {
                 eprintln!("[glass-clear] compositor=absent; target=absent; visual=absent; brush=absent; host-opt-in=not-enabled");
@@ -202,8 +207,8 @@ mod native {
                 seconds = value.parse::<u32>().map_err(|_| "invalid lifetime")?;
                 if !(5..=120).contains(&seconds) { return Err("lifetime must be 5..120 seconds".into()); }
             } else if let Some(value) = arg.strip_prefix("--backdrop-source=") {
-                if !matches!(value, "host" | "host-upper" | "visual-blur" | "none") {
-                    return Err("backdrop source must be host, host-upper, visual-blur or none".into());
+                if !matches!(value, "host" | "host-upper" | "host-alpha100" | "host-alpha99" | "host-alpha50" | "visual-blur" | "none") {
+                    return Err("unsupported backdrop source".into());
                 }
                 source = value.to_owned();
             } else if !matches!(arg.as_str(), "--glass-backend=native" | "--theme=dark" | "--theme=light" | "--content=optimizing") {
