@@ -3,55 +3,98 @@
 ## A. Native readability / fallback (first acceptance gate)
 
 Branch: `feat/glass-native-fallback`. Base: PR #7 at `dfb2b6d`.
-The existing production texture entrypoint now requests GPUI's native blurred
-window background on Windows. Surface edges stay procedural and foreground is
-still rendered separately. A neutral content-protection layer is baked below
-surface highlights, rather than blurring the finished UI.
+
+### What failed on the real desktop
+
+The first implementation used GPUI 0.2.2's `Blurred` background. This enables an
+HWND-wide Acrylic accent. On the tested Windows 11 system at 150% DPI it produced
+a 214 x 76 gray rectangle, matching the entire HWND, outside the 162 x 39 capsule.
+
+Read-back of the actual window region matched the desired capsule. Reapplying
+that region with redraw and enabling WS_EX_LAYERED did not reduce the artifact:
+the original, reclip and layered cases each changed 9,452 of 25,676 measured
+outside pixels, excluding a 3px edge band. These counts do not assert that every
+pixel/color was identical across frames. This Acrylic version failed acceptance.
+Neither workaround is treated as a fix, and layered style is not enabled by the
+production implementation.
+
+### Current native candidate: clipped host-backdrop visual
+
+`glass_host.rs` uses Windows.UI.Composition's HostBackdropBrush and a capsule
+CompositionGeometricClip. It attaches to the HWND's lower composition target;
+GPUI 0.2.2 continues to own the top target for foreground text/waveform. The brush
+is clipped in its own visual tree, independently of the Win32 hit-test region.
+No desktop capture, GPU-to-CPU readback, microphone or third-party window is used
+by the native material implementation.
+
+Windows 11's documented DWMWA_USE_HOSTBACKDROPBRUSH opt-in is required. The old
+full-window Acrylic request is not used. Unsupported systems, an unavailable
+lower target, initialization errors or a disabled GPUI composition path select
+solid. A creation failure is latched for the current window to avoid retries
+on every animation frame. Restart after fixing an unavailable runtime condition.
+The custom-material branch still contains the earlier fallback revision until
+this candidate passes acceptance; do not merge unverified changes into it.
+
+The neutral content-protection layer remains beneath the procedural highlights;
+foreground text and waveforms are rendered separately and are never blurred.
 
 Select `--glass-backend=native` (default on Windows), `--glass-backend=solid`, or
 `--glass-backend=transparent` (old appearance, diagnostic ONLY). The equivalent
 process-local environment variable is `DOUBAO_GLASS_BACKEND`; CLI wins. Invalid
 values fail closed to solid. High contrast, a remote session, or disabled Windows
 transparency selects solid for native mode, checked at most once per second.
-This does not implement the full WinUI accessibility/theme policy: high-contrast
-foreground/system-color mapping and battery-saver transitions still need review.
+This is not a full accessibility policy: high-contrast foreground/system-color
+mapping and battery-saver transitions still need review.
 
-IMPORTANT: GPUI 0.2.2's setter returns no native-effect status. Its return is NOT
-an assertion that the background has blurred. If native mode is ineffective or
-shows a rectangular artifact on a target system, use solid pending a platform
-fix. Never automatically fall back to the old highly transparent material.
+IMPORTANT: a successful native visual/brush initialization is NOT visual
+acceptance. Verify actual background softening, shape and foreground readability.
+A selected Native backend and passing CI do not prove the displayed result.
+If a target device renders an unusable native material, explicitly select solid
+until the problem is resolved. Never fall back automatically to clear glass.
 
-### Safe visual preview
+### Safe visual preview and repeatable shape audit
+
+`cargo build --release --locked --bins --manifest-path clients/desktop-client/Cargo.toml`
 
 `cargo run --release --locked --manifest-path clients/desktop-client/Cargo.toml --bin GlassPreview -- --glass-backend=native --theme=light --content=cycle --seconds=60`
 
 GlassPreview is a separate binary: no microphone, voice controller, paste,
-clipboard, tray, global hotkey, production single-instance mutex, or desktop
-capture. It exits after the specified duration or a click. It uses the same
-native material and texture installation functions as the production client.
-Theme is fixed deliberately for reproducible light/dark comparisons. Waveform is
-synthetic test content, not live voice activity. Position is near the screen bottom.
+clipboard, tray, global hotkey, production singleton or desktop capture. It exits
+after its specified lifetime or a click. It shares the production material and
+texture installation functions. Theme is fixed for reproducible comparisons.
+The waveform is synthetic, not voice activity.
 
-Use Notepad dense text behind it. Compare native / transparent / solid, both
-themes, and wave / activating / optimizing text. Verify blur inside the capsule,
-untouched background outside, no rectangular bleed, stable typing focus, normal
-screen capture, and 100/125/150/200% DPI. Do NOT treat compiled code as visual
-acceptance. Do NOT infer application FPS from slow GDI screenshot samples.
+Run the persisted audit in 64-bit Windows PowerShell:
 
-Cold start still uses the caller's fallback until the async frames arrive; the
-preview uses an opaque fallback. Production's existing fallback is unchanged and
-must be checked during cold start and a policy/DPI transition.
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File clients/desktop-client/verify-native-glass.ps1`
+
+The audit requires the release preview already built. It creates its own small
+text background, tests Native/Solid in light/dark, captures only that test area,
+compares pixels outside the capsule to a background-only sample, and closes its
+test windows. It will not stop an already-running preview or the production
+client. PNGs and full logs remain in a new temporary folder; terminal output is
+bounded JSON, never image Base64. `Completed` means the audit ran, not that the
+material passed. A Solid selection is not evidence that native blur worked.
+
+Also use real Notepad dense text. Compare native / transparent / solid, both
+themes, and wave / activating / optimizing. Verify softened background within
+the capsule, untouched background outside, stable typing focus, screen recording,
+and 100/125/150/200% DPI. Do not infer application FPS from GDI screenshot samples.
+
+Cold start still uses the caller's fallback until async frames arrive; the
+preview uses an opaque fallback. Production's caller fallback is unchanged and
+must be checked during cold start and policy/DPI transitions before delivery.
 
 ## B. Custom material (separate experimental track)
 
-Branch: `feat/glass-custom-material`, developed separately and incorporating A.
-First prove deterministic fixture rendering: real input pixels, blur, capsule
-normal-driven displacement, contrast/tint, edge lighting, and opaque output in
-the lens interior. Only the boundary uses shape coverage; do not blend the sharp
-original desktop through a second time.
+Branch: `feat/glass-custom-material`. The existing offline reference and HLSL
+milestone are isolated from this native change. First tune deterministic fixtures:
+real input pixels, blur, capsule-normal displacement, contrast/tint, edge lighting,
+and opaque output in the lens interior. Only the silhouette uses shape coverage;
+do not leak the sharp original desktop through a second translucent blend.
 
 Do not enable desktop capture in the deliverable until native acceptance passes.
-Then validate a GPU-backed background source, exclusion/self-feedback, capture
+Then validate a GPU-backed backdrop source, exclusion/self-feedback, capture
 permissions and recording compatibility, HDR/color space, DPI, latency and device
 loss. Native remains available; custom failures must not block voice input.
 No promises of pixel-identical Apple behavior or unmeasured 60 fps.
