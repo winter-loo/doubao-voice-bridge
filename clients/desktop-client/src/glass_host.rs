@@ -14,7 +14,7 @@ use windows::{
         SpriteVisual,
     },
     Win32::{
-        Foundation::{BOOL, HWND, RECT},
+        Foundation::{HWND, RECT},
         Graphics::Dwm::{DWMWA_USE_HOSTBACKDROPBRUSH, DwmSetWindowAttribute},
         System::WinRT::{
             Composition::ICompositorDesktopInterop, CreateDispatcherQueueController,
@@ -22,7 +22,7 @@ use windows::{
         },
         UI::WindowsAndMessaging::GetClientRect,
     },
-    core::Interface,
+    core::{BOOL, Interface},
 };
 
 fn checked<T>(result: windows::core::Result<T>, operation: &str) -> Result<T, String> {
