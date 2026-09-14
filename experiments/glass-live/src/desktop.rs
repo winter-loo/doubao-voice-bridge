@@ -140,8 +140,8 @@ unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<
         let mut bits=std::ptr::null_mut();let bitmap=CreateDIBSection(Some(dc),&info,DIB_RGB_COLORS,&mut bits,None,0)?;
         let old=SelectObject(dc,HGDIOBJ(bitmap.0));
         let font=CreateFontW(-((if compact {11.}else{14.})*scale).round()as i32,0,0,0,500,0,0,0,
-            DEFAULT_CHARSET.0 as u32,OUT_DEFAULT_PRECIS.0 as u32,CLIP_DEFAULT_PRECIS.0 as u32,
-            ANTIALIASED_QUALITY.0 as u32,(DEFAULT_PITCH.0|FF_DONTCARE.0)as u32,w!("Microsoft YaHei UI"));
+            DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY,(DEFAULT_PITCH.0|FF_DONTCARE.0)as u32,w!("Microsoft YaHei UI"));
         if font.0.is_null(){SelectObject(dc,old);let _=DeleteObject(HGDIOBJ(bitmap.0));return Err("Text font creation failed".into());}
         let old_font=SelectObject(dc,HGDIOBJ(font.0));
         std::ptr::write_bytes(bits,0,(width*height*4)as usize);
