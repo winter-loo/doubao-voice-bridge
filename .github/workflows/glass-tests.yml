@@ -14,29 +14,29 @@ on:
     paths:
       - 'clients/desktop-client/src/liquid_glass.rs'
       - 'clients/desktop-client/src/glass_*.rs'
-      - 'clients/desktop-client/src/main.rs'
       - '.github/workflows/glass-tests.yml'
 
 permissions:
   contents: read
-
 concurrency:
   group: glass-tests-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   standalone:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Parse application source without changing formatting
-        shell: bash
-        run: rustfmt --edition=2024 --config skip_children=true --emit stdout clients/desktop-client/src/main.rs > /dev/null
-      - name: Test shading, background policy and bake coordination
+      - name: Parse application sources
         shell: bash
         run: |
-          for source in liquid_glass glass_background glass_bake; do
+          for source in main glass_preview glass_texture glass_native; do
+            rustfmt --edition=2024 --config skip_children=true --emit stdout "clients/desktop-client/src/$source.rs" > /dev/null
+          done
+      - name: Test shading, background policy, bake coordination and content protection
+        shell: bash
+        run: |
+          for source in liquid_glass glass_background glass_bake glass_policy; do
             rustc --edition=2024 --test "clients/desktop-client/src/$source.rs" -o "$RUNNER_TEMP/$source-tests"
             "$RUNNER_TEMP/$source-tests"
           done
@@ -50,5 +50,5 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
-      - name: Compile the Windows GPUI client and run glass tests
-        run: cargo test --locked --manifest-path clients/desktop-client/Cargo.toml glass_
+      - name: Compile both Windows binaries and run glass tests
+        run: cargo test --locked --bins --manifest-path clients/desktop-client/Cargo.toml glass_

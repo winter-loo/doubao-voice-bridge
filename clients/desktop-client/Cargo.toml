@@ -3,10 +3,15 @@ name = "doubao-voice-desktop-client"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "DoubaoVoiceClient"
 
 [[bin]]
 name = "DoubaoVoiceClient"
 path = "src/main.rs"
+
+[[bin]]
+name = "GlassPreview"
+path = "src/glass_preview.rs"
 
 [dependencies]
 gpui = { version = "=0.2.2", default-features = false }
