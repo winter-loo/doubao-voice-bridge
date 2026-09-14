@@ -23,6 +23,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Parse launcher under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & './experiments/glass-live/run-preview.ps1' -CompileOnly
       - name: Compile and run portable tests on Windows
         shell: pwsh
         run: |
