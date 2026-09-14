@@ -60,15 +60,32 @@ try {
             $validSource = $observed.Count -gt 0 -and @($observed | Where-Object {
                 $_.SourceMismatches -ne 0 -or $_.SourceOuterRowValid -ne $true
             }).Count -eq 0
+            $warm = @($case.Observations | Where-Object { $_.Phase -eq 'after-source-repaint' })
+            $left = @(); $right = @(); $colorOrder = $null
+            if ($warm.Count -eq 1) {
+                $left = @($warm[0].GlassLeft); $right = @($warm[0].GlassRight)
+                if ($left.Count -eq 3 -and $right.Count -eq 3) {
+                    $colorOrder = $left[0] -gt $left[2] -and $right[2] -gt $right[0]
+                }
+            }
+            # A constant/blank output could have zero startup error. Preserve
+            # actual warm RGB and expected red/blue ordering as additional
+            # evidence; the ordering alone is NOT visual/blur acceptance.
             $rows += [ordered]@{
                 Host=$kind; Trial=$case.Name; Error=$case.Error; Stopped=$case.Stopped
                 BeforeToWarm=$case.BeforeToWarm; ObserverToWarm=$case.ObserverToWarm
                 AfterWaitToWarm=$case.AfterOwnToWarm
                 SourceProbesValid=$validSource; MaxOutsideChanged=$case.MaxOutsideChanged
                 PaperPaintCounts=@($case.Observations | ForEach-Object { $_.PaperPaints })
+                WarmLeftRgb=$left; WarmRightRgb=$right; WarmRedBlueOrder=$colorOrder
             }
-            if ($kind -eq 'minimal' -and $case.Log -notmatch '\[glass-minimal\] selected=Native;') {
-                throw 'Minimal host did not report its identity; do not confuse it with the GPUI product.'
+            if ($kind -eq 'minimal') {
+                if ($case.Log -notmatch '\[glass-minimal\] selected=Native;') {
+                    throw 'Minimal host did not report its identity; do not confuse it with the GPUI product.'
+                }
+                if ($case.Log -match '\[glass-minimal\] failed:') {
+                    throw ('Minimal host reported a runtime/cleanup failure; inspect ' + $directory)
+                }
             }
         }
         if (-not $report.Completed) { throw ('Host experiment failed: ' + $report.Error) }
@@ -80,7 +97,7 @@ try {
 }
 $result = [ordered]@{
     Completed=($null -eq $failure); Error=$failure; Directory=$OutputDirectory
-    Scope='Native-path reduction, not a proposed fix. Compare startup/warm within each host, not raw color errors across different materials. Same shared source audit; GDI captures are not presentation/FPS measurements.'
+    Scope='Native-path reduction, not a proposed fix. Compare startup/warm within each host, not raw color errors across materials; an unchanged blank surface is not success. Same shared source audit; GDI captures are not presentation/FPS measurements.'
     Hosts=$hosts; Cases=$rows; VisualAcceptance='not_evaluated'
 }
 $json = $result | ConvertTo-Json -Depth 6 -Compress
