@@ -1,10 +1,9 @@
 //! A native backdrop VISUAL, not an Acrylic accent attached to the whole HWND.
 //!
-//! GPUI 0.2.2 owns the HWND's top DirectComposition target. This module uses the
-//! lower target and clips its own brush in the composition tree. It does not
-//! capture the desktop, read background pixels, or touch another process.
-//! Windows 11's documented host-backdrop opt-in is required; callers fail closed
-//! to the solid material when any part of initialization is unavailable.
+//! GPUI 0.2.2 owns the HWND's top DirectComposition target. Product construction
+//! keeps the lower target and clips its own brush in the composition tree.
+//! The explicit target probe is for the bare HWND example, never the GPUI HWND.
+//! No desktop capture/readback or another process's window is involved.
 
 use std::{cell::RefCell, ffi::c_void};
 #[path = "glass_host_probe.rs"]
@@ -98,6 +97,31 @@ pub struct HostBackdrop {
 
 impl HostBackdrop {
     pub fn new(identity: isize, width: u32, height: u32) -> Result<Self, String> {
+        // Product placement stays lower. No command line or environment variable
+        // can redirect this constructor into GPUI's already-occupied upper slot.
+        Self::create(identity, width, height, false)
+    }
+
+    /// Explicit reduction-only entry point. The caller must own a bare HWND
+    /// whose target slot is unoccupied; this does not replace an existing target.
+    /// Only GlassNativeMinimal calls it. The default product constructor above
+    /// is unchanged, and no periodic refresh/recreation policy is introduced.
+    #[allow(dead_code)]
+    pub(crate) fn new_for_target_probe(
+        identity: isize, width: u32, height: u32, upper: bool,
+    ) -> Result<Self, String> {
+        let surface = Self::create(identity, width, height, upper)?;
+        let actual = checked(surface.target.IsTopmost(), "read created target layer")?;
+        if actual != upper {
+            return Err("created composition target does not match requested layer".into());
+        }
+        let requested = if upper { "upper" } else { "lower" };
+        let observed = if actual { "upper" } else { "lower" };
+        eprintln!("[glass-host-target] requested={requested}; actual={observed}; readback=verified");
+        Ok(surface)
+    }
+
+    fn create(identity: isize, width: u32, height: u32, upper: bool) -> Result<Self, String> {
         if std::env::var_os("GPUI_DISABLE_DIRECT_COMPOSITION").is_some() {
             return Err("host backdrop requires GPUI's alpha-preserving composition path".into());
         }
@@ -106,9 +130,9 @@ impl HostBackdrop {
         ensure_dispatcher()?;
         let compositor = checked(Compositor::new(), "create native compositor")?;
         let interop: ICompositorDesktopInterop = checked(compositor.cast(), "query desktop interop")?;
-        // GPUI uses CreateTargetForHwnd(hwnd, true). Keep its foreground tree
-        // untouched; the false target is behind GPUI but above the HWND surface.
-        let target = checked(unsafe { interop.CreateDesktopWindowTarget(hwnd, false) }, "create lower composition target")?;
+        // This selects a composition slot within this HWND, not WS_EX_TOPMOST.
+        // Product new() always passes false because GPUI occupies the upper slot.
+        let target = checked(unsafe { interop.CreateDesktopWindowTarget(hwnd, upper) }, "create composition target")?;
         let visual = checked(compositor.CreateSpriteVisual(), "create backdrop visual")?;
         let geometry = checked(compositor.CreateRoundedRectangleGeometry(), "create capsule geometry")?;
         let clip = checked(compositor.CreateGeometricClipWithGeometry(&geometry), "create compositor capsule clip")?;
