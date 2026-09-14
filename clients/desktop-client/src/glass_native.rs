@@ -124,10 +124,28 @@ mod platform {
             let changed = geometry_changed || state.backend != Some(candidate);
             state.window = identity;
             state.size = (width, height);
-            let host = if changed { state.host.take() } else { None };
+            // Dormant for ordinary startup. The opt-in standalone preview can
+            // service one zero-wait diagnostic event without borrowing across COM.
+            let probing = !changed && state.host.as_ref().is_some_and(HostBackdrop::has_armed_probe);
+            let host = if changed || probing { state.host.take() } else { None };
             (candidate, changed, host)
         });
-        if !changed { return candidate; }
+        if !changed {
+            if let Some(mut surface) = host.take() {
+                if let Err(error) = surface.service_probe() {
+                    eprintln!("[glass-host-probe] failed: {error}");
+                }
+                STATE.with(|cell| {
+                    let mut state = cell.borrow_mut();
+                    // Do not overwrite a new state in the event of reentrant work.
+                    if state.window == identity && state.size == (width, height)
+                        && state.backend == Some(candidate) && state.host.is_none() {
+                        state.host = Some(surface);
+                    }
+                });
+            }
+            return candidate;
+        }
 
         // Do WinRT/GPUI calls outside the RefCell borrow (callbacks may re-enter).
         if host.as_ref().is_some_and(|surface| surface.identity() != identity) {
