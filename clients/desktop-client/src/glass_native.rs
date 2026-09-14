@@ -1,15 +1,22 @@
-//! Shared native compositor setup. A successful request does not prove visible
-//! blur: GPUI 0.2.2 exposes no effect-status result. Validate on the real desktop.
+//! Native material selection shared by production and GlassPreview.
+//!
+//! The HWND Acrylic accent ignored the correctly installed capsule HRGN in our
+//! Windows 11 / GPUI 0.2.2 test. Native now uses a separately clipped composition
+//! visual. An unavailable visual fails closed to solid, never to clear glass or
+//! the known-overflowing Acrylic accent. Visual acceptance is still required.
 
 use gpui::Window;
 use super::policy::Backend;
+#[cfg(target_os = "windows")]
+#[path = "glass_host.rs"]
+mod host;
 
 #[cfg(target_os = "windows")]
 mod platform {
     use std::{cell::RefCell, ffi::c_void, sync::OnceLock, time::{Duration, Instant}};
     use gpui::{Window, WindowBackgroundAppearance};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use super::Backend;
+    use super::{Backend, host::HostBackdrop};
 
     #[repr(C)]
     struct HighContrast { size: u32, flags: u32, scheme: *mut u16 }
@@ -38,10 +45,8 @@ mod platform {
         fn RegGetValueW(key: *mut c_void, subkey: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
     }
 
-    // GPUI's manifest/UI thread is per-monitor DPI aware. The width and height
-    // here are the SAME device-pixel size passed to the actual texture renderer.
-    // Window rectangles include invisible borders; dividing them by logical
-    // overlay dimensions produces an oversized blur region on some Windows builds.
+    // Keep hit testing and the GPUI foreground limited to the capsule. This is
+    // NOT the native blur clip; glass_host installs that in the compositor tree.
     fn clip(hwnd: isize, width: u32, height: u32) -> bool {
         if width == 0 || height == 0 || width > 4096 || height > 4096 { return false; }
         let mut outer = Rect::default();
@@ -49,6 +54,7 @@ mod platform {
         let mut origin = Point::default();
         unsafe {
             if GetWindowRect(hwnd, &mut outer) == 0 || GetClientRect(hwnd, &mut client) == 0 || ClientToScreen(hwnd, &mut origin) == 0 { return false; }
+            if width as i32 > client.right - client.left || height as i32 > client.bottom - client.top { return false; }
             let left = origin.x - outer.left + (client.right - client.left - width as i32) / 2;
             let top = origin.y - outer.top + (client.bottom - client.top - height as i32) / 2;
             let region = CreateRoundRectRgn(left, top, left + width as i32, top + height as i32, height as i32, height as i32);
@@ -57,7 +63,6 @@ mod platform {
                 DeleteObject(region);
                 return false;
             }
-            // Windows owns region after success.
         }
         true
     }
@@ -86,7 +91,16 @@ mod platform {
         })
     }
     #[derive(Default)]
-    struct State { window: isize, size: (u32, u32), backend: Option<Backend>, checked: Option<Instant>, allowed: bool, clip_ok: bool }
+    struct State {
+        window: isize,
+        size: (u32, u32),
+        backend: Option<Backend>,
+        checked: Option<Instant>,
+        allowed: bool,
+        clip_ok: bool,
+        host_failed: bool,
+        host: Option<HostBackdrop>,
+    }
     thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 
     pub fn prepare(window: &Window, width: u32, height: u32) -> Backend {
@@ -94,26 +108,61 @@ mod platform {
             Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(), _ => return Backend::Solid,
         };
         let request = requested();
-        let (backend, changed) = STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            let geometry_changed = state.window != identity || state.size != (width, height);
+        let (candidate, changed, mut host) = STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let identity_changed = state.window != identity;
+            let geometry_changed = identity_changed || state.size != (width, height);
+            if identity_changed { state.host_failed = false; }
             if geometry_changed {
                 state.clip_ok = clip(identity, width, height);
-                if !state.clip_ok { eprintln!("[glass] capsule clipping failed; native blur disabled"); }
+                if !state.clip_ok { eprintln!("[glass] capsule clipping failed; native disabled"); }
             }
             if state.checked.is_none_or(|time| time.elapsed() >= Duration::from_secs(1)) {
                 state.allowed = allows_native(); state.checked = Some(Instant::now());
             }
-            let backend = request.resolve(state.allowed && state.clip_ok);
-            let changed = geometry_changed || state.backend != Some(backend);
-            state.window = identity; state.size = (width, height); state.backend = Some(backend);
-            (backend, changed)
+            let candidate = request.resolve(state.allowed && state.clip_ok && !state.host_failed);
+            let changed = geometry_changed || state.backend != Some(candidate);
+            state.window = identity;
+            state.size = (width, height);
+            let host = if changed { state.host.take() } else { None };
+            (candidate, changed, host)
         });
-        if changed {
-            window.set_background_appearance(if backend == Backend::Native { WindowBackgroundAppearance::Blurred } else { WindowBackgroundAppearance::Transparent });
-            eprintln!("[glass] requested={request:?} selected={backend:?}; hwnd=0x{identity:X}; pixels={width}x{height}");
+        if !changed { return candidate; }
+
+        // Never request WindowBackgroundAppearance::Blurred here: in GPUI 0.2.2
+        // that enables the full-HWND Acrylic effect which failed our shape test.
+        // Do WinRT/GPUI calls outside the RefCell borrow (callbacks may re-enter).
+        window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+        if host.as_ref().is_some_and(|surface| surface.identity() != identity) {
+            host = None;
         }
-        backend
+        let mut selected = candidate;
+        let mut failed = false;
+        if candidate == Backend::Native {
+            let result = if let Some(surface) = host.as_mut() {
+                surface.resize(width, height)
+            } else {
+                HostBackdrop::new(identity, width, height).map(|surface| { host = Some(surface); })
+            };
+            if let Err(error) = result {
+                // Latch this failure for this window instead of retrying every
+                // animation frame or ever exposing the broken Acrylic rectangle.
+                eprintln!("[glass] native visual unavailable; using solid: {error}");
+                host = None;
+                failed = true;
+                selected = Backend::Solid;
+            }
+        } else {
+            host = None;
+        }
+        STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.host = host;
+            state.host_failed |= failed;
+            state.backend = Some(selected);
+        });
+        eprintln!("[glass] requested={request:?} selected={selected:?}; hwnd=0x{identity:X}; pixels={width}x{height}; native-path=clipped-host-visual");
+        selected
     }
 }
 
