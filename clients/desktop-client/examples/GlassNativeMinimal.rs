@@ -7,6 +7,10 @@
 //! not a usable glass material; less opacity also leaks unfiltered background.
 //! 'visual-blur' selects standard backdrop + system Gaussian on the lower slot.
 //! 'none' creates NO compositor, target, visual, brush or host opt-in.
+//! 'system-acrylic' asks DWM to draw DWMSBT_TRANSIENTWINDOW directly. It creates
+//! no app-owned compositor/target/visual/brush and does NOT enable HostBackdrop.
+//! This is NOT the old undocumented Acrylic accent; clipping and real background
+//! response still require testing. A successful attribute readback is not a pass.
 //! Compare startup to warm pixels WITHIN each mode; a constant output is not a pass.
 
 // windows-implement expands absolute ::windows_core paths. This diagnostic-only
@@ -84,6 +88,51 @@ mod native {
     unsafe extern "system" { fn GetModuleHandleW(name: *const u16) -> isize; }
     #[link(name = "runtimeobject")]
     unsafe extern "system" { fn RoInitialize(kind: u32) -> i32; fn RoUninitialize(); }
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const c_void, size: u32) -> i32;
+        fn DwmGetWindowAttribute(hwnd: isize, attribute: u32, value: *mut c_void, size: u32) -> i32;
+    }
+
+    // Documented Windows 11 build 22621+ system-drawn window backdrop. This is
+    // example-only; product code never reaches this route. No SetWindowComposition-
+    // Attribute, activation spoofing, frame mutation or foreign-window operation.
+    // Docs: https://learn.microsoft.com/windows/win32/api/dwmapi/ne-dwmapi-dwm_systembackdrop_type
+    const SYSTEM_BACKDROP_ATTRIBUTE: u32 = 38;
+    const TRANSIENT_BACKDROP: i32 = 3;
+    struct SystemBackdrop { hwnd: isize, previous: i32 }
+    impl SystemBackdrop {
+        fn read(hwnd: isize) -> Result<i32, String> {
+            let mut value = 0i32;
+            let hr = unsafe { DwmGetWindowAttribute(hwnd, SYSTEM_BACKDROP_ATTRIBUTE,
+                (&mut value as *mut i32).cast(), size_of::<i32>() as u32) };
+            if hr < 0 { return Err(format!("read system backdrop (Windows 11 22621+): 0x{:08X}", hr as u32)); }
+            Ok(value)
+        }
+        fn write(hwnd: isize, value: i32) -> Result<(), String> {
+            let hr = unsafe { DwmSetWindowAttribute(hwnd, SYSTEM_BACKDROP_ATTRIBUTE,
+                (&value as *const i32).cast(), size_of::<i32>() as u32) };
+            if hr < 0 { return Err(format!("set system backdrop (Windows 11 22621+): 0x{:08X}", hr as u32)); }
+            Ok(())
+        }
+        fn new(hwnd: isize) -> Result<Self, String> {
+            let previous = Self::read(hwnd)?;
+            Self::write(hwnd, TRANSIENT_BACKDROP)?;
+            // Own the setting before any fallible readback, so failures restore it.
+            let backdrop = Self { hwnd, previous };
+            let actual = Self::read(hwnd)?;
+            if actual != TRANSIENT_BACKDROP { return Err("system backdrop readback mismatch".into()); }
+            eprintln!("[glass-system] requested=3; actual=3; readback=verified; app-compositor=absent; host-opt-in=not-enabled; accent=not-used; set-before-show=true");
+            Ok(backdrop)
+        }
+    }
+    impl Drop for SystemBackdrop {
+        fn drop(&mut self) {
+            if let Err(error) = Self::write(self.hwnd, self.previous) {
+                eprintln!("[glass-system] restore-failed: {error}");
+            }
+        }
+    }
 
     fn require(ok: bool, operation: &str) -> Result<(), String> {
         if ok { Ok(()) } else { Err(format!("{operation}: {}", std::io::Error::last_os_error())) }
@@ -150,25 +199,26 @@ mod native {
             unsafe { DeleteObject(region); }
             return Err("install reduction capsule region".into());
         }
-        // Probe values are explicit, fixed before root attachment/window show.
-        // Production still calls HostBackdrop::new(), without an opacity override.
+        // Probe values are explicit and set before window show. In the direct
+        // system route the app owns no composition target/visual/brush at all.
         let surface = match source {
             "host" | "host-upper" => (Some(HostBackdrop::new_for_target_probe(
                 raw, width as u32, height as u32, source == "host-upper",
-            )?), None),
+            )?), None, None),
             "host-alpha100" | "host-alpha99" | "host-alpha50" => {
                 let opacity = match source { "host-alpha99" => 0.99, "host-alpha50" => 0.5, _ => 1.0 };
-                (Some(HostBackdrop::new_for_opacity_probe(raw, width as u32, height as u32, opacity)?), None)
+                (Some(HostBackdrop::new_for_opacity_probe(raw, width as u32, height as u32, opacity)?), None, None)
             }
-            "visual-blur" => (None, Some(VisualBlur::new(raw, width as u32, height as u32)?)),
+            "visual-blur" => (None, Some(VisualBlur::new(raw, width as u32, height as u32)?), None),
+            "system-acrylic" => (None, None, Some(SystemBackdrop::new(raw)?)),
             "none" => {
                 eprintln!("[glass-clear] compositor=absent; target=absent; visual=absent; brush=absent; host-opt-in=not-enabled");
-                (None, None)
+                (None, None, None)
             }
             _ => return Err("invalid backdrop source".into()),
         };
-        let selected = if source == "none" { "Transparent" } else { "Native" };
-        let target_slot = match source { "host-upper" => "upper", "none" => "absent", _ => "lower" };
+        let selected = match source { "none" => "Transparent", "system-acrylic" => "SystemAcrylic", _ => "Native" };
+        let target_slot = match source { "host-upper" => "upper", "none" | "system-acrylic" => "absent", _ => "lower" };
         require(unsafe { SetTimer(raw, 1, seconds * 1000, ptr::null()) } != 0, "set lifetime timer")?;
         require(unsafe { SetWindowPos(raw, -1, 0, 0, 0, 0, 0x0053) } != 0, "show without activation")?;
         eprintln!("[glass-minimal] selected={selected}; pid={}; hwnd=0x{raw:X}; dpi={dpi}; pixels={width}x{height}; GPUI=absent; foreground-target=absent; source={source}; target-slot={target_slot}; requested-theme-not-applied; no microphone", std::process::id());
@@ -207,7 +257,7 @@ mod native {
                 seconds = value.parse::<u32>().map_err(|_| "invalid lifetime")?;
                 if !(5..=120).contains(&seconds) { return Err("lifetime must be 5..120 seconds".into()); }
             } else if let Some(value) = arg.strip_prefix("--backdrop-source=") {
-                if !matches!(value, "host" | "host-upper" | "host-alpha100" | "host-alpha99" | "host-alpha50" | "visual-blur" | "none") {
+                if !matches!(value, "host" | "host-upper" | "host-alpha100" | "host-alpha99" | "host-alpha50" | "visual-blur" | "system-acrylic" | "none") {
                     return Err("unsupported backdrop source".into());
                 }
                 source = value.to_owned();
