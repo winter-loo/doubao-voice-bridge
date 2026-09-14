@@ -2,7 +2,7 @@
 //!
 //! GPUI 0.2.2 owns the HWND's top DirectComposition target. Product construction
 //! keeps the lower target and clips its own brush in the composition tree.
-//! The explicit target probe is for the bare HWND example, never the GPUI HWND.
+//! Explicit visual probes are for the bare HWND example, never the GPUI HWND.
 //! No desktop capture/readback or another process's window is involved.
 
 use std::{cell::RefCell, ffi::c_void};
@@ -97,31 +97,56 @@ pub struct HostBackdrop {
 
 impl HostBackdrop {
     pub fn new(identity: isize, width: u32, height: u32) -> Result<Self, String> {
-        // Product placement stays lower. No command line or environment variable
-        // can redirect this constructor into GPUI's already-occupied upper slot.
-        Self::create(identity, width, height, false)
+        // Product construction is fixed: lower slot, untouched default opacity.
+        // No command-line or environment option changes these product settings.
+        Self::create(identity, width, height, false, None)
     }
 
     /// Explicit reduction-only entry point. The caller must own a bare HWND
     /// whose target slot is unoccupied; this does not replace an existing target.
-    /// Only GlassNativeMinimal calls it. The default product constructor above
-    /// is unchanged, and no periodic refresh/recreation policy is introduced.
+    /// Only GlassNativeMinimal calls it. No recovery policy is introduced.
     #[allow(dead_code)]
     pub(crate) fn new_for_target_probe(
         identity: isize, width: u32, height: u32, upper: bool,
     ) -> Result<Self, String> {
-        let surface = Self::create(identity, width, height, upper)?;
-        let actual = checked(surface.target.IsTopmost(), "read created target layer")?;
+        let surface = Self::create(identity, width, height, upper, None)?;
+        surface.verify_target(upper)?;
+        Ok(surface)
+    }
+
+    /// Diagnostic creation-time alpha comparison, always in the lower slot.
+    /// No fade, periodic update, source repaint, or post-show reset is performed.
+    /// Reduced opacity leaks unfiltered background and can only be evaluated as
+    /// a diagnostic until effective blur and foreground legibility are rechecked.
+    #[allow(dead_code)]
+    pub(crate) fn new_for_opacity_probe(
+        identity: isize, width: u32, height: u32, opacity: f32,
+    ) -> Result<Self, String> {
+        if !opacity.is_finite() || !(0.5..=1.0).contains(&opacity) {
+            return Err("diagnostic opacity must be finite and in 0.5..=1.0".into());
+        }
+        let surface = Self::create(identity, width, height, false, Some(opacity))?;
+        surface.verify_target(false)?;
+        let actual = checked(surface.visual.Opacity(), "read diagnostic visual opacity")?;
+        if !actual.is_finite() || (actual - opacity).abs() > 0.00001 {
+            return Err("diagnostic opacity readback mismatch".into());
+        }
+        eprintln!("[glass-host-opacity] requested={opacity:.4}; actual={actual:.4}; readback=verified; set-before-root=true");
+        Ok(surface)
+    }
+
+    fn verify_target(&self, upper: bool) -> Result<(), String> {
+        let actual = checked(self.target.IsTopmost(), "read created target layer")?;
         if actual != upper {
             return Err("created composition target does not match requested layer".into());
         }
         let requested = if upper { "upper" } else { "lower" };
         let observed = if actual { "upper" } else { "lower" };
         eprintln!("[glass-host-target] requested={requested}; actual={observed}; readback=verified");
-        Ok(surface)
+        Ok(())
     }
 
-    fn create(identity: isize, width: u32, height: u32, upper: bool) -> Result<Self, String> {
+    fn create(identity: isize, width: u32, height: u32, upper: bool, opacity: Option<f32>) -> Result<Self, String> {
         if std::env::var_os("GPUI_DISABLE_DIRECT_COMPOSITION").is_some() {
             return Err("host backdrop requires GPUI's alpha-preserving composition path".into());
         }
@@ -139,9 +164,14 @@ impl HostBackdrop {
         checked(visual.SetClip(&clip), "attach compositor capsule clip")?;
         let brush = checked(compositor.CreateHostBackdropBrush(), "create native host backdrop brush")?;
         checked(visual.SetBrush(&brush), "attach native host backdrop brush")?;
+        if let Some(value) = opacity {
+            // Only the explicit bare-host probe passes Some. Set once BEFORE
+            // root attachment and window show, never as a refresh workaround.
+            checked(visual.SetOpacity(value), "set diagnostic visual opacity")?;
+        }
         let mut surface = Self { identity, target, compositor, visual, geometry, _opt_in: opt_in, probe: None };
         surface.resize(width, height)?;
-        checked(surface.target.SetRoot(&surface.visual), "attach lower visual tree")?;
+        checked(surface.target.SetRoot(&surface.visual), "attach visual tree")?;
         // Explicit preview-only opt-in. Ordinary client/preview startup is unchanged.
         surface.probe = probe::Probe::from_args()?;
         eprintln!("[glass-host] native brush attached; compositor capsule clip; legacy-acrylic=off");
