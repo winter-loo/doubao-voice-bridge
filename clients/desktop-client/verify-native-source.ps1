@@ -1,7 +1,8 @@
 # Inspect only synthetic test windows. No voice input, foreign-window repaint,
 # desktop upload or production-process control. This is not a material fix.
 [CmdletBinding()]
-param([string]$OutputDirectory, [switch]$CompileOnly)
+param([string]$OutputDirectory, [switch]$CompileOnly,
+    [ValidateSet('none','brush','visual')][string]$Refresh = 'none')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
@@ -35,6 +36,7 @@ public static class GlassSourceAudit18 {
     [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int l,int t,int r,int b);
     [DllImport("gdi32.dll")] static extern int GetRgnBox(IntPtr r,out R b);
     [DllImport("gdi32.dll")] static extern bool PtInRegion(IntPtr r,int x,int y);
+    [DllImport("gdi32.dll")] static extern bool EqualRgn(IntPtr a,IntPtr b);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(P p);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h,uint flags);
@@ -46,6 +48,10 @@ public static class GlassSourceAudit18 {
     [DllImport("dwmapi.dll")] static extern int DwmRegisterThumbnail(IntPtr dst,IntPtr src,out IntPtr thumb);
     [DllImport("dwmapi.dll")] static extern int DwmUpdateThumbnailProperties(IntPtr thumb,ref ThumbnailProperties p);
     [DllImport("dwmapi.dll")] static extern int DwmUnregisterThumbnail(IntPtr thumb);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern IntPtr OpenEvent(uint access,bool inherit,string name);
+    [DllImport("kernel32.dll")] static extern bool SetEvent(IntPtr h);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h,uint ms);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     public sealed class Observation {
         public string Phase; public int PaperPaints; public double SampleMs;
         public double[] GlassLeft,GlassRight,SourceLeft,SourceRight;
@@ -53,14 +59,16 @@ public static class GlassSourceAudit18 {
         public bool? SourceOuterRowValid;
     }
     public sealed class Case {
-        public string Name,Error,Log; public bool Stopped;
-        public double? BeforeToWarm,ObserverToWarm,ObserverChange;
-        public bool? SourceMappingVerifiedAfterRepaint;
+        public string Name,Error,Log,Refresh; public bool Stopped;
+        public double? BeforeToWarm,ObserverToWarm,ObserverChange,AfterOwnToWarm,OwnChange;
+        public bool? SourceMappingVerifiedAfterRepaint,PaperUnchangedDuringOwn;
+        public bool RefreshAcknowledged,RegionPreserved;
+        public int OutsideChangedDuringOwn;
         public Observation[] Observations;
     }
     public sealed class Report {
         public bool Completed,FocusPreserved; public string Directory,Error,ExecutableSha256;
-        public string Scope="Synthetic background source via 1:1 DWM thumbnail. Observer may perturb composition; compare before/after and paint counts. No automatic acceptance.";
+        public string Scope="Synthetic source via 1:1 DWM thumbnail; one optional resource replacement. API acknowledgement is not presentation timing. No automatic visual acceptance.";
         public Case[] Cases;
     }
     class NoFocusForm : Form {
@@ -100,6 +108,31 @@ public static class GlassSourceAudit18 {
         if(h!=IntPtr.Zero&&Owner(h)==(uint)p.Id)PostMessage(h,0x0010,IntPtr.Zero,IntPtr.Zero);
         if(!p.WaitForExit(2500)){p.Kill();Check(p.WaitForExit(5000),"Test preview did not exit.");}
     }
+    static void RequestRenewal(Process process,IntPtr hwnd){
+        Check(!process.HasExited&&Owner(hwnd)==(uint)process.Id,"Preview identity changed before probe.");
+        string prefix="Local\\DoubaoGlassProbe."+process.Id+".";
+        IntPtr request=IntPtr.Zero,applied=IntPtr.Zero,failed=IntPtr.Zero;
+        try{
+            request=OpenEvent(2,false,prefix+"request");
+            applied=OpenEvent(0x00100000,false,prefix+"applied");
+            failed=OpenEvent(0x00100000,false,prefix+"failed");
+            Check(request!=IntPtr.Zero&&applied!=IntPtr.Zero&&failed!=IntPtr.Zero,"Preview probe channel is unavailable; rebuild the opt-in preview.");
+            Check(WaitForSingleObject(applied,0)==258&&WaitForSingleObject(failed,0)==258,"Probe was already consumed.");
+            Check(SetEvent(request),"Cannot signal preview probe.");
+            var timer=Stopwatch.StartNew();
+            while(timer.ElapsedMilliseconds<3000&&!process.HasExited){
+                uint ok=WaitForSingleObject(applied,0),bad=WaitForSingleObject(failed,0);
+                Check(bad==258,"Preview resource replacement failed; inspect saved log.");
+                if(ok==0)return;
+                Check(ok==258,"Cannot wait for preview acknowledgement.");Pump(10);
+            }
+            throw new InvalidOperationException("Preview did not acknowledge the one-shot probe.");
+        }finally{
+            if(request!=IntPtr.Zero)CloseHandle(request);
+            if(applied!=IntPtr.Zero)CloseHandle(applied);
+            if(failed!=IntPtr.Zero)CloseHandle(failed);
+        }
+    }
     static Bitmap Shot(Rectangle crop,IntPtr centerOwner,IntPtr marginOwner){
         Check(Root(crop.Left+crop.Width/2,crop.Top+crop.Height/2)==centerOwner&&Root(crop.Left+3,crop.Top+3)==marginOwner,
             "Another window covers the synthetic capture area.");
@@ -120,14 +153,16 @@ public static class GlassSourceAudit18 {
         for(int k=0;k<3;k++)v[k]=Math.Round(v[k]/p.Count,3);return v;}
     static double Delta(Bitmap a,Bitmap b,List<Point> points){double v=0;foreach(var p in points){var x=a.GetPixel(p.X,p.Y);var y=b.GetPixel(p.X,p.Y);
         v+=Math.Abs(x.R-y.R)+Math.Abs(x.G-y.G)+Math.Abs(x.B-y.B);}return Math.Round(v/(3*points.Count),4);}
-    static Case RunCase(string exe,string directory,int repeat){
-        var result=new Case{Name="native-dark-preview-first-r"+repeat};
+    static Case RunCase(string exe,string directory,int repeat,string refresh){
+        var result=new Case{Name="native-dark-preview-first-"+refresh+"-r"+repeat,Refresh=refresh};
         Process preview=null;Paper paper=null;NoFocusForm observer=null;IntPtr h=IntPtr.Zero,region=IntPtr.Zero,thumb=IntPtr.Zero;
         var images=new List<Bitmap>();var notes=new List<Observation>();
         System.Threading.Tasks.Task<string> stderr=null,stdout=null;var clock=Stopwatch.StartNew();
         try{
             var screen=Screen.PrimaryScreen.Bounds;
-            var si=new ProcessStartInfo(exe,"--glass-backend=native --theme=dark --content=optimizing --seconds=60"){
+            string arguments="--glass-backend=native --theme=dark --content=optimizing --seconds=60";
+            if(refresh!="none")arguments+=" --glass-probe="+refresh;
+            var si=new ProcessStartInfo(exe,arguments){
                 UseShellExecute=false,CreateNoWindow=true,WorkingDirectory=Path.GetDirectoryName(exe),RedirectStandardError=true,RedirectStandardOutput=true};
             si.EnvironmentVariables.Remove("GPUI_DISABLE_DIRECT_COMPOSITION");
             preview=Process.Start(si);Check(preview!=null,"Cannot start test preview.");
@@ -152,20 +187,16 @@ public static class GlassSourceAudit18 {
             Check(paper.Bounds.Contains(crop),"Synthetic paper does not cover preview.");
             paper.Show();Check(SetWindowPos(h,new IntPtr(-1),0,0,0,0,0x0213),"Cannot stack preview.");
             Check(SetWindowPos(paper.Handle,h,paper.Left,paper.Top,paper.Width,paper.Height,0x0250),"Cannot stack paper.");
-            // Preserve first paint; do not refresh the source before taking the control.
+            // Preserve first paint; do not refresh the source before the controls.
             Pump(1600);
             Rectangle view=Rectangle.Empty;
-            string[] phases={"before-observer","observer-800","observer-1600","after-source-repaint"};
+            string[] phases={"before-observer","observer-800","observer-1600","after-own-resource","after-source-repaint"};
             for(int i=0;i<phases.Length;i++){
                 if(i==1){
-                    // This is an observer of our OWN synthetic source HWND, not
-                    // a screenshot/thumbnail of the desktop or another app.
                     observer=new NoFocusForm();observer.BackColor=Color.Magenta;
                     view=new Rectangle(crop.Left,paper.Top-crop.Height-40,crop.Width,crop.Height);
                     Check(screen.Contains(view)&&!view.IntersectsWith(paper.Bounds),"No safe space for the source observer.");
                     observer.Bounds=view;observer.Show();observer.Refresh();
-                    // Keep out-parameter calls separate: Check() does not tell
-                    // C# definite-assignment analysis that a false result throws.
                     R pr;Check(GetWindowRect(paper.Handle,out pr),"Cannot read source window geometry.");
                     R vr;Check(GetWindowRect(observer.Handle,out vr),"Cannot read observer window geometry.");
                     Check(vr.Right-vr.L==crop.Width&&vr.Bottom-vr.T==crop.Height&&observer.ClientSize==crop.Size,"Observer is not 1:1 physical pixels.");
@@ -176,7 +207,12 @@ public static class GlassSourceAudit18 {
                         Destination=new R{L=0,T=0,Right=crop.Width,Bottom=crop.Height},
                         Source=new R{L=crop.Left-pr.L,T=crop.Top-pr.T,Right=crop.Right-pr.L,Bottom=crop.Bottom-pr.T}};
                     Check(DwmUpdateThumbnailProperties(thumb,ref properties)>=0,"Cannot display source thumbnail.");Pump(800);
-                }else if(i==2){Pump(800);}else if(i==3){paper.Refresh();Pump(1600);}
+                }else if(i==2){Pump(800);}
+                else if(i==3){
+                    if(refresh!="none"){RequestRenewal(preview,h);result.RefreshAcknowledged=true;}
+                    // No source repaint, host opt-in toggle or window recreation.
+                    Pump(1200);
+                }else if(i==4){paper.Refresh();Pump(1600);}
                 R now;Check(!preview.HasExited&&GetWindowRect(h,out now)&&now.L==r.L&&now.T==r.T&&now.Right==r.Right&&now.Bottom==r.Bottom,"Preview changed or exited.");
                 var image=Shot(crop,h,paper.Handle);images.Add(image);Check(RowValid(image,crop,paper),"Visible source margin does not match the requested colors.");
                 image.Save(Path.Combine(directory,result.Name+"-"+phases[i]+".png"),ImageFormat.Png);
@@ -189,9 +225,21 @@ public static class GlassSourceAudit18 {
                     note.SourceMismatches=bad;note.SourceProbes=points.Count;note.SourceOuterRowValid=RowValid(source,crop,paper);
                 }}notes.Add(note);
             }
-            result.BeforeToWarm=Delta(images[0],images[3],points);
-            result.ObserverToWarm=Delta(images[2],images[3],points);
+            result.BeforeToWarm=Delta(images[0],images[4],points);
+            result.ObserverToWarm=Delta(images[2],images[4],points);
             result.ObserverChange=Delta(images[0],images[2],points);
+            result.AfterOwnToWarm=Delta(images[3],images[4],points);
+            result.OwnChange=Delta(images[2],images[3],points);
+            result.PaperUnchangedDuringOwn=notes[2].PaperPaints==notes[3].PaperPaints;
+            IntPtr actual=CreateRectRgn(0,0,0,0);Check(actual!=IntPtr.Zero,"Cannot allocate region check.");
+            try{result.RegionPreserved=GetWindowRgn(h,actual)>1&&EqualRgn(region,actual);}finally{DeleteObject(actual);}
+            Check(result.RegionPreserved,"Candidate changed the capsule window region.");
+            for(int y=0;y<crop.Height;y++)for(int x=0;x<crop.Width;x++){
+                int rx=x+crop.Left-outer.Left,ry=y+crop.Top-outer.Top;
+                if(PtInRegion(region,rx,ry)||PtInRegion(region,rx-3,ry)||PtInRegion(region,rx+3,ry)||PtInRegion(region,rx,ry-3)||PtInRegion(region,rx,ry+3))continue;
+                var a=images[2].GetPixel(x,y);var b=images[3].GetPixel(x,y);
+                if(Math.Max(Math.Abs(a.R-b.R),Math.Max(Math.Abs(a.G-b.G),Math.Abs(a.B-b.B)))>4)result.OutsideChangedDuringOwn++;
+            }
             var last=notes[notes.Count-1];result.SourceMappingVerifiedAfterRepaint=last.SourceOuterRowValid==true&&last.SourceMismatches==0;
         }catch(Exception e){result.Error=e.Message;}
         finally{
@@ -203,22 +251,24 @@ public static class GlassSourceAudit18 {
             result.Stopped=preview==null||preview.HasExited;result.Observations=notes.ToArray();
             try{if(result.Stopped&&stderr!=null&&stderr.Wait(2000)){
                 string log=stderr.Result??"";File.WriteAllText(Path.Combine(directory,result.Name+".log"),log,Encoding.UTF8);
-                result.Log=log.Length>700?log.Substring(log.Length-700):log;
+                result.Log=log.Length>1100?log.Substring(log.Length-1100):log;
                 if(!log.Contains("selected=Native")||!log.Contains("[glass-host] native brush attached"))result.Error=(result.Error??"")+" Native host visual not confirmed.";
+                if(refresh!="none"&&(!log.Contains("[glass-host-probe] mode=")||!log.Contains("applied=true")))result.Error=(result.Error??"")+" Native resource replacement was not reported.";
             }else{result.Error=(result.Error??"")+" Native startup log unavailable.";}
             if(result.Stopped&&stdout!=null)stdout.Wait(2000);
             }catch(Exception e){result.Error=(result.Error??"")+" Log: "+e.Message;}
             if(preview!=null)preview.Dispose();
         }return result;
     }
-    public static Report Run(string exe,string directory){
+    public static Report Run(string exe,string directory,string refresh){
+        Check(refresh=="none"||refresh=="brush"||refresh=="visual","Invalid refresh mode.");
         Check(IntPtr.Size==8&&File.Exists(exe),"64-bit PowerShell and built GlassPreview are required.");
         Check(Marshal.SizeOf(typeof(ThumbnailProperties))==48,"Unexpected thumbnail structure layout.");
         var existing=Process.GetProcessesByName("GlassPreview");int n=existing.Length;foreach(var p in existing)p.Dispose();
         Check(n==0,"An existing test preview is running; none was stopped.");Check(!Directory.Exists(directory),"Refusing to overwrite output directory.");
         var report=new Report{Directory=directory};var cases=new List<Case>();IntPtr old=IntPtr.Zero,focus=GetForegroundWindow();
         try{Directory.CreateDirectory(directory);old=SetThreadDpiAwarenessContext(new IntPtr(-4));Check(old!=IntPtr.Zero,"Cannot enter physical-pixel DPI context.");
-            for(int i=1;i<=3;i++){var c=RunCase(exe,directory,i);cases.Add(c);Check(c.Error==null&&c.Stopped,c.Error??"Test cleanup failed.");}report.Completed=true;
+            for(int i=1;i<=3;i++){var c=RunCase(exe,directory,i,refresh);cases.Add(c);Check(c.Error==null&&c.Stopped,c.Error??"Test cleanup failed.");}report.Completed=true;
         }catch(Exception e){report.Error=e.Message;}
         finally{if(old!=IntPtr.Zero)SetThreadDpiAwarenessContext(old);report.Cases=cases.ToArray();report.FocusPreserved=focus==GetForegroundWindow();}
         return report;
@@ -231,16 +281,16 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory=Join-Path $env:TEMP ('doubao-source-audit-'+[Guid]::NewGuid().ToString('N'))
 }
 $exe=Join-Path $PSScriptRoot 'target\release\GlassPreview.exe'
-$result=[GlassSourceAudit18]::Run($exe,$OutputDirectory)
+$result=[GlassSourceAudit18]::Run($exe,$OutputDirectory,$Refresh)
 $result.ExecutableSha256=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
 if (Test-Path -LiteralPath $OutputDirectory -PathType Container) {
     [IO.File]::WriteAllText((Join-Path $OutputDirectory 'result.json'),($result|ConvertTo-Json -Depth 8 -Compress))
 }
-# Bound bridge output. Full per-frame RGB, logs and images remain in result.json.
+# Bound bridge output. Full RGB, API logs and images remain in result.json.
 $cases=@($result.Cases|ForEach-Object {
     $c=$_
     $samples=@($c.Observations|Select-Object Phase,PaperPaints,SourceMismatches,SourceProbes,SourceOuterRowValid)
-    [ordered]@{Name=$c.Name;Error=$c.Error;Stopped=$c.Stopped;BeforeToWarm=$c.BeforeToWarm;ObserverToWarm=$c.ObserverToWarm;ObserverChange=$c.ObserverChange;SourceMappingVerifiedAfterRepaint=$c.SourceMappingVerifiedAfterRepaint;Observations=$samples}
+    [ordered]@{Name=$c.Name;Error=$c.Error;Stopped=$c.Stopped;BeforeToWarm=$c.BeforeToWarm;ObserverToWarm=$c.ObserverToWarm;ObserverChange=$c.ObserverChange;AfterOwnToWarm=$c.AfterOwnToWarm;OwnChange=$c.OwnChange;RefreshAcknowledged=$c.RefreshAcknowledged;PaperUnchangedDuringOwn=$c.PaperUnchangedDuringOwn;RegionPreserved=$c.RegionPreserved;OutsideChangedDuringOwn=$c.OutsideChangedDuringOwn;SourceMappingVerifiedAfterRepaint=$c.SourceMappingVerifiedAfterRepaint;Observations=$samples}
 })
 [ordered]@{Completed=$result.Completed;Error=$result.Error;FocusPreserved=$result.FocusPreserved;Directory=$result.Directory;ExecutableSha256=$result.ExecutableSha256;Scope=$result.Scope;Cases=$cases}|ConvertTo-Json -Depth 6 -Compress
 if (-not $result.Completed) { throw ('Source diagnostic failed: '+$result.Error) }
