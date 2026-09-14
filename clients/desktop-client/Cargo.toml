@@ -30,6 +30,7 @@ embed-resource = "3.0.11"
 cpal = "0.17"
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
 windows = { version = "0.61", features = [
+    "Foundation",
     "System",
     "UI_Composition",
     "UI_Composition_Desktop",
