@@ -51,7 +51,7 @@ impl Cache {
 }
 
 pub fn glass_texture(window: &mut Window, width: u32, height: u32, tint: u32, level: u32) -> Option<Arc<RenderImage>> {
-    let backend = native::prepare(window);
+    let backend = native::prepare(window, width, height);
     static CACHE: OnceLock<Mutex<Option<Cache>>> = OnceLock::new();
     let mut slot = CACHE.get_or_init(|| Mutex::new(match Cache::new() {
         Ok(cache) => Some(cache),
