@@ -164,7 +164,10 @@ public static class GlassSourceAudit18 {
                     view=new Rectangle(crop.Left,paper.Top-crop.Height-40,crop.Width,crop.Height);
                     Check(screen.Contains(view)&&!view.IntersectsWith(paper.Bounds),"No safe space for the source observer.");
                     observer.Bounds=view;observer.Show();observer.Refresh();
-                    R pr,vr;Check(GetWindowRect(paper.Handle,out pr)&&GetWindowRect(observer.Handle,out vr),"Cannot read observer geometry.");
+                    // Keep out-parameter calls separate: Check() does not tell
+                    // C# definite-assignment analysis that a false result throws.
+                    R pr;Check(GetWindowRect(paper.Handle,out pr),"Cannot read source window geometry.");
+                    R vr;Check(GetWindowRect(observer.Handle,out vr),"Cannot read observer window geometry.");
                     Check(vr.Right-vr.L==crop.Width&&vr.Bottom-vr.T==crop.Height&&observer.ClientSize==crop.Size,"Observer is not 1:1 physical pixels.");
                     view=Rectangle.FromLTRB(vr.L,vr.T,vr.Right,vr.Bottom);
                     using(var self=Process.GetCurrentProcess())Check(Owner(paper.Handle)==(uint)self.Id&&Owner(observer.Handle)==(uint)self.Id,"Source ownership mismatch.");
