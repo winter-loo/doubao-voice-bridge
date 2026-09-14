@@ -8,35 +8,116 @@ on:
       - 'clients/desktop-client/src/main.rs'
       - 'clients/desktop-client/Cargo.toml'
       - 'clients/desktop-client/Cargo.lock'
+      - 'clients/desktop-client/verify-native-*.ps1'
+      - 'clients/desktop-client/compare-native-hosts.ps1'
+      - 'clients/desktop-client/examples/GlassNativeMinimal.rs'
       - '.github/workflows/glass-tests.yml'
   push:
     branches: ['feat/liquid-glass-overlay']
     paths:
       - 'clients/desktop-client/src/liquid_glass.rs'
       - 'clients/desktop-client/src/glass_*.rs'
-      - 'clients/desktop-client/src/main.rs'
+      - 'clients/desktop-client/verify-native-*.ps1'
+      - 'clients/desktop-client/compare-native-hosts.ps1'
+      - 'clients/desktop-client/examples/GlassNativeMinimal.rs'
       - '.github/workflows/glass-tests.yml'
 
 permissions:
   contents: read
-
 concurrency:
   group: glass-tests-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
+  powershell-diagnostics:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse probes and compile embedded C# without running desktop tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
+              throw 'This gate must use Windows PowerShell 5.1, not pwsh.'
+          }
+          Add-Type -AssemblyName System.Drawing
+          Add-Type -AssemblyName System.Windows.Forms
+          $files = @(Get-ChildItem -LiteralPath 'clients/desktop-client' -File -Filter 'verify-native-*.ps1' | Sort-Object Name)
+          if ($files.Count -eq 0) { throw 'No native diagnostic scripts found.' }
+          foreach ($file in $files) {
+              $tokens = $null
+              $parseErrors = $null
+              $null = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)
+              if (@($parseErrors).Count -gt 0) {
+                  throw ($file.Name + ': ' + (($parseErrors | ForEach-Object { $_.Message }) -join '; '))
+              }
+              # Compile only the embedded source. Do not dot-source a diagnostic:
+              # its top-level code may start windows, capture pixels or processes.
+              $source = [IO.File]::ReadAllText($file.FullName)
+              $blocks = [regex]::Matches($source, "(?ms)-TypeDefinition[ \t]+@'\r?\n(?<code>.*?)\r?\n'@")
+              if ($blocks.Count -ne 1) { throw ('Expected exactly one C# block in ' + $file.Name) }
+              Add-Type -TypeDefinition $blocks[0].Groups['code'].Value -ReferencedAssemblies System.Drawing,System.Windows.Forms -ErrorAction Stop
+              Write-Output ('Compiled: ' + $file.Name)
+          }
+          Write-Output 'All diagnostic sources compiled; no preview, microphone or screen capture was started.'
+      - name: Check native-host comparison wrapper without running windows
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & './clients/desktop-client/compare-native-hosts.ps1' -CompileOnly
+          if ($LASTEXITCODE -ne 0) { throw 'Native-host wrapper compile-only check failed.' }
+  native-minimal-build:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the same minimal host without a GPUI dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # A throwaway manifest links the real example and real shared host
+          # modules, using the product's locked windows-rs version/features.
+          # This fast gate does not build or initialize GPUI or execute a GUI.
+          $source = @'
+          import json, os, pathlib, tomllib
+          root = pathlib.Path('clients/desktop-client').resolve()
+          config = tomllib.loads((root/'Cargo.toml').read_text(encoding='utf-8'))
+          lock = tomllib.loads((root/'Cargo.lock').read_text(encoding='utf-8'))
+          dependency = config['target']['cfg(target_os = "windows")']['dependencies']['windows']
+          versions = [p['version'] for p in lock['package'] if p['name'] == 'windows' and p['version'].startswith('0.61.')]
+          assert len(versions) == 1, 'Expected the pinned windows 0.61 dependency'
+          directory = pathlib.Path(os.environ['RUNNER_TEMP'])/'native-host-minimal'
+          directory.mkdir()
+          manifest = '\n'.join([
+              '[package]', 'name = "glass-native-minimal-ci"', 'version = "0.0.0"', 'edition = "2024"',
+              '[[bin]]', 'name = "GlassNativeMinimal"',
+              'path = '+json.dumps((root/'examples/GlassNativeMinimal.rs').as_posix()),
+              '[dependencies]', 'windows = { version = '+json.dumps('='+versions[0])+', features = '+json.dumps(dependency['features'])+' }', ''
+          ])
+          (directory/'Cargo.toml').write_text(manifest, encoding='utf-8')
+          print('Building native-only source with windows-rs '+versions[0])
+          '@
+          $source | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Could not prepare isolated native manifest.' }
+          cargo build --manifest-path "$env:RUNNER_TEMP/native-host-minimal/Cargo.toml"
+          if ($LASTEXITCODE -ne 0) { throw 'Minimal native host did not compile/link.' }
+          Write-Output 'Minimal native host compiled and linked; no desktop visual test executed.'
   standalone:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Parse application source without changing formatting
-        shell: bash
-        run: rustfmt --edition=2024 --config skip_children=true --emit stdout clients/desktop-client/src/main.rs > /dev/null
-      - name: Test shading, background policy and bake coordination
+      - name: Parse application sources
         shell: bash
         run: |
-          for source in liquid_glass glass_background glass_bake; do
+          for source in main glass_preview glass_texture glass_native; do
+            rustfmt --edition=2024 --config skip_children=true --emit stdout "clients/desktop-client/src/$source.rs" > /dev/null
+          done
+          rustfmt --edition=2024 --config skip_children=true --emit stdout clients/desktop-client/examples/GlassNativeMinimal.rs > /dev/null
+      - name: Test shading, background policy, bake coordination and content protection
+        shell: bash
+        run: |
+          for source in liquid_glass glass_background glass_bake glass_policy; do
             rustc --edition=2024 --test "clients/desktop-client/src/$source.rs" -o "$RUNNER_TEMP/$source-tests"
             "$RUNNER_TEMP/$source-tests"
           done
@@ -50,5 +131,5 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
-      - name: Compile the Windows GPUI client and run glass tests
-        run: cargo test --locked --manifest-path clients/desktop-client/Cargo.toml glass_
+      - name: Compile both Windows binaries and run glass tests
+        run: cargo test --locked --bins --manifest-path clients/desktop-client/Cargo.toml glass_

@@ -3,10 +3,15 @@ name = "doubao-voice-desktop-client"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "DoubaoVoiceClient"
 
 [[bin]]
 name = "DoubaoVoiceClient"
 path = "src/main.rs"
+
+[[bin]]
+name = "GlassPreview"
+path = "src/glass_preview.rs"
 
 [dependencies]
 gpui = { version = "=0.2.2", default-features = false }
@@ -25,6 +30,11 @@ embed-resource = "3.0.11"
 cpal = "0.17"
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
 windows = { version = "0.61", features = [
+    "Foundation",
+    "Graphics_Effects",
+    "System",
+    "UI_Composition",
+    "UI_Composition_Desktop",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
@@ -34,6 +44,9 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Graphics_Direct2D",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
