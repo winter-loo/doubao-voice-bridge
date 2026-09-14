@@ -1,8 +1,10 @@
 //! Reduction baseline, NOT a replacement voice client or a visual design.
 //! No GPUI Application, renderer, upper target, texture baking, animation,
 //! capture, or voice input. Default source retains the exact shared HostBackdrop.
-//! --backdrop-source=visual-blur explicitly selects the experimental standard
-//! backdrop + system Gaussian effect. No recovery operation is performed.
+//! --backdrop-source=visual-blur selects standard backdrop + system Gaussian.
+//! --backdrop-source=none creates NO compositor, target, visual, brush or host
+//! opt-in. It keeps the same transparent HWND, HRGN, dispatcher and message loop.
+//! This zero-effect negative control is NOT a fallback material or a blur success.
 //! Compare startup to warm pixels WITHIN each mode; a constant output is not a pass.
 
 // windows-implement expands absolute ::windows_core paths. This diagnostic-only
@@ -146,17 +148,21 @@ mod native {
             unsafe { DeleteObject(region); }
             return Err("install reduction capsule region".into());
         }
-        // Both modes use the same lower target, geometry, HWND and message loop.
-        // Only the default arm uses HostBackdrop + its host opt-in. The candidate
-        // samples via standard backdrop and the explicit system Gaussian graph.
-        let surface = if source == "host" {
-            (Some(HostBackdrop::new(raw, width as u32, height as u32)?), None)
-        } else {
-            (None, Some(VisualBlur::new(raw, width as u32, height as u32)?))
+        // 'none' removes the entire effect consumer, not just Gaussian blur.
+        // The HWND (including input hit testing) and source fixture remain.
+        let surface = match source {
+            "host" => (Some(HostBackdrop::new(raw, width as u32, height as u32)?), None),
+            "visual-blur" => (None, Some(VisualBlur::new(raw, width as u32, height as u32)?)),
+            "none" => {
+                eprintln!("[glass-clear] compositor=absent; target=absent; visual=absent; brush=absent; host-opt-in=not-enabled");
+                (None, None)
+            }
+            _ => return Err("invalid backdrop source".into()),
         };
+        let selected = if source == "none" { "Transparent" } else { "Native" };
         require(unsafe { SetTimer(raw, 1, seconds * 1000, ptr::null()) } != 0, "set lifetime timer")?;
         require(unsafe { SetWindowPos(raw, -1, 0, 0, 0, 0, 0x0053) } != 0, "show without activation")?;
-        eprintln!("[glass-minimal] selected=Native; pid={}; hwnd=0x{raw:X}; dpi={dpi}; pixels={width}x{height}; GPUI=absent; upper-target=absent; source={source}; requested-theme-not-applied; no microphone", std::process::id());
+        eprintln!("[glass-minimal] selected={selected}; pid={}; hwnd=0x{raw:X}; dpi={dpi}; pixels={width}x{height}; GPUI=absent; upper-target=absent; source={source}; requested-theme-not-applied; no microphone", std::process::id());
         let outcome = loop {
             let mut message = Message::default();
             let status = unsafe { GetMessageW(&mut message, 0, 0, 0) };
@@ -192,7 +198,7 @@ mod native {
                 seconds = value.parse::<u32>().map_err(|_| "invalid lifetime")?;
                 if !(5..=120).contains(&seconds) { return Err("lifetime must be 5..120 seconds".into()); }
             } else if let Some(value) = arg.strip_prefix("--backdrop-source=") {
-                if !matches!(value, "host" | "visual-blur") { return Err("backdrop source must be host or visual-blur".into()); }
+                if !matches!(value, "host" | "visual-blur" | "none") { return Err("backdrop source must be host, visual-blur or none".into()); }
                 source = value.to_owned();
             } else if !matches!(arg.as_str(), "--glass-backend=native" | "--theme=dark" | "--theme=light" | "--content=optimizing") {
                 return Err(format!("unsupported baseline argument: {arg}"));
