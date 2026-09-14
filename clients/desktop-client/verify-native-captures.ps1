@@ -1,21 +1,21 @@
 # Cross-check native-only source modes with GDI and DXGI Desktop Duplication.
 # Diagnostic only: no product deployment, foreign repaint, voice recording, or upload.
-# -Source target-compare alternates the SAME HostBackdrop on lower/upper target slots.
-# This is NOT WS_EX_TOPMOST: both native HWNDs retain identical topmost styles.
-# -Source control alternates host/none. none has no compositor/brush/target at all.
-# -Placement compare preserves the old topmost/restack fixture and adds ordinary
-# non-topmost Show() without touching the already-topmost host's Z order.
-# Crops are bounded by the monitor work area in BOTH arms; ordinary paper must
-# not be asked to cover the taskbar. Host geometry and interior probes do not move.
+# -Source opacity-compare rotates 1.00/0.99/0.50 across three rounds, all lower target.
+# Opacity is fixed BEFORE root attachment and window show. This tests a hypothesis,
+# NOT a documented occlusion fix. Reduced alpha also leaks unfiltered background.
+# -Source target-compare retains the lower/upper slot experiment (not HWND topmost).
+# -Source control retains host/none (no compositor/brush/target in none).
+# -Placement compare retains restacking versus ordinary non-topmost Show().
+# Work-area crops, sample points, thresholds, waits and paint phases are unchanged.
 # UnfilteredInputMismatches tests raw transparency, NOT blur quality in native modes.
 [CmdletBinding()]
 param([string]$OutputDirectory, [string]$FfmpegPath, [switch]$CompileOnly,
-    [ValidateSet('host','host-upper','visual-blur','none','compare','control','target-compare')][string]$Source = 'host',
+    [ValidateSet('host','host-upper','host-alpha100','host-alpha99','host-alpha50','visual-blur','none','compare','control','target-compare','opacity-compare')][string]$Source = 'host',
     [ValidateSet('restack','normal','compare')][string]$Placement = 'restack')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
-if (-not ('NativeCaptureAudit24' -as [type])) {
+if (-not ('NativeCaptureAudit25' -as [type])) {
 Add-Type -ReferencedAssemblies System.Drawing,System.Windows.Forms -TypeDefinition @'
 using System;
 using System.IO;
@@ -26,7 +26,7 @@ using System.Diagnostics;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
-public static class NativeCaptureAudit24 {
+public static class NativeCaptureAudit25 {
     [StructLayout(LayoutKind.Sequential)] struct R { public int L,T,Right,Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct P { public int X,Y; }
     delegate bool EnumProc(IntPtr h,IntPtr p);
@@ -61,14 +61,15 @@ public static class NativeCaptureAudit24 {
         public int[] OuterPixels,CropPixels;
         public bool HostStopped,RegionPreserved,PaperUnchangedDuringColdDda,PaperUnchangedDuringWarmDda;
         public bool SourceTopmost,HostTopmost,StackingConfigurationVerified;
-        public bool? TargetLayerVerified;
+        public bool? TargetLayerVerified,OpacityVerified;
+        public double? VisualOpacity,InitialToWarmDividedByOpacity;
         public double? GdiInitialToWarm,DdaFirstInitialToWarm,DdaLastInitialToWarm,GdiAfterDdaToWarm;
         public double? ColdDdaVsGdiBefore,ColdDdaVsGdiAfter,ColdGdiChangeAcrossDda,ColdDdaFirstToLast,WarmDdaVsGdi;
         public Sample[] Samples;
     }
     public sealed class Report {
         public bool Completed,FocusPreserved; public string Error,Directory,ExecutableSha256,FfmpegSha256;
-        public string Scope="Native-only diagnostic. target-compare uses the same HostBackdrop constructor with only the creation-time target-slot bool changed and read back; both HWNDs stay topmost. normal placement uses non-topmost paper Show only. Cold/repaint phases, probe regions and GDI/four-DXGI/GDI capture phases are unchanged. A normal initial sample is not a recovery. Raw input mismatches are not blur-quality metrics. No automatic product acceptance, OS-bug attribution, FPS claim or upload.";
+        public string Scope="Native-only diagnostic. Opacity arms use the same lower target with visual alpha fixed before root attachment/show and verified by readback. No post-show recovery. Reduced alpha mixes in unfiltered background; a smaller raw error alone is not success. Error/alpha is a diagnostic dilution check, not recovered source data. Same fixture, cold/source-repaint phases, probes, thresholds, GDI/four-DXGI/GDI sampling. No automatic blur/visual acceptance, occlusion-bug attribution, FPS claim or upload.";
         public Trial[] Trials;
     }
     sealed class Paper : Form {
@@ -85,6 +86,13 @@ public static class NativeCaptureAudit24 {
     static bool Topmost(IntPtr h){return (GetWindowLongPtr(h,-20).ToInt64()&8)!=0;}
     static IntPtr Root(int x,int y){return GetAncestor(WindowFromPoint(new P{X=x,Y=y}),2);}
     static void Pump(int ms){var t=Stopwatch.StartNew();do{Application.DoEvents();System.Threading.Thread.Sleep(10);}while(t.ElapsedMilliseconds<ms);}
+    static double? Alpha(string source){
+        if(source=="host-alpha100")return 1.0;
+        if(source=="host-alpha99")return 0.99;
+        if(source=="host-alpha50")return 0.5;
+        return null;
+    }
+    static bool HostMode(string source){return source=="host"||source=="host-upper"||Alpha(source).HasValue;}
     static void ClearOfOtherHosts(){
         foreach(string name in new string[]{"GlassPreview","GlassNativeMinimal"})foreach(var p in Process.GetProcessesByName(name)){
             using(p){Check(p.HasExited,"Existing diagnostic process: "+name+" PID="+p.Id+"; none was stopped.");}}
@@ -145,7 +153,8 @@ public static class NativeCaptureAudit24 {
             ProbeCount=left.Count+right.Count,UnfilteredInputMismatches=rawBad,LeftRgb=Mean(b,left),RightRgb=Mean(b,right)};
     }
     static Trial RunTrial(string exe,string ffmpeg,string dir,int repeat,string source,string placement){
-        var result=new Trial{Repeat=repeat,Source=source,Placement=placement};var notes=new List<Sample>();var images=new List<Bitmap>();
+        var result=new Trial{Repeat=repeat,Source=source,Placement=placement,VisualOpacity=Alpha(source)};
+        var notes=new List<Sample>();var images=new List<Bitmap>();
         Process host=null;Paper paper=null;IntPtr h=IntPtr.Zero,region=IntPtr.Zero;
         System.Threading.Tasks.Task<string> logs=null,stdout=null;var clock=Stopwatch.StartNew();
         try{var si=new ProcessStartInfo(exe,"--glass-backend=native --theme=dark --content=optimizing --seconds=60 --backdrop-source="+source){
@@ -157,8 +166,7 @@ public static class NativeCaptureAudit24 {
             R r;Check(GetWindowRect(h,out r),"Cannot read test host geometry.");var outer=Rectangle.FromLTRB(r.L,r.T,r.Right,r.Bottom);
             Check(outer.Width>=30&&outer.Width<=600&&outer.Height>=10&&outer.Height<=250,"Unexpected host size.");
             var screen=Screen.PrimaryScreen.Bounds;
-            // Both arms use the same work-area crop, not the taskbar or a smaller
-            // hand-picked success region. Keep the entire HWND and interior probes.
+            // Same work-area crop and entire HWND; no hand-picked success region.
             var crop=Rectangle.Intersect(Rectangle.Inflate(outer,24,24),Screen.PrimaryScreen.WorkingArea);
             Check(screen.Contains(crop)&&crop.Contains(outer)&&outer.Left-crop.Left>=4&&outer.Top-crop.Top>=4
                 &&crop.Right-outer.Right>=4&&crop.Bottom-outer.Bottom>=4,"Insufficient work-area margin; host was not moved.");
@@ -179,7 +187,6 @@ public static class NativeCaptureAudit24 {
             Check(paper.Bounds.Contains(crop),"Paper does not cover crop.");
             paper.Show();result.PaintsWhenShowReturned=paper.Paints;
             if(placement=="restack"){
-                // Preserve the old fixture exactly: topmost Show(), then reorder.
                 Check(SetWindowPos(h,new IntPtr(-1),0,0,0,0,0x0213),"Cannot stack host.");
                 Check(SetWindowPos(paper.Handle,h,paper.Left,paper.Top,paper.Width,paper.Height,0x0250),"Cannot stack paper.");
             }
@@ -214,13 +221,17 @@ public static class NativeCaptureAudit24 {
             result.ColdDdaVsGdiBefore=Delta(images[4],images[0],points);result.ColdDdaVsGdiAfter=Delta(images[4],images[5],points);
             result.ColdGdiChangeAcrossDda=Delta(images[0],images[5],points);result.ColdDdaFirstToLast=Delta(images[1],images[4],points);
             result.WarmDdaVsGdi=Delta(images[10],images[11],points);
+            // Helps distinguish real fresh output from merely diluting stale output.
+            // This division is NOT a reconstruction of an internal source texture.
+            if(result.VisualOpacity.HasValue)result.InitialToWarmDividedByOpacity=
+                Math.Round(result.GdiInitialToWarm.Value/result.VisualOpacity.Value,4);
         }catch(Exception e){result.Error=e.Message;}
         finally{try{StopHost(host,h);}catch(Exception e){result.Error=(result.Error??"")+" Cleanup: "+e.Message;}
             if(paper!=null){paper.Close();paper.Dispose();Application.DoEvents();}foreach(var b in images)b.Dispose();if(region!=IntPtr.Zero)DeleteObject(region);
             result.HostStopped=host==null||host.HasExited;result.Samples=notes.ToArray();
             try{if(result.HostStopped&&logs!=null&&logs.Wait(2000)){string text=logs.Result??"";File.WriteAllText(Path.Combine(dir,"r"+repeat+"-host.log"),text,Encoding.UTF8);
                     result.Log=text.Length>1000?text.Substring(text.Length-1000):text;
-                    bool hostMode=source=="host"||source=="host-upper";
+                    bool hostMode=HostMode(source);
                     string marker=hostMode?"[glass-host] native brush attached":source=="none"?"[glass-clear] compositor=absent;":"[glass-visual-blur] attached;";
                     string selected=source=="none"?"Transparent":"Native";
                     if(!text.Contains("[glass-minimal] selected="+selected+";")||!text.Contains("source="+source+";")||!text.Contains(marker)||text.Contains("[glass-minimal] failed:"))result.Error=(result.Error??"")+" Minimal source identity/runtime validation failed.";
@@ -229,15 +240,20 @@ public static class NativeCaptureAudit24 {
                         result.TargetLayerVerified=text.Contains("[glass-host-target] requested="+layer+"; actual="+layer+"; readback=verified");
                         if(result.TargetLayerVerified!=true)result.Error=(result.Error??"")+" Target layer readback was not verified.";
                     }
+                    if(result.VisualOpacity.HasValue){
+                        string a=result.VisualOpacity.Value.ToString("F4",System.Globalization.CultureInfo.InvariantCulture);
+                        result.OpacityVerified=text.Contains("[glass-host-opacity] requested="+a+"; actual="+a+"; readback=verified; set-before-root=true");
+                        if(result.OpacityVerified!=true)result.Error=(result.Error??"")+" Opacity readback was not verified.";
+                    }
                     if(source=="none"&&(text.Contains("[glass-host] native brush attached")||text.Contains("[glass-visual-blur] attached;")))result.Error=(result.Error??"")+" Zero-effect control unexpectedly initialized a brush.";}
                 else result.Error=(result.Error??"")+" Host log unavailable.";if(result.HostStopped&&stdout!=null)stdout.Wait(2000);
             }catch(Exception e){result.Error=(result.Error??"")+" Log: "+e.Message;}if(host!=null)host.Dispose();}
         return result;
     }
     public static Report Run(string exe,string ffmpeg,string dir,string source,string placement){
-        Check(source=="host"||source=="host-upper"||source=="visual-blur"||source=="none"||source=="compare"||source=="control"||source=="target-compare","Invalid source choice.");
+        Check(HostMode(source)||source=="visual-blur"||source=="none"||source=="compare"||source=="control"||source=="target-compare"||source=="opacity-compare","Invalid source choice.");
         Check(placement=="restack"||placement=="normal"||placement=="compare","Invalid source-placement choice.");
-        Check(placement!="compare"||(source!="compare"&&source!="control"&&source!="target-compare"),"Select one backdrop source when comparing source placement.");
+        Check(placement!="compare"||(source!="compare"&&source!="control"&&source!="target-compare"&&source!="opacity-compare"),"Select one backdrop source when comparing source placement.");
         Check(IntPtr.Size==8&&File.Exists(exe)&&File.Exists(ffmpeg),"64-bit PowerShell, minimal host and FFmpeg are required.");
         ClearOfOtherHosts();Check(!Directory.Exists(dir),"Refusing to overwrite output directory.");
         var report=new Report{Directory=dir};var trials=new List<Trial>();IntPtr old=IntPtr.Zero,focus=GetForegroundWindow();
@@ -248,6 +264,10 @@ public static class NativeCaptureAudit24 {
                 if(source=="compare")modes=i%2==1?new string[]{"host","visual-blur"}:new string[]{"visual-blur","host"};
                 else if(source=="control")modes=i%2==1?new string[]{"host","none"}:new string[]{"none","host"};
                 else if(source=="target-compare")modes=i%2==1?new string[]{"host","host-upper"}:new string[]{"host-upper","host"};
+                else if(source=="opacity-compare"){
+                    string[] alphaModes={"host-alpha100","host-alpha99","host-alpha50"};
+                    modes=new string[3];for(int j=0;j<3;j++)modes[j]=alphaModes[(j+i-1)%3];
+                }
                 else modes=new string[]{source};
                 string[] placements=placement=="compare"?(i%2==1?new string[]{"restack","normal"}:new string[]{"normal","restack"}):new string[]{placement};
                 foreach(string mode in modes)foreach(string position in placements){
@@ -272,10 +292,10 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build GlassNativ
 $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
 $ffhash=(Get-FileHash -LiteralPath $FfmpegPath -Algorithm SHA256).Hash
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { $OutputDirectory=Join-Path $env:TEMP ('doubao-capture-paths-'+[Guid]::NewGuid().ToString('N')) }
-$result=[NativeCaptureAudit24]::Run($exe,$FfmpegPath,$OutputDirectory,$Source,$Placement)
+$result=[NativeCaptureAudit25]::Run($exe,$FfmpegPath,$OutputDirectory,$Source,$Placement)
 $result.ExecutableSha256=$hash; $result.FfmpegSha256=$ffhash
 if (Test-Path -LiteralPath $OutputDirectory -PathType Container) { [IO.File]::WriteAllText((Join-Path $OutputDirectory 'result.json'),($result|ConvertTo-Json -Depth 8 -Compress)) }
-# Bound the paired six-trial output. Full RGB and capture intervals stay local.
+# Full sample RGB and capture intervals stay in result.json, never image encodings.
 $trials=@($result.Trials | ForEach-Object {
     $t=$_; $s=@($t.Samples); $warm=@($s|Where-Object {$_.Name -eq 'warm-gdi-after'}); $cold=@($s|Where-Object {$_.Name -eq 'cold-gdi-before'})
     $wl=@(); $wr=@(); $order=$null; $coldBad=$null; $warmBad=$null; $probes=$null
@@ -285,7 +305,8 @@ $trials=@($result.Trials | ForEach-Object {
         if ($wl.Count -eq 3 -and $wr.Count -eq 3) { $order=$wl[0] -gt $wl[2] -and $wr[2] -gt $wr[0] }
     }
     [ordered]@{Source=$t.Source;Placement=$t.Placement;Repeat=$t.Repeat;Error=$t.Error;Stopped=$t.HostStopped;
-        TargetLayerVerified=$t.TargetLayerVerified;
+        TargetLayerVerified=$t.TargetLayerVerified;VisualOpacity=$t.VisualOpacity;OpacityVerified=$t.OpacityVerified;
+        InitialToWarmDividedByOpacity=$t.InitialToWarmDividedByOpacity;
         SourceTopmost=$t.SourceTopmost;HostTopmost=$t.HostTopmost;StackingVerified=$t.StackingConfigurationVerified;PaintsAtShowReturn=$t.PaintsWhenShowReturned;
         OuterPixels=$t.OuterPixels;CropPixels=$t.CropPixels;
         GdiInitialToWarm=$t.GdiInitialToWarm;DdaFirstInitialToWarm=$t.DdaFirstInitialToWarm;DdaLastInitialToWarm=$t.DdaLastInitialToWarm;
