@@ -129,10 +129,7 @@ mod platform {
         });
         if !changed { return candidate; }
 
-        // Never request WindowBackgroundAppearance::Blurred here: in GPUI 0.2.2
-        // that enables the full-HWND Acrylic effect which failed our shape test.
         // Do WinRT/GPUI calls outside the RefCell borrow (callbacks may re-enter).
-        window.set_background_appearance(WindowBackgroundAppearance::Transparent);
         if host.as_ref().is_some_and(|surface| surface.identity() != identity) {
             host = None;
         }
@@ -140,8 +137,17 @@ mod platform {
         let mut failed = false;
         if candidate == Backend::Native {
             let result = if let Some(surface) = host.as_mut() {
+                // Do not reset the HWND accent or host opt-in on a size change.
                 surface.resize(width, height)
             } else {
+                // GPUI 0.2.2 Windows maps Transparent to legacy accent state 2,
+                // NOT to absence of a window effect. Opaque maps to state 0
+                // (ACCENT_DISABLED); this setter does not change the renderer's
+                // alpha-preserving DirectComposition swap chain or paint a fill.
+                // Clear the legacy accent once BEFORE enabling HostBackdrop.
+                // This is version/platform-specific, not a portable recipe.
+                window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+                eprintln!("[glass] host initialization: legacy-accent=disabled; GPUI composition unchanged");
                 HostBackdrop::new(identity, width, height).map(|surface| { host = Some(surface); })
             };
             if let Err(error) = result {
@@ -149,11 +155,15 @@ mod platform {
                 // animation frame or ever exposing the broken Acrylic rectangle.
                 eprintln!("[glass] native visual unavailable; using solid: {error}");
                 host = None;
+                // Preserve the previously tested Solid rendering configuration.
+                window.set_background_appearance(WindowBackgroundAppearance::Transparent);
                 failed = true;
                 selected = Backend::Solid;
             }
         } else {
+            // Detach the native visual before restoring the non-native setup.
             host = None;
+            window.set_background_appearance(WindowBackgroundAppearance::Transparent);
         }
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
@@ -161,7 +171,8 @@ mod platform {
             state.host_failed |= failed;
             state.backend = Some(selected);
         });
-        eprintln!("[glass] requested={request:?} selected={selected:?}; hwnd=0x{identity:X}; pixels={width}x{height}; native-path=clipped-host-visual");
+        let path = if selected == Backend::Native { "clipped-host-visual" } else { "off" };
+        eprintln!("[glass] requested={request:?} selected={selected:?}; hwnd=0x{identity:X}; pixels={width}x{height}; native-path={path}");
         selected
     }
 }
