@@ -1,11 +1,12 @@
-# Cross-check the bare native host with GDI and DXGI Desktop Duplication.
-# Diagnostic only: no material changes, foreign repaint, recording, or upload.
+# Cross-check native-only source modes with GDI and DXGI Desktop Duplication.
+# Diagnostic only: no product changes, foreign repaint, recording, or upload.
 [CmdletBinding()]
-param([string]$OutputDirectory, [string]$FfmpegPath, [switch]$CompileOnly)
+param([string]$OutputDirectory, [string]$FfmpegPath, [switch]$CompileOnly,
+    [ValidateSet('host','visual-blur','compare')][string]$Source = 'host')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
-if (-not ('NativeCaptureAudit20' -as [type])) {
+if (-not ('NativeCaptureAudit21' -as [type])) {
 Add-Type -ReferencedAssemblies System.Drawing,System.Windows.Forms -TypeDefinition @'
 using System;
 using System.IO;
@@ -16,7 +17,7 @@ using System.Diagnostics;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
-public static class NativeCaptureAudit20 {
+public static class NativeCaptureAudit21 {
     [StructLayout(LayoutKind.Sequential)] struct R { public int L,T,Right,Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct P { public int X,Y; }
     delegate bool EnumProc(IntPtr h,IntPtr p);
@@ -46,7 +47,7 @@ public static class NativeCaptureAudit20 {
         public double[] LeftRgb,RightRgb;
     }
     public sealed class Trial {
-        public int Repeat; public string Error,Log;
+        public int Repeat; public string Source,Error,Log;
         public bool HostStopped,RegionPreserved,PaperUnchangedDuringColdDda,PaperUnchangedDuringWarmDda;
         public double? GdiInitialToWarm,DdaFirstInitialToWarm,DdaLastInitialToWarm,GdiAfterDdaToWarm;
         public double? ColdDdaVsGdiBefore,ColdDdaVsGdiAfter,ColdGdiChangeAcrossDda,ColdDdaFirstToLast,WarmDdaVsGdi;
@@ -54,10 +55,9 @@ public static class NativeCaptureAudit20 {
     }
     public sealed class Report {
         public bool Completed,FocusPreserved; public string Error,Directory,ExecutableSha256,FfmpegSha256;
-        public string Scope="Bare native host only. Sequential GDI / four DXGI frames / GDI, before and after TEST-source repaint. Capture initialization can perturb composition. No display/FPS or visual acceptance claim. Only small local PNG crops are saved.";
+        public string Scope="Native-only source comparison. HostBackdrop control versus standard Backdrop plus system Gaussian effect. Same lower target, window geometry and first-paint fixture. Sequential GDI / four DXGI frames / GDI, before and after TEST-source repaint. Low drift alone can mean a blank source; inspect warm RGB. No automatic blur/visual/FPS acceptance. Local cropped PNGs only.";
         public Trial[] Trials;
     }
-    // Match the source audit's no-activate GDI paper, colors and initial placement.
     sealed class Paper : Form {
         public int SplitScreenX,Paints;
         public Paper(){FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;TopMost=true;StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;DoubleBuffered=true;}
@@ -93,7 +93,6 @@ public static class NativeCaptureAudit20 {
             LayerCheck(crop,host,paper);return b;}catch{b.Dispose();throw;}}
     static Bitmap[] Dda(string ffmpeg,string prefix,Rectangle crop,IntPtr host,Paper paper){
         LayerCheck(crop,host,paper);
-        // Require one display at (0,0). Never guess a multi-monitor output mapping.
         Check(Screen.AllScreens.Length==1&&Screen.PrimaryScreen.Bounds.Location==Point.Empty,"DXGI probe requires a single display at (0,0).");
         Check(crop.Left>=0&&crop.Top>=0&&Screen.PrimaryScreen.Bounds.Contains(crop),"Invalid DXGI crop.");
         string filter="ddagrab=output_idx=0:draw_mouse=0:framerate=10:video_size="+crop.Width+"x"+crop.Height+":offset_x="+crop.Left+":offset_y="+crop.Top+",hwdownload,format=bgra";
@@ -124,11 +123,11 @@ public static class NativeCaptureAudit20 {
             var a=b.GetPixel(x,y);var e=paper.Expected(crop.Left+x);if(Math.Max(Math.Abs(a.R-e.R),Math.Max(Math.Abs(a.G-e.G),Math.Abs(a.B-e.B)))>4)bad++;}
         return new Sample{Name=name,Api=api,StartMs=start,EndMs=end,Paints=paper.Paints,BackgroundRowValid=valid,OutsideChanged=bad,LeftRgb=Mean(b,left),RightRgb=Mean(b,right)};
     }
-    static Trial RunTrial(string exe,string ffmpeg,string dir,int repeat){
-        var result=new Trial{Repeat=repeat};var notes=new List<Sample>();var images=new List<Bitmap>();
+    static Trial RunTrial(string exe,string ffmpeg,string dir,int repeat,string source){
+        var result=new Trial{Repeat=repeat,Source=source};var notes=new List<Sample>();var images=new List<Bitmap>();
         Process host=null;Paper paper=null;IntPtr h=IntPtr.Zero,region=IntPtr.Zero;
         System.Threading.Tasks.Task<string> logs=null,stdout=null;var clock=Stopwatch.StartNew();
-        try{var si=new ProcessStartInfo(exe,"--glass-backend=native --theme=dark --content=optimizing --seconds=60"){
+        try{var si=new ProcessStartInfo(exe,"--glass-backend=native --theme=dark --content=optimizing --seconds=60 --backdrop-source="+source){
                 UseShellExecute=false,CreateNoWindow=true,WorkingDirectory=Path.GetDirectoryName(exe),RedirectStandardError=true,RedirectStandardOutput=true};
             si.EnvironmentVariables.Remove("GPUI_DISABLE_DIRECT_COMPOSITION");host=Process.Start(si);Check(host!=null,"Cannot start minimal host.");
             logs=host.StandardError.ReadToEndAsync();stdout=host.StandardOutput.ReadToEndAsync();
@@ -150,7 +149,7 @@ public static class NativeCaptureAudit20 {
             paper.Show();Check(SetWindowPos(h,new IntPtr(-1),0,0,0,0,0x0213),"Cannot stack host.");
             Check(SetWindowPos(paper.Handle,h,paper.Left,paper.Top,paper.Width,paper.Height,0x0250),"Cannot stack paper.");Pump(1600);
             for(int stage=0;stage<2;stage++){
-                if(stage==1){paper.Refresh();Pump(1600);} // Positive control on OUR paper, not a product remedy.
+                if(stage==1){paper.Refresh();Pump(1600);}
                 string label=stage==0?"cold":"warm";string prefix=Path.Combine(dir,"r"+repeat+"-"+label);
                 double t0=clock.Elapsed.TotalMilliseconds;var before=Gdi(crop,h,paper);double t1=clock.Elapsed.TotalMilliseconds;
                 images.Add(before);before.Save(prefix+"-gdi-before.png",ImageFormat.Png);int paintsBefore=paper.Paints;
@@ -168,7 +167,6 @@ public static class NativeCaptureAudit20 {
                 try{result.RegionPreserved=GetWindowRgn(h,actual)>1&&EqualRgn(region,actual);}finally{DeleteObject(actual);}
                 Check(result.RegionPreserved,"Host region changed.");foreach(var note in notes)Check(note.BackgroundRowValid,"Capture background is not the expected RGB; color/mapping failure, not blur evidence.");
             }
-            // Per stage: GDI-before, DDA0..3, GDI-after. Compare each API to ITSELF after source repaint.
             result.GdiInitialToWarm=Delta(images[0],images[6],points);
             result.DdaFirstInitialToWarm=Delta(images[1],images[7],points);result.DdaLastInitialToWarm=Delta(images[4],images[10],points);
             result.GdiAfterDdaToWarm=Delta(images[5],images[11],points);
@@ -181,18 +179,27 @@ public static class NativeCaptureAudit20 {
             result.HostStopped=host==null||host.HasExited;result.Samples=notes.ToArray();
             try{if(result.HostStopped&&logs!=null&&logs.Wait(2000)){string text=logs.Result??"";File.WriteAllText(Path.Combine(dir,"r"+repeat+"-host.log"),text,Encoding.UTF8);
                     result.Log=text.Length>1000?text.Substring(text.Length-1000):text;
-                    if(!text.Contains("[glass-minimal] selected=Native;")||!text.Contains("[glass-host] native brush attached")||text.Contains("[glass-minimal] failed:"))result.Error=(result.Error??"")+" Minimal host identity/runtime validation failed.";}
+                    string marker=source=="host"?"[glass-host] native brush attached":"[glass-visual-blur] attached;";
+                    if(!text.Contains("[glass-minimal] selected=Native;")||!text.Contains("source="+source+";")||!text.Contains(marker)||text.Contains("[glass-minimal] failed:"))result.Error=(result.Error??"")+" Minimal source identity/runtime validation failed.";}
                 else result.Error=(result.Error??"")+" Host log unavailable.";if(result.HostStopped&&stdout!=null)stdout.Wait(2000);
             }catch(Exception e){result.Error=(result.Error??"")+" Log: "+e.Message;}if(host!=null)host.Dispose();}
         return result;
     }
-    public static Report Run(string exe,string ffmpeg,string dir){
+    public static Report Run(string exe,string ffmpeg,string dir,string source){
+        Check(source=="host"||source=="visual-blur"||source=="compare","Invalid source choice.");
         Check(IntPtr.Size==8&&File.Exists(exe)&&File.Exists(ffmpeg),"64-bit PowerShell, minimal host and FFmpeg are required.");
         ClearOfOtherHosts();Check(!Directory.Exists(dir),"Refusing to overwrite output directory.");
         var report=new Report{Directory=dir};var trials=new List<Trial>();IntPtr old=IntPtr.Zero,focus=GetForegroundWindow();
         try{Directory.CreateDirectory(dir);old=SetThreadDpiAwarenessContext(new IntPtr(-4));Check(old!=IntPtr.Zero,"Cannot enter physical-pixel context.");
             Check(Screen.AllScreens.Length==1&&Screen.PrimaryScreen.Bounds.Location==Point.Empty,"Single-display diagnostic only; no capture was started.");
-            for(int i=1;i<=3;i++){var trial=RunTrial(exe,ffmpeg,dir,i);trials.Add(trial);Check(trial.Error==null&&trial.HostStopped,trial.Error??"Test cleanup failed.");}report.Completed=true;
+            for(int i=1;i<=3;i++){
+                string[] modes=source=="compare"?(i%2==1?new string[]{"host","visual-blur"}:new string[]{"visual-blur","host"}):new string[]{source};
+                foreach(string mode in modes){
+                    string sub=Path.Combine(dir,mode+"-r"+i);Directory.CreateDirectory(sub);
+                    var trial=RunTrial(exe,ffmpeg,sub,i,mode);trials.Add(trial);
+                    Check(trial.Error==null&&trial.HostStopped,trial.Error??"Test cleanup failed.");
+                }
+            }report.Completed=true;
         }catch(Exception e){report.Error=e.Message;}
         finally{if(old!=IntPtr.Zero)SetThreadDpiAwarenessContext(old);report.FocusPreserved=focus==GetForegroundWindow();report.Trials=trials.ToArray();}
         return report;
@@ -209,17 +216,24 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build GlassNativ
 $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
 $ffhash=(Get-FileHash -LiteralPath $FfmpegPath -Algorithm SHA256).Hash
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { $OutputDirectory=Join-Path $env:TEMP ('doubao-capture-paths-'+[Guid]::NewGuid().ToString('N')) }
-$result=[NativeCaptureAudit20]::Run($exe,$FfmpegPath,$OutputDirectory)
+$result=[NativeCaptureAudit21]::Run($exe,$FfmpegPath,$OutputDirectory,$Source)
 $result.ExecutableSha256=$hash; $result.FfmpegSha256=$ffhash
 if (Test-Path -LiteralPath $OutputDirectory -PathType Container) { [IO.File]::WriteAllText((Join-Path $OutputDirectory 'result.json'),($result|ConvertTo-Json -Depth 8 -Compress)) }
+# Bound the paired six-trial output. Full before/after RGB and capture intervals stay local.
 $trials=@($result.Trials | ForEach-Object {
-    $t=$_; $s=@($t.Samples)
-    [ordered]@{Repeat=$t.Repeat;Error=$t.Error;HostStopped=$t.HostStopped;RegionPreserved=$t.RegionPreserved;
-        GdiInitialToWarm=$t.GdiInitialToWarm;DdaFirstInitialToWarm=$t.DdaFirstInitialToWarm;DdaLastInitialToWarm=$t.DdaLastInitialToWarm;GdiAfterDdaToWarm=$t.GdiAfterDdaToWarm;
-        ColdDdaVsGdiBefore=$t.ColdDdaVsGdiBefore;ColdDdaVsGdiAfter=$t.ColdDdaVsGdiAfter;ColdGdiChangeAcrossDda=$t.ColdGdiChangeAcrossDda;ColdDdaFirstToLast=$t.ColdDdaFirstToLast;WarmDdaVsGdi=$t.WarmDdaVsGdi;
-        PaperUnchangedCold=$t.PaperUnchangedDuringColdDda;PaperUnchangedWarm=$t.PaperUnchangedDuringWarmDda;
+    $t=$_; $s=@($t.Samples); $warm=@($s|Where-Object {$_.Name -eq 'warm-gdi-after'})
+    $wl=@(); $wr=@(); $order=$null
+    if ($warm.Count -eq 1) {
+        $wl=@($warm[0].LeftRgb); $wr=@($warm[0].RightRgb)
+        if ($wl.Count -eq 3 -and $wr.Count -eq 3) { $order=$wl[0] -gt $wl[2] -and $wr[2] -gt $wr[0] }
+    }
+    [ordered]@{Source=$t.Source;Repeat=$t.Repeat;Error=$t.Error;Stopped=$t.HostStopped;
+        GdiInitialToWarm=$t.GdiInitialToWarm;DdaFirstInitialToWarm=$t.DdaFirstInitialToWarm;DdaLastInitialToWarm=$t.DdaLastInitialToWarm;
+        ColdDdaVsGdi=$t.ColdDdaVsGdiBefore;ColdGdiChangeAcrossDda=$t.ColdGdiChangeAcrossDda;WarmDdaVsGdi=$t.WarmDdaVsGdi;
+        PaperUnchangedCold=$t.PaperUnchangedDuringColdDda;RegionPreserved=$t.RegionPreserved;
         PaintCounts=@($s|ForEach-Object {$_.Paints});MaxOutsideChanged=($s|Measure-Object -Property OutsideChanged -Maximum).Maximum;
-        AllBackgroundRowsValid=($s.Count -eq 12 -and @($s|Where-Object {-not $_.BackgroundRowValid}).Count -eq 0)}
+        AllBackgroundRowsValid=($s.Count -eq 12 -and @($s|Where-Object {-not $_.BackgroundRowValid}).Count -eq 0);
+        WarmLeftRgb=$wl;WarmRightRgb=$wr;WarmRedBlueOrder=$order}
 })
 [ordered]@{Completed=$result.Completed;Error=$result.Error;FocusPreserved=$result.FocusPreserved;Directory=$result.Directory;ExecutableSha256=$hash;FfmpegSha256=$ffhash;Scope=$result.Scope;Trials=$trials}|ConvertTo-Json -Depth 5 -Compress
 if (-not $result.Completed) { throw ('Cross-capture test failed: '+$result.Error) }
