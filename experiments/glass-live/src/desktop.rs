@@ -144,15 +144,17 @@ unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<
             ANTIALIASED_QUALITY,(DEFAULT_PITCH.0|FF_DONTCARE.0)as u32,w!("Microsoft YaHei UI"));
         if font.0.is_null(){SelectObject(dc,old);let _=DeleteObject(HGDIOBJ(bitmap.0));return Err("Text font creation failed".into());}
         let old_font=SelectObject(dc,HGDIOBJ(font.0));
-        std::ptr::write_bytes(bits,0,(width*height*4)as usize);
+        std::ptr::write_bytes(bits.cast::<u8>(),0,(width*height*4)as usize);
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,COLORREF(0x00ffffff));
         let mut rect=RECT{left:(height as f32*0.92)as i32,top:0,right:width as i32-(height as f32*0.25)as i32,bottom:height as i32};
         let mut text:Vec<u16>="优化识别中".encode_utf16().collect();
         let drawn=DrawTextW(dc,&mut text,&mut rect,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        // A DIB section must synchronize batched GDI writes before CPU access.
+        let flushed=GdiFlush().as_bool();
         let pixels=std::slice::from_raw_parts(bits as *const u8,(width*height*4)as usize);
         let mask=pixels.chunks_exact(4).map(|p|p[0].max(p[1]).max(p[2])).collect::<Vec<_>>();
         SelectObject(dc,old_font);let _=DeleteObject(HGDIOBJ(font.0));SelectObject(dc,old);let _=DeleteObject(HGDIOBJ(bitmap.0));
-        ensure(drawn>0&&mask.iter().any(|&v|v>0),"Foreground text mask is empty")?;Ok(mask)
+        ensure(flushed&&drawn>0&&mask.iter().any(|&v|v>0),"Foreground text mask is empty or failed to flush")?;Ok(mask)
     })();
     let _=DeleteDC(dc);result
 }
@@ -224,7 +226,7 @@ pub unsafe fn run(options:Options)->AppResult<()> {
             if snapshot{if let Some(dir)=options.snapshots.as_deref(){
                 ensure(snapshots<100,"Snapshot limit reached (100)")?;snapshots+=1;pipe.snapshot(dir,snapshots)?;
             }else{eprintln!("[glass-live] snapshot ignored: no explicit snapshot directory");}}
-            let budget=Duration::from_millis(16);if tick.elapsed()<budget{std::thread::sleep(budget-tick.elapsed());}
+            if let Some(delay)=Duration::from_millis(16).checked_sub(tick.elapsed()){std::thread::sleep(delay);}
         }Ok(())
     })();
     // Remove the window immediately on capture/device loss; never leave stale glass.
