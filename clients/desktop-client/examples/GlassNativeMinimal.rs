@@ -1,14 +1,17 @@
 //! Reduction baseline, NOT a replacement voice client or a visual design.
-//! Run with compare-native-hosts.ps1. There is no GPUI Application, renderer,
-//! upper composition target, texture baking, animation, capture, or voice input.
-//! The existing glass_host.rs lower target and brush are intentionally reused.
-//! Comparing startup to warm pixels WITHIN each host is meaningful; absolute
-//! colors between this bare brush and the shaded GPUI product are not.
+//! No GPUI Application, renderer, upper target, texture baking, animation,
+//! capture, or voice input. Default source retains the exact shared HostBackdrop.
+//! --backdrop-source=visual-blur explicitly selects the experimental standard
+//! backdrop + system Gaussian effect. No recovery operation is performed.
+//! Compare startup to warm pixels WITHIN each mode; a constant output is not a pass.
 
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 #[path = "../src/glass_host.rs"]
 mod glass_host;
+#[cfg(target_os = "windows")]
+#[path = "support/visual_blur.rs"]
+mod visual_blur;
 
 #[cfg(target_os = "windows")]
 mod native {
@@ -17,7 +20,7 @@ mod native {
         CreateDispatcherQueueController, DispatcherQueueOptions,
         DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
     }};
-    use super::glass_host::HostBackdrop;
+    use super::{glass_host::HostBackdrop, visual_blur::VisualBlur};
 
     type WndProc = unsafe extern "system" fn(isize, u32, usize, isize) -> isize;
     #[repr(C)]
@@ -102,7 +105,7 @@ mod native {
         }
     }
 
-    fn window_loop(seconds: u32) -> Result<(), String> {
+    fn window_loop(seconds: u32, source: &str) -> Result<(), String> {
         let instance = unsafe { GetModuleHandleW(ptr::null()) };
         require(instance != 0, "get module")?;
         let name = wide("Doubao::NativeHostReduction");
@@ -112,14 +115,12 @@ mod native {
         };
         require(unsafe { RegisterClassExW(&class) } != 0, "register reduction window")?;
         let registration = Registration { name, instance };
-        // Keep the existing audit's title contract. Process identity and the
-        // [glass-minimal] log distinguish this from the product GlassPreview.
         let title = wide("Doubao Glass Preview - no microphone");
         let sw = unsafe { GetSystemMetrics(0) };
         let sh = unsafe { GetSystemMetrics(1) };
         require(sw >= 640 && sh >= 480, "primary monitor dimensions")?;
         // TOPMOST | TOOLWINDOW | NOACTIVATE | NOREDIRECTIONBITMAP. No accent,
-        // layered-window alpha, upper target, GDI fill, or timer-based refresh.
+        // layered alpha, upper target, GDI fill, or timer-based refresh.
         let ex_style = 0x08200088;
         let raw = unsafe { CreateWindowExW(ex_style, registration.name.as_ptr(), title.as_ptr(),
             0x80000000, sw / 2 - 64, sh - 180, 128, 42, 0, 0, instance, ptr::null()) };
@@ -138,12 +139,17 @@ mod native {
             unsafe { DeleteObject(region); }
             return Err("install reduction capsule region".into());
         }
-        // The same lower-target implementation as the product; no copy or new
-        // interpretation of the HostBackdrop APIs is introduced by this test.
-        let surface = HostBackdrop::new(raw, width as u32, height as u32)?;
+        // Both modes use the same lower target, geometry, HWND and message loop.
+        // Only the default arm uses HostBackdrop + its host opt-in. The candidate
+        // samples via standard backdrop and the explicit system Gaussian graph.
+        let surface = if source == "host" {
+            (Some(HostBackdrop::new(raw, width as u32, height as u32)?), None)
+        } else {
+            (None, Some(VisualBlur::new(raw, width as u32, height as u32)?))
+        };
         require(unsafe { SetTimer(raw, 1, seconds * 1000, ptr::null()) } != 0, "set lifetime timer")?;
         require(unsafe { SetWindowPos(raw, -1, 0, 0, 0, 0, 0x0053) } != 0, "show without activation")?;
-        eprintln!("[glass-minimal] selected=Native; pid={}; hwnd=0x{raw:X}; dpi={dpi}; pixels={width}x{height}; GPUI=absent; upper-target=absent; material=bare-host-brush; requested-theme-not-applied; no microphone", std::process::id());
+        eprintln!("[glass-minimal] selected=Native; pid={}; hwnd=0x{raw:X}; dpi={dpi}; pixels={width}x{height}; GPUI=absent; upper-target=absent; source={source}; requested-theme-not-applied; no microphone", std::process::id());
         let outcome = loop {
             let mut message = Message::default();
             let status = unsafe { GetMessageW(&mut message, 0, 0, 0) };
@@ -151,7 +157,7 @@ mod native {
             if status < 0 { break Err(format!("message loop: {}", std::io::Error::last_os_error())); }
             unsafe { TranslateMessage(&message); DispatchMessageW(&message); }
         };
-        drop(surface); // Detach backdrop BEFORE destroying the HWND.
+        drop(surface);
         drop(window);
         outcome
     }
@@ -159,8 +165,6 @@ mod native {
     fn shutdown(queue: &DispatcherQueueController) -> Result<(), String> {
         let action = queue.ShutdownQueueAsync().map_err(|e| e.to_string())?;
         let timer = Instant::now();
-        // AsyncStatus::Started = 0. Keep the owning UI thread pumping until the
-        // queue is shut down; do not release WinRT after uninitializing COM.
         while action.Status().map_err(|e| e.to_string())?.0 == 0 {
             if timer.elapsed() > Duration::from_secs(2) { return Err("dispatcher shutdown timed out".into()); }
             let mut message = Message::default();
@@ -175,27 +179,29 @@ mod native {
     pub fn run() -> Result<(), String> {
         require(size_of::<usize>() == 8, "64-bit baseline required")?;
         let mut seconds = 60;
+        let mut source = String::from("host");
         for arg in std::env::args().skip(1) {
             if let Some(value) = arg.strip_prefix("--seconds=") {
                 seconds = value.parse::<u32>().map_err(|_| "invalid lifetime")?;
                 if !(5..=120).contains(&seconds) { return Err("lifetime must be 5..120 seconds".into()); }
+            } else if let Some(value) = arg.strip_prefix("--backdrop-source=") {
+                if !matches!(value, "host" | "visual-blur") { return Err("backdrop source must be host or visual-blur".into()); }
+                source = value.to_owned();
             } else if !matches!(arg.as_str(), "--glass-backend=native" | "--theme=dark" | "--theme=light" | "--content=optimizing") {
                 return Err(format!("unsupported baseline argument: {arg}"));
             }
         }
-        let hr = unsafe { RoInitialize(0) }; // RO_INIT_SINGLETHREADED.
+        let hr = unsafe { RoInitialize(0) };
         if hr < 0 { return Err(format!("initialize WinRT: 0x{:08X}", hr as u32)); }
         let _apartment = Apartment;
         let previous = unsafe { SetThreadDpiAwarenessContext(-4) };
         require(previous != 0, "set per-monitor physical-pixel DPI context")?;
         let _dpi = Dpi(previous);
-        // Precreate and OWN the queue, so the shared HostBackdrop borrows it
-        // instead of leaving a thread-local owned queue past COM cleanup.
         let queue = unsafe { CreateDispatcherQueueController(DispatcherQueueOptions {
             dwSize: size_of::<DispatcherQueueOptions>() as u32,
             threadType: DQTYPE_THREAD_CURRENT, apartmentType: DQTAT_COM_NONE,
         }) }.map_err(|e| e.to_string())?;
-        let result = window_loop(seconds);
+        let result = window_loop(seconds, &source);
         let closed = shutdown(&queue);
         drop(queue);
         result.and(closed)
