@@ -1,12 +1,14 @@
 # Cross-check native-only source modes with GDI and DXGI Desktop Duplication.
 # Diagnostic only: no product changes, foreign repaint, recording, or upload.
+# -Source control alternates host/none. none has no compositor/brush/target at all.
+# UnfilteredInputMismatches tests raw transparency, NOT blur quality in native modes.
 [CmdletBinding()]
 param([string]$OutputDirectory, [string]$FfmpegPath, [switch]$CompileOnly,
-    [ValidateSet('host','visual-blur','compare')][string]$Source = 'host')
+    [ValidateSet('host','visual-blur','none','compare','control')][string]$Source = 'host')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
-if (-not ('NativeCaptureAudit21' -as [type])) {
+if (-not ('NativeCaptureAudit22' -as [type])) {
 Add-Type -ReferencedAssemblies System.Drawing,System.Windows.Forms -TypeDefinition @'
 using System;
 using System.IO;
@@ -17,7 +19,7 @@ using System.Diagnostics;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
-public static class NativeCaptureAudit21 {
+public static class NativeCaptureAudit22 {
     [StructLayout(LayoutKind.Sequential)] struct R { public int L,T,Right,Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct P { public int X,Y; }
     delegate bool EnumProc(IntPtr h,IntPtr p);
@@ -42,7 +44,7 @@ public static class NativeCaptureAudit21 {
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     public sealed class Sample {
-        public string Name,Api; public int Paints,OutsideChanged;
+        public string Name,Api; public int Paints,OutsideChanged,ProbeCount,UnfilteredInputMismatches;
         public bool BackgroundRowValid; public double StartMs,EndMs;
         public double[] LeftRgb,RightRgb;
     }
@@ -55,7 +57,7 @@ public static class NativeCaptureAudit21 {
     }
     public sealed class Report {
         public bool Completed,FocusPreserved; public string Error,Directory,ExecutableSha256,FfmpegSha256;
-        public string Scope="Native-only source comparison. HostBackdrop control versus standard Backdrop plus system Gaussian effect. Same lower target, window geometry and first-paint fixture. Sequential GDI / four DXGI frames / GDI, before and after TEST-source repaint. Low drift alone can mean a blank source; inspect warm RGB. No automatic blur/visual/FPS acceptance. Local cropped PNGs only.";
+        public string Scope="Diagnostic source comparison including optional zero-effect HWND control. none creates no compositor, target, visual, brush or host opt-in; HWND styles, HRGN, dispatcher and source fixture stay unchanged. Sequential GDI / four DXGI frames / GDI before/after TEST-source repaint. Unfiltered mismatch counts are raw-transparency checks, not blur-quality metrics. No automatic product/visual/FPS acceptance. Local cropped PNGs only.";
         public Trial[] Trials;
     }
     sealed class Paper : Form {
@@ -121,7 +123,13 @@ public static class NativeCaptureAudit21 {
             if(Math.Max(Math.Abs(a.R-e.R),Math.Max(Math.Abs(a.G-e.G),Math.Abs(a.B-e.B)))>2)valid=false;}
         int bad=0;for(int y=0;y<b.Height;y++)for(int x=0;x<b.Width;x++)if(Outside(region,x+crop.Left-outer.Left,y+crop.Top-outer.Top)){
             var a=b.GetPixel(x,y);var e=paper.Expected(crop.Left+x);if(Math.Max(Math.Abs(a.R-e.R),Math.Max(Math.Abs(a.G-e.G),Math.Abs(a.B-e.B)))>4)bad++;}
-        return new Sample{Name=name,Api=api,StartMs=start,EndMs=end,Paints=paper.Paints,BackgroundRowValid=valid,OutsideChanged=bad,LeftRgb=Mean(b,left),RightRgb=Mean(b,right)};
+        int rawBad=0;
+        foreach(var patch in new List<Point>[]{left,right})foreach(var p in patch){
+            var a=b.GetPixel(p.X,p.Y);var e=paper.Expected(crop.Left+p.X);
+            if(Math.Max(Math.Abs(a.R-e.R),Math.Max(Math.Abs(a.G-e.G),Math.Abs(a.B-e.B)))>2)rawBad++;
+        }
+        return new Sample{Name=name,Api=api,StartMs=start,EndMs=end,Paints=paper.Paints,BackgroundRowValid=valid,OutsideChanged=bad,
+            ProbeCount=left.Count+right.Count,UnfilteredInputMismatches=rawBad,LeftRgb=Mean(b,left),RightRgb=Mean(b,right)};
     }
     static Trial RunTrial(string exe,string ffmpeg,string dir,int repeat,string source){
         var result=new Trial{Repeat=repeat,Source=source};var notes=new List<Sample>();var images=new List<Bitmap>();
@@ -179,21 +187,26 @@ public static class NativeCaptureAudit21 {
             result.HostStopped=host==null||host.HasExited;result.Samples=notes.ToArray();
             try{if(result.HostStopped&&logs!=null&&logs.Wait(2000)){string text=logs.Result??"";File.WriteAllText(Path.Combine(dir,"r"+repeat+"-host.log"),text,Encoding.UTF8);
                     result.Log=text.Length>1000?text.Substring(text.Length-1000):text;
-                    string marker=source=="host"?"[glass-host] native brush attached":"[glass-visual-blur] attached;";
-                    if(!text.Contains("[glass-minimal] selected=Native;")||!text.Contains("source="+source+";")||!text.Contains(marker)||text.Contains("[glass-minimal] failed:"))result.Error=(result.Error??"")+" Minimal source identity/runtime validation failed.";}
+                    string marker=source=="host"?"[glass-host] native brush attached":source=="none"?"[glass-clear] compositor=absent;":"[glass-visual-blur] attached;";
+                    string selected=source=="none"?"Transparent":"Native";
+                    if(!text.Contains("[glass-minimal] selected="+selected+";")||!text.Contains("source="+source+";")||!text.Contains(marker)||text.Contains("[glass-minimal] failed:"))result.Error=(result.Error??"")+" Minimal source identity/runtime validation failed.";
+                    if(source=="none"&&(text.Contains("[glass-host] native brush attached")||text.Contains("[glass-visual-blur] attached;")))result.Error=(result.Error??"")+" Zero-effect control unexpectedly initialized a brush.";}
                 else result.Error=(result.Error??"")+" Host log unavailable.";if(result.HostStopped&&stdout!=null)stdout.Wait(2000);
             }catch(Exception e){result.Error=(result.Error??"")+" Log: "+e.Message;}if(host!=null)host.Dispose();}
         return result;
     }
     public static Report Run(string exe,string ffmpeg,string dir,string source){
-        Check(source=="host"||source=="visual-blur"||source=="compare","Invalid source choice.");
+        Check(source=="host"||source=="visual-blur"||source=="none"||source=="compare"||source=="control","Invalid source choice.");
         Check(IntPtr.Size==8&&File.Exists(exe)&&File.Exists(ffmpeg),"64-bit PowerShell, minimal host and FFmpeg are required.");
         ClearOfOtherHosts();Check(!Directory.Exists(dir),"Refusing to overwrite output directory.");
         var report=new Report{Directory=dir};var trials=new List<Trial>();IntPtr old=IntPtr.Zero,focus=GetForegroundWindow();
         try{Directory.CreateDirectory(dir);old=SetThreadDpiAwarenessContext(new IntPtr(-4));Check(old!=IntPtr.Zero,"Cannot enter physical-pixel context.");
             Check(Screen.AllScreens.Length==1&&Screen.PrimaryScreen.Bounds.Location==Point.Empty,"Single-display diagnostic only; no capture was started.");
             for(int i=1;i<=3;i++){
-                string[] modes=source=="compare"?(i%2==1?new string[]{"host","visual-blur"}:new string[]{"visual-blur","host"}):new string[]{source};
+                string[] modes;
+                if(source=="compare")modes=i%2==1?new string[]{"host","visual-blur"}:new string[]{"visual-blur","host"};
+                else if(source=="control")modes=i%2==1?new string[]{"host","none"}:new string[]{"none","host"};
+                else modes=new string[]{source};
                 foreach(string mode in modes){
                     string sub=Path.Combine(dir,mode+"-r"+i);Directory.CreateDirectory(sub);
                     var trial=RunTrial(exe,ffmpeg,sub,i,mode);trials.Add(trial);
@@ -216,15 +229,16 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Build GlassNativ
 $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
 $ffhash=(Get-FileHash -LiteralPath $FfmpegPath -Algorithm SHA256).Hash
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { $OutputDirectory=Join-Path $env:TEMP ('doubao-capture-paths-'+[Guid]::NewGuid().ToString('N')) }
-$result=[NativeCaptureAudit21]::Run($exe,$FfmpegPath,$OutputDirectory,$Source)
+$result=[NativeCaptureAudit22]::Run($exe,$FfmpegPath,$OutputDirectory,$Source)
 $result.ExecutableSha256=$hash; $result.FfmpegSha256=$ffhash
 if (Test-Path -LiteralPath $OutputDirectory -PathType Container) { [IO.File]::WriteAllText((Join-Path $OutputDirectory 'result.json'),($result|ConvertTo-Json -Depth 8 -Compress)) }
 # Bound the paired six-trial output. Full before/after RGB and capture intervals stay local.
 $trials=@($result.Trials | ForEach-Object {
-    $t=$_; $s=@($t.Samples); $warm=@($s|Where-Object {$_.Name -eq 'warm-gdi-after'})
-    $wl=@(); $wr=@(); $order=$null
+    $t=$_; $s=@($t.Samples); $warm=@($s|Where-Object {$_.Name -eq 'warm-gdi-after'}); $cold=@($s|Where-Object {$_.Name -eq 'cold-gdi-before'})
+    $wl=@(); $wr=@(); $order=$null; $coldBad=$null; $warmBad=$null; $probes=$null
+    if ($cold.Count -eq 1) { $coldBad=$cold[0].UnfilteredInputMismatches; $probes=$cold[0].ProbeCount }
     if ($warm.Count -eq 1) {
-        $wl=@($warm[0].LeftRgb); $wr=@($warm[0].RightRgb)
+        $wl=@($warm[0].LeftRgb); $wr=@($warm[0].RightRgb); $warmBad=$warm[0].UnfilteredInputMismatches
         if ($wl.Count -eq 3 -and $wr.Count -eq 3) { $order=$wl[0] -gt $wl[2] -and $wr[2] -gt $wr[0] }
     }
     [ordered]@{Source=$t.Source;Repeat=$t.Repeat;Error=$t.Error;Stopped=$t.HostStopped;
@@ -233,6 +247,7 @@ $trials=@($result.Trials | ForEach-Object {
         PaperUnchangedCold=$t.PaperUnchangedDuringColdDda;RegionPreserved=$t.RegionPreserved;
         PaintCounts=@($s|ForEach-Object {$_.Paints});MaxOutsideChanged=($s|Measure-Object -Property OutsideChanged -Maximum).Maximum;
         AllBackgroundRowsValid=($s.Count -eq 12 -and @($s|Where-Object {-not $_.BackgroundRowValid}).Count -eq 0);
+        ProbePixels=$probes;ColdUnfilteredMismatches=$coldBad;WarmUnfilteredMismatches=$warmBad;
         WarmLeftRgb=$wl;WarmRightRgb=$wr;WarmRedBlueOrder=$order}
 })
 [ordered]@{Completed=$result.Completed;Error=$result.Error;FocusPreserved=$result.FocusPreserved;Directory=$result.Directory;ExecutableSha256=$hash;FfmpegSha256=$ffhash;Scope=$result.Scope;Trials=$trials}|ConvertTo-Json -Depth 5 -Compress
