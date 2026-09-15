@@ -19,13 +19,13 @@ unsafe fn baseline(device: ID3D11Device, context: ID3D11DeviceContext, mask: &[u
 unsafe fn upload(pipe: &Pipeline, pixels: &[u8], v1: bool) {
     assert_eq!(pixels.len(), (pipe.raw.width * pipe.raw.height * 4) as usize);
     pipe.context.UpdateSubresource(&pipe.raw.texture, 0, None, pixels.as_ptr().cast(), pipe.raw.width * 4, 0);
-    if v1 { pipe.prepare_scales(.16, .035); } else { pipe.prepare(); }
+    if v1 { pipe.prepare_scales(0.16, 0.035); } else { pipe.prepare(); }
 }
 fn pixel(pixels: &[u8], x: usize, y: usize) -> &[u8] {
     &pixels[(y * W + x) * 4..][..4]
 }
 fn luminance(p: &[u8]) -> f64 {
-    .2126 * p[0] as f64 + .7152 * p[1] as f64 + .0722 * p[2] as f64
+    0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64
 }
 fn row_std(pixels: &[u8], y: usize) -> f64 {
     let v: Vec<f64> = (H..W-H).map(|x| luminance(pixel(pixels, x, y))).collect();
@@ -86,7 +86,7 @@ unsafe fn export(pipe: &Pipeline, directory: &Path, name: &str) -> AppResult<()>
 #[test]
 fn center_filter_support_stays_inside_existing_roi() {
     for h in 20..=120 {
-        let padding = (h as f32 * .65).ceil() as u32;
+        let padding = (h as f32 * 0.65).ceil() as u32;
         let support = (3.0 * (h as f32 * CENTER_SIGMA_FRACTION).min(20.0)).ceil() as u32;
         assert!(support <= padding, "height={h}");
     }
@@ -115,8 +115,8 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
             let before = row_std(&v1, H/2);
             let after = row_std(&v2, H/2);
             let rim = row_std(&v2, 3);
-            assert!(before > .5, "The baseline fixture must actually contain measurable variation");
-            assert!(after < before * .65 + .15, "Center suppression regressed: V1={before}, V2={after}");
+            assert!(before > 0.5, "The baseline fixture must actually contain measurable variation");
+            assert!(after < before * 0.65 + 0.15, "Center suppression regressed: V1={before}, V2={after}");
             assert!(rim > after + 1.0 && rim < 35.0, "Rim must transmit more structure, not become unfiltered: {rim}");
             for (a, b) in v1.chunks_exact(4).zip(v2.chunks_exact(4)) {
                 assert_eq!(a[3], b[3], "Coverage must not change with material tuning");
@@ -138,7 +138,7 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
                 let center = pixel(&pixels,W/2,H/2);
                 if dark { assert!(center[..3].iter().all(|c| *c >= 20 && *c <= 80)); }
                 else { assert!(center[..3].iter().all(|c| *c >= 230 && *c <= 251)); }
-                let x = (W as f32*.28) as usize;
+                let x = (W as f32*0.28) as usize;
                 assert!(luminance(pixel(&pixels,x,1)) > luminance(pixel(&pixels,x,H-2)) + 1., "Directional rim disappeared");
             }
         }
