@@ -51,9 +51,11 @@ fn parameter_refactor_matches_v22_on_gpu() -> AppResult<()> {
         let mut max_rgb_error = 0u8;
         let mut compared_pixels = 0usize;
         let mut cases = 0usize;
+        // Sibling, not child: the historical material test creates its own root
+        // concurrently with create_dir(). Neither test owns the other's directory.
         let dir = std::env::var_os("GLASS_MATERIAL_FIXTURES")
-            .map(|p| std::path::PathBuf::from(p).join("issue11-refactor"));
-        if let Some(dir) = &dir { std::fs::create_dir(dir)?; }
+            .map(|p| std::path::PathBuf::from(p).with_extension("issue11"));
+        if let Some(dir) = &dir { std::fs::create_dir_all(dir)?; }
         for (w,h) in [(108u32,26u32),(162,39),(324,78)] {
             let mask: Vec<u8> = (0..w*h).map(|i| {
                 let (x,y) = (i%w,i/w);
@@ -89,7 +91,7 @@ fn parameter_refactor_matches_v22_on_gpu() -> AppResult<()> {
                         if w==162 && *offset==0 && (kind==4 || kind==5) {
                             if let Some(dir) = &dir {
                                 let dir = dir.join(format!("{}-{}",if kind==4 {"colors"} else {"text"},if dark {"dark"} else {"light"}));
-                                std::fs::create_dir(&dir)?;
+                                std::fs::create_dir_all(&dir)?;
                                 baseline.snapshot(&dir,1)?;
                                 current.snapshot(&dir,2)?;
                             }
