@@ -2,6 +2,9 @@
 //! duplication. Mouse routing is exercised ONLY in an explicitly enabled hosted
 //! Windows CI desktop over this process's generated windows. Cargo-test only;
 //! never compiled into the formal EXE self-test or run on the user's machine.
+//! The adaptive workflow runs this ignored integration test explicitly, in its
+//! own process, before the parallel unit suite. Other tests create windows and
+//! must not compete for the same desktop/cursor while this fixture is observed.
 use super::*;
 use std::sync::{atomic::{AtomicBool,AtomicUsize,Ordering},mpsc};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1,IDXGIFactory2};
@@ -58,6 +61,7 @@ unsafe fn click_fixture(p:POINT,allowed:&[HWND]) {
 }
 
 #[test]
+#[ignore = "requires exclusive hosted CI desktop; mandatory isolated adaptive-glass workflow step"]
 fn native_canvas_visible_input_stays_capsule_and_both_windows_move(){unsafe {
     assert!(std::env::var("GITHUB_ACTIONS").as_deref()==Ok("true") && std::env::var("GLASS_CI_NATIVE_FIXTURE").as_deref()==Ok("1"),"Native desktop fixture requires explicit hosted CI authorization; it must not inject local user input");
     let _serial=WINDOW_TEST_LOCK.lock().unwrap_or_else(|p|p.into_inner());
