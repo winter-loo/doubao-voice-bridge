@@ -1,0 +1,56 @@
+name: Preserve liquid glass baseline
+on:
+  push:
+    branches: ['chore/liquid-glass-baseline-20260915']
+    paths: ['.github/workflows/liquid-glass-baseline-tag.yml']
+permissions:
+  contents: read
+concurrency:
+  group: liquid-glass-baseline-20260915
+  cancel-in-progress: false
+jobs:
+  tag:
+    if: github.repository == 'winter-loo/doubao-voice-bridge' && github.ref == 'refs/heads/chore/liquid-glass-baseline-20260915'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create only the requested fixed baseline tag; never replace or publish a release
+        shell: bash
+        env:
+          BASELINE: b504973fda501775a4aaabc68c5a064373ebd606
+          TAG: liquid-glass-baseline-2026-09-15
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "$BASELINE^{commit}")" = "$BASELINE"
+          existing="$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          if test -n "$existing"; then
+            git fetch --no-tags origin "refs/tags/$TAG"
+            test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$BASELINE"
+            echo 'Baseline tag already exists at the expected commit; not modified.'
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/baseline-tag.txt" <<'NOTE'
+          Liquid glass baseline before iPhone-recording-driven adaptive-contrast work.
+
+          Source checkpoint: b504973fda501775a4aaabc68c5a064373ebd606.
+          User explicitly requested this tag after basic implementation verification.
+          Includes the original cyan-to-blue recording waveform restoration.
+          The parent 3e2fcfd had one successful real-voice local smoke check.
+          The colored-waveform fix passed Windows CI, actual HLSL/WARP checks and
+          the formal EXE self-test; its local EXE replacement was not independently
+          confirmed at tag creation. This tag is a rollback/source baseline, not a
+          claim of exhaustive platform, performance or white-background acceptance.
+
+          CI: actions/runs/34969954936, artifact 10396607817.
+          Formal EXE SHA256: 9cde74c73ec57f7fa0d9a0855447f732ad0064fb0fe309b3f86f4b38bbcf32c9.
+          No PR merge, release publication, local process or setting change.
+          NOTE
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' tag -a "$TAG" "$BASELINE" -F "$RUNNER_TEMP/baseline-tag.txt"
+          git push origin "refs/tags/$TAG:refs/tags/$TAG"
+          git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
+          printf '### Preserved baseline\n`%s` → `%s`\n' "$TAG" "$BASELINE" >> "$GITHUB_STEP_SUMMARY"
