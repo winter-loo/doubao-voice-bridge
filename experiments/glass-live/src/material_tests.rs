@@ -1,6 +1,8 @@
 //! Offscreen WARP tests. All input pixels below are generated here, never captured.
-//! V1 uses its original blur scales; the pinned V2 baseline uses the same filters
-//! as V2.1. These are regression bounds, not OCR scores or Apple parity.
+//! V1 uses its original blur scales; the pinned V2 baseline uses the same filters.
+//! Historical V2.1 rim checks run with ONLY the new surface reflection disabled.
+//! Final V2.2 output also has independent contrast, foreground and relief checks.
+//! These are regression bounds, not OCR scores, display timing or Apple parity.
 use super::*;
 
 const W: usize = 162;
@@ -115,8 +117,7 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
             let v2 = current.read_rgba(&current.output)?;
             let before = row_std(&v1, H/2);
             let after = row_std(&v2, H/2);
-            // V2.1 deliberately narrows the rim: sample its actual 1.5px inset,
-            // not the old 3.5px shoulder. Keep the existing contrast bounds.
+            // Sample the unchanged thin rim at its actual 1.5px inset.
             let rim = row_std(&v2, 1);
             assert!(before > 0.5, "The baseline fixture must actually contain measurable variation");
             assert!(after < before * 0.65 + 0.15, "Center suppression regressed: V1={before}, current={after}");
@@ -130,8 +131,7 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
             } }
             metrics.push(format!("{{\"theme\":\"{}\",\"stripe_center_std_v1\":{before:.6},\"stripe_center_std_v2\":{after:.6},\"stripe_rim_std_v2\":{rim:.6}}}", if dark {"dark"} else {"light"}));
         }
-        // Bounds over uniform black/white: clean pearl light body, darker charcoal
-        // body, and a non-flat directional rim. No thresholds on average screenshot RGB.
+        // These original bounds also apply to the FINAL material with reflection.
         for value in [0, 255] {
             let solid = fixture(rw, rh, |_, _| [value,value,value,255]);
             upload(&current, &solid, false);
@@ -165,10 +165,14 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
                 }
             }
         }
-        let summary = format!("{{\"scope\":\"synthetic WARP pixels; no desktop capture or display timing; V1 uses original shader and blur scales\",\"material\":\"V2.1\",\"rim_probe_inset_pixels\":1.5,\"width\":{rw},\"height\":{rh},\"metrics\":[{}]}}", metrics.join(","));
+        let summary = format!("{{\"scope\":\"synthetic WARP pixels; no desktop capture or display timing; V1 uses original shader and blur scales\",\"material\":\"V2.2\",\"rim_probe_inset_pixels\":1.5,\"width\":{rw},\"height\":{rh},\"metrics\":[{}]}}", metrics.join(","));
         eprintln!("[material-v2] {summary}");
         if let Some(dir) = &directory { std::fs::write(dir.join("metrics.json"), summary)?; }
-        rim_refinement_contract(&current, &mask, directory.as_deref())?;
+        let no_reflection = reflection_control(&current, &mask)?;
+        // Retain the exact historical center/rim regression on the transmission
+        // stage, then independently bound the final new reflection below.
+        rim_refinement_contract(&no_reflection, &mask, directory.as_deref())?;
+        surface_reflection_contract(&current, &no_reflection, &mask, directory.as_deref())?;
         Ok(())
     }
 }
@@ -239,8 +243,117 @@ unsafe fn rim_refinement_contract(current: &Pipeline, mask: &[u8], directory: Op
             }
         }
     }
-    let summary = format!("{{\"scope\":\"synthetic WARP, pinned V2 versus V2.1; no user pixels\",\"metrics\":[{}]}}",metrics.join(","));
+    let summary = format!("{{\"scope\":\"synthetic WARP, pinned V2 versus V2.1 transmission; new reflection disabled only for this historical contract; no user pixels\",\"metrics\":[{}]}}",metrics.join(","));
     eprintln!("[material-v21] {summary}");
+    if let Some(dir) = &dir { std::fs::write(dir.join("metrics.json"),summary)?; }
+    Ok(())
+}
+
+unsafe fn reflection_control(current: &Pipeline, mask: &[u8]) -> AppResult<Pipeline> {
+    let mut pipe = Pipeline::new(current.device.clone(),current.context.clone(),W as u32,H as u32,mask)?;
+    let source = format!("#define GLASS_SURFACE_REFLECTION_TEST_OFF 1\n{}",include_str!("glass.hlsl"));
+    let code = compile_source(&source,s!("material_ps"),s!("ps_5_0"))?;
+    let mut shader = None;
+    pipe.device.CreatePixelShader(blob_bytes(&code),None,Some(&mut shader))?;
+    pipe.material = shader.ok_or("Missing reflection-off control shader")?;
+    Ok(pipe)
+}
+fn inset_at(x: usize, y: usize) -> f32 {
+    let qx = x as f32+0.5-W as f32*0.5;
+    let qy = y as f32+0.5-H as f32*0.5;
+    let half = (W-H) as f32*0.5;
+    H as f32*0.5-((qx-qx.clamp(-half,half)).powi(2)+qy*qy).sqrt()
+}
+fn relative_luminance(p: &[u8]) -> f64 {
+    let linear = |v: u8| { let c = v as f64/255.; if c <= 0.04045 {c/12.92} else {((c+0.055)/1.055).powf(2.4)} };
+    0.2126*linear(p[0])+0.7152*linear(p[1])+0.0722*linear(p[2])
+}
+fn center_difference(a: &[u8], b: &[u8]) -> f64 {
+    let mut sum = 0.; let mut count = 0;
+    for y in H/3..H*2/3 { for x in H..W-H {
+        sum += (luminance(pixel(a,x,y))-luminance(pixel(b,x,y))).abs(); count += 1;
+    } }
+    sum/count as f64
+}
+unsafe fn surface_reflection_contract(current: &Pipeline, control: &Pipeline, mask: &[u8], directory: Option<&Path>) -> AppResult<()> {
+    let (rw,rh) = (current.raw.width,current.raw.height);
+    let dir = directory.map(|p|p.join("surface-reflection"));
+    if let Some(dir) = &dir { std::fs::create_dir(dir)?; }
+    let mut metrics = Vec::new();
+    for value in [0,128,255] {
+        let input = fixture(rw,rh,|_,_|[value,value,value,255]);
+        upload(current,&input,false); upload(control,&input,false);
+        for dark in [false,true] {
+            control.render(dark,PHASE,false); current.render(dark,PHASE,false);
+            let before = control.read_rgba(&control.output)?;
+            let after = current.read_rgba(&current.output)?;
+            let mut max_shift = 0u8;
+            for y in 0..H { for x in 0..W {
+                let a = pixel(&before,x,y); let b = pixel(&after,x,y);
+                assert_eq!(a[3],b[3],"Reflection changed coverage");
+                assert!(b[..3].iter().all(|v|*v<=b[3]),"Reflection broke premultiplication");
+                for k in 0..3 { max_shift = max_shift.max(a[k].abs_diff(b[k])); }
+                if inset_at(x,y) <= H as f32*0.08 {
+                    assert!(a.iter().zip(b).all(|(a,b)|a.abs_diff(*b)<=1),"Thin rim widened by reflection");
+                }
+            } }
+            assert!(max_shift <= if dark {16} else {3},"Reflection too strong: dark={dark}, max={max_shift}");
+            let x = (W as f32*0.30) as usize;
+            let y = (H as f32*0.28) as usize;
+            let top_lift = luminance(pixel(&after,x,y))-luminance(pixel(&before,x,y));
+            let bottom_lift = luminance(pixel(&after,x,H-1-y))-luminance(pixel(&before,x,H-1-y));
+            assert!(top_lift > if dark {3.0} else {0.3},"Reflection disappeared: {top_lift}");
+            assert!(top_lift > bottom_lift+0.3,"Reflection became a uniform overlay");
+            metrics.push(format!("{{\"background\":{value},\"dark\":{dark},\"max_rgb_shift\":{max_shift},\"top_lift\":{top_lift:.4},\"bottom_lift\":{bottom_lift:.4}}}"));
+        }
+    }
+    // Invert the same stripes to measure INPUT-dependent contrast, cancelling the
+    // static reflection. A smooth gradient must not conceal sharper background.
+    let stripes_a = fixture(rw,rh,|x,_|{let v=if x/8%2==0{0}else{255};[v,v,v,255]});
+    let stripes_b = fixture(rw,rh,|x,_|{let v=if x/8%2==0{255}else{0};[v,v,v,255]});
+    for dark in [false,true] {
+        upload(current,&stripes_a,false); upload(control,&stripes_a,false);
+        current.render(dark,PHASE,false); control.render(dark,PHASE,false);
+        let a = current.read_rgba(&current.output)?; let old_a = control.read_rgba(&control.output)?;
+        upload(current,&stripes_b,false); upload(control,&stripes_b,false);
+        current.render(dark,PHASE,false); control.render(dark,PHASE,false);
+        let b = current.read_rgba(&current.output)?; let old_b = control.read_rgba(&control.output)?;
+        let response = center_difference(&a,&b); let old_response = center_difference(&old_a,&old_b);
+        assert!(response <= old_response+0.5,"Reflection amplified background contrast: {old_response} -> {response}");
+        metrics.push(format!("{{\"dark\":{dark},\"stripe_response_v21\":{old_response:.6},\"stripe_response_v22\":{response:.6}}}"));
+    }
+    let text = text_fixture(rw,rh);
+    let colors = fixture(rw,rh,|x,_|if x<rw/2{[64,48,220,255]}else{[224,112,32,255]});
+    let white = fixture(rw,rh,|_,_|[255,255,255,255]);
+    for (name,input) in [("text",text),("colors",colors),("white",white)] {
+        upload(current,&input,false); upload(control,&input,false);
+        for dark in [false,true] {
+            current.render(dark,PHASE,false);
+            let background = current.read_rgba(&current.output)?;
+            current.render(dark,PHASE,true); control.render(dark,PHASE,true);
+            let after = current.read_rgba(&current.output)?;
+            let before = control.read_rgba(&control.output)?;
+            for (i,m) in mask.iter().enumerate() {
+                if *m == 255 {
+                    let fg = &after[i*4..i*4+4]; let bg = &background[i*4..i*4+4];
+                    assert_eq!(fg,&before[i*4..i*4+4],"Reflection altered opaque foreground");
+                    let a = relative_luminance(fg); let b = relative_luminance(bg);
+                    assert!((a.max(b)+0.05)/(a.min(b)+0.05) >= 7.0,"Synthetic foreground contrast fell below design bound");
+                }
+            }
+            if name == "colors" {
+                let a = pixel(&background,30,H/2); let b = pixel(&background,W-30,H/2);
+                assert!(a[0] > a[2]+5 && b[2] > b[0]+5,"Background color response disappeared");
+            }
+            if let Some(dir) = &dir {
+                let theme = if dark{"dark"}else{"light"};
+                export(control,dir,&format!("{name}-{theme}-v21.png"))?;
+                export(current,dir,&format!("{name}-{theme}-v22.png"))?;
+            }
+        }
+    }
+    let summary = format!("{{\"scope\":\"synthetic WARP; same filters/input/phase; V2.1 transmission versus final V2.2 surface reflection; not user screenshot or display acceptance\",\"metrics\":[{}]}}",metrics.join(","));
+    eprintln!("[material-v22] {summary}");
     if let Some(dir) = &dir { std::fs::write(dir.join("metrics.json"),summary)?; }
     Ok(())
 }
