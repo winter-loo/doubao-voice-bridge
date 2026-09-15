@@ -29,10 +29,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & './experiments/glass-live/run-preview.ps1' -CompileOnly
           & './experiments/glass-live/review-preview.ps1' -CompileOnly
-      - name: Run unit, hidden-window control and same-frame GPU pair tests; build Windows executable
+      - name: Run unit, control, GPU pair and V1-V2 material tests; build Windows executable
         shell: pwsh
         run: |
-          cargo test --locked --manifest-path experiments/glass-live/Cargo.toml
+          $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures'
+          cargo test --locked --manifest-path experiments/glass-live/Cargo.toml -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked --manifest-path experiments/glass-live/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -51,6 +52,14 @@ jobs:
               if ($bitmap.Width -ne 212 -or $bitmap.Height -ne 92) { throw 'Unexpected decoded PNG size.' }
             } finally { $bitmap.Dispose() }
           }
+          $comparisons = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures') -Filter '*.png')
+          if ($comparisons.Count -ne 8) { throw 'Expected eight V1/V2 text and color comparison images.' }
+          foreach ($image in $comparisons) {
+            $bitmap = [System.Drawing.Bitmap]::new($image.FullName)
+            try {
+              if ($bitmap.Width -ne 214 -or $bitmap.Height -ne 91) { throw 'Unexpected material comparison PNG size.' }
+            } finally { $bitmap.Dispose() }
+          }
           'PNG decoding verified independently. This is not live-desktop/hardware acceptance.'
       - name: Upload independent preview and synthetic GPU fixtures
         uses: actions/upload-artifact@v4
@@ -59,5 +68,7 @@ jobs:
           path: |
             experiments/glass-live/target/release/GlassLivePreview.exe
             ${{ runner.temp }}/glass-live-gpu-fixtures/*.png
+            ${{ runner.temp }}/glass-material-v2-fixtures/*.png
+            ${{ runner.temp }}/glass-material-v2-fixtures/metrics.json
           if-no-files-found: error
           retention-days: 7
