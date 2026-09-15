@@ -1,7 +1,5 @@
-// Issue #11 stage 1. Appended after the unchanged glass.hlsl reference and
-// generated material_config.rs constants. The old material_ps stays independent;
-// the runtime uses configured_material_ps. Shared color/filter/geometry helpers
-// deliberately retain the V2.2 implementation.
+// Configured runtime material; glass.hlsl remains an immutable V2.2 reference.
+// Generated constants come from material_config.rs. All colors below are linear.
 float3 configured_tone(float3 scene, float protection, bool dark) {
     float4 tone = dark ? cfg_dark_luminance : cfg_light_luminance;
     float2 gain = dark ? cfg_dark_chroma : cfg_light_chroma;
@@ -11,6 +9,22 @@ float3 configured_tone(float3 scene, float protection, bool dark) {
     float luminance = lerp(tone.x + tone.y * y, tone.z + tone.w * y, protection);
     float chroma_gain = lerp(gain.x, gain.y, protection);
     return saturate(luminance.xxx + chroma * chroma_gain + bias);
+}
+// The soft band contains the fixed waveform and text layout. It is NOT fitted
+// to background ink and cannot shimmer as the desktop scrolls underneath it.
+float configured_content_weight(float2 p, float inset) {
+    float2 half_size = cfg_content_extent * geometry.zw * .5;
+    float radius = min(cfg_content_corner * geometry.w, min(half_size.x, half_size.y));
+    float2 q = abs(p - cfg_content_center * geometry.zw) - (half_size - radius);
+    float distance = length(max(q, 0)) + min(max(q.x, q.y), 0) - radius;
+    float weight = 1 - smoothstep(-cfg_content_feather * geometry.w, 0, distance);
+    // Keep the outer 8% inset completely untouched, including antialias coverage.
+    return weight * smoothstep(.08 * geometry.w, .20 * geometry.w, inset);
+}
+float3 configured_veil(float3 body, float weight, bool dark) {
+    float4 r = dark ? cfg_dark_readability : cfg_light_readability;
+    float3 target = dark ? cfg_dark_veil_rgb : cfg_light_veil_rgb;
+    return saturate(lerp(body, target, weight * r.x) + weight * r.y);
 }
 float3 configured_rim(float3 body, float2 p, float3 field, bool dark) {
     float scale = geometry.w / cfg_reference_height;
@@ -52,13 +66,14 @@ float4 configured_material_ps(float4 pos : SV_POSITION) : SV_TARGET {
                         image1.SampleLevel(clamped, uv, 0).rgb, bevel * cfg_narrow_mix);
     bool dark = style.x > .5;
     float3 c = configured_tone(scene, protection, dark);
+    c = configured_veil(c, configured_content_weight(p, inset), dark);
     c = configured_rim(c, p, f, dark);
 #ifndef GLASS_SURFACE_REFLECTION_TEST_OFF
     c = configured_surface(c, p, inset, dark);
 #endif
     if (style.z > .5) {
         float foreground = text_mask.SampleLevel(clamped, p / geometry.zw, 0);
-        // Keep original foreground geometry and animation; only its color is named.
+        // Foreground layout, colors and animation remain unchanged.
         [unroll] for (int i = 0; i < 5; ++i) {
             float x = h * (.32 + i * .105);
             float length_y = h * (.07 + .12 * (.5 + .5 * sin(style.y * 3.5 + i * 1.3)));
@@ -69,4 +84,9 @@ float4 configured_material_ps(float4 pos : SV_POSITION) : SV_TARGET {
         c = lerp(c, dark ? cfg_dark_foreground : cfg_light_foreground, foreground);
     }
     return float4(encode_srgb(c) * coverage, coverage);
+}
+// Explicit offscreen test entry: validates the mask actually executed by HLSL.
+float4 configured_content_mask_ps(float4 p : SV_POSITION) : SV_TARGET {
+    float w = configured_content_weight(p.xy, max(0, -capsule(p.xy).x));
+    return float4(w, w, w, 1);
 }
