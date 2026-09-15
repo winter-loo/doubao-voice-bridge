@@ -36,7 +36,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & './experiments/glass-live/run-preview.ps1' -CompileOnly
           & './experiments/glass-live/review-preview.ps1' -CompileOnly
-      - name: Run unit, control, GPU pair and material regression tests; build Windows executable
+      - name: Test actual optics, input, pair export and retained material controls; build executable
         shell: pwsh
         run: |
           $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures'
@@ -44,10 +44,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked --manifest-path experiments/glass-live/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Execute real shaders on WARP without desktop capture
+      - name: Execute the default optical renderer on WARP and decode all fixtures
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'glass-live-gpu-fixtures'
+          $help = & './experiments/glass-live/target/release/GlassLivePreview.exe' --help | Out-String
+          if ($LASTEXITCODE -ne 0 -or -not $help.Contains('LENS_TRANSMISSION_1')) { throw 'Old renderer binary was built.' }
           & './experiments/glass-live/target/release/GlassLivePreview.exe' --self-test "--snapshot-dir=$dir"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Type -AssemblyName System.Drawing
@@ -68,24 +70,36 @@ jobs:
           $parity = @(Get-ChildItem -LiteralPath $issueRoot -Recurse -File -Filter '*.png')
           if ($parity.Count -ne 8) { throw 'Expected eight V2.2/neutral-profile parity PNGs.' }
           $metrics = Get-Content -LiteralPath (Join-Path $issueRoot 'metrics.json') -Raw | ConvertFrom-Json
-          if ($metrics.stage -ne 1 -or $metrics.cases -ne 192 -or $metrics.compared_pixels -ne 2201472 -or $metrics.max_rgb_error -gt 1 -or -not $metrics.alpha_exact) {
-            throw 'Parameter-refactor parity contract failed.'
-          }
+          if ($metrics.stage -ne 1 -or $metrics.cases -ne 192 -or $metrics.compared_pixels -ne 2201472 -or $metrics.max_rgb_error -gt 1 -or -not $metrics.alpha_exact) { throw 'Historical parameter-refactor parity failed.' }
           $v23Root = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures.issue11-v23'
           $v23 = @(Get-ChildItem -LiteralPath $v23Root -Recurse -File -Filter '*.png')
-          if ($v23.Count -ne 48) { throw 'Expected 6 backgrounds x 2 themes x 4 material stages.' }
-          $current = Get-Content -LiteralPath (Join-Path $v23Root 'metrics.json') -Raw | ConvertFrom-Json
-          if ($current.cases -ne 36 -or -not $current.alpha_exact -or -not $current.opaque_foreground_exact -or $current.min_synthetic_foreground_contrast -lt 7 -or $current.max_veil_light_rgb_shift -gt 4 -or $current.max_veil_dark_rgb_shift -gt 12) {
-            throw 'Current V2.3 material contract or coverage failed.'
-          }
+          if ($v23.Count -ne 48) { throw 'Expected retained V2.3 stage fixtures.' }
+          $historical = Get-Content -LiteralPath (Join-Path $v23Root 'metrics.json') -Raw | ConvertFrom-Json
+          if ($historical.cases -ne 36 -or -not $historical.alpha_exact -or -not $historical.opaque_foreground_exact -or $historical.min_synthetic_foreground_contrast -lt 7 -or $historical.max_veil_light_rgb_shift -gt 4 -or $historical.max_veil_dark_rgb_shift -gt 12) { throw 'Retained V2.3 contract failed.' }
           foreach ($image in @($comparisons + $surface + $parity + $v23)) {
             $bitmap = [System.Drawing.Bitmap]::new($image.FullName)
             try {
-              if ($bitmap.Width -ne 214 -or $bitmap.Height -ne 91) { throw 'Unexpected material comparison PNG size.' }
+              if ($bitmap.Width -ne 214 -or $bitmap.Height -ne 91) { throw 'Unexpected historical PNG size.' }
             } finally { $bitmap.Dispose() }
           }
-          'Decoded historical/neutral/current outputs independently. No real-desktop or motion acceptance implied.'
-      - name: Upload independent preview and synthetic GPU fixtures
+          $opticalRoot = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures.liquid'
+          $optical = Get-Content -LiteralPath (Join-Path $opticalRoot 'metrics.json') -Raw | ConvertFrom-Json
+          $ink = Get-Content -LiteralPath (Join-Path $opticalRoot 'legibility.json') -Raw | ConvertFrom-Json
+          if ($optical.material -ne 'LENS_TRANSMISSION_1' -or $optical.cases -ne 42 -or $ink.min_contrast -lt 4.5 -or $ink.checked_pixels -lt 420) { throw 'Actual optical material contract missing or failed.' }
+          $frames = @(Get-ChildItem -LiteralPath (Join-Path $opticalRoot 'input-motion') -File -Filter '*.png')
+          $opticalImages = @(Get-ChildItem -LiteralPath $opticalRoot -Recurse -File -Filter '*.png')
+          if ($frames.Count -ne 72 -or $opticalImages.Count -ne 102) { throw 'Missing optical or input-motion frames.' }
+          foreach ($image in $opticalImages) {
+            $moving = $image.Directory.Name -eq 'input-motion'
+            $bitmap = [System.Drawing.Bitmap]::new($image.FullName)
+            try {
+              $w = if ($moving) { 348 } else { 214 }; $h = if ($moving) { 138 } else { 91 }
+              if ($bitmap.Width -ne $w -or $bitmap.Height -ne $h) { throw 'Optical fixture decode/geometry failed.' }
+            } finally { $bitmap.Dispose() }
+          }
+          'Actual optical runtime and all historical controls decoded. No real-desktop FPS or user visual acceptance implied.'
+      - name: Upload executable and actual shader evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: GlassLivePreview-windows
@@ -99,5 +113,7 @@ jobs:
             ${{ runner.temp }}/glass-material-v2-fixtures.issue11-v23/**/*.png
             ${{ runner.temp }}/glass-material-v2-fixtures.issue11-v23/metrics.json
             ${{ runner.temp }}/glass-material-v2-fixtures.issue11-v23/parameters.txt
-          if-no-files-found: error
+            ${{ runner.temp }}/glass-material-v2-fixtures.liquid/**/*.png
+            ${{ runner.temp }}/glass-material-v2-fixtures.liquid/*.json
+          if-no-files-found: warn
           retention-days: 7
