@@ -1,8 +1,7 @@
-//! Offscreen WARP tests. All input pixels below are generated here, never captured.
-//! V1 uses its original blur scales; the pinned V2 baseline uses the same filters.
-//! Historical V2.1 rim checks run with ONLY the new surface reflection disabled.
-//! Final V2.2 output also has independent contrast, foreground and relief checks.
-//! These are regression bounds, not OCR scores, display timing or Apple parity.
+//! Historical V1/V2/V2.1/V2.2 WARP contracts, with unchanged assertion bounds.
+//! V2.2 is now explicitly pinned, not mislabeled as current V2.3 runtime output.
+//! Current default material, foreground, alpha and response are tested separately
+//! in issue11_tests::v23_tests. All inputs are synthetic, never user captures.
 use super::*;
 
 const W: usize = 162;
@@ -100,7 +99,9 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
     unsafe {
         let (device, context) = create_device(None)?;
         let mask = foreground_mask();
-        let current = Pipeline::new(device.clone(), context.clone(), W as u32, H as u32, &mask)?;
+        // Preserve these historical assertions exactly. New defaults are covered
+        // independently in v23_tests, not accidentally held to V2.2 pixel equality.
+        let current = super::issue11_tests::reference_pipeline(device.clone(), context.clone(), W as u32, H as u32, &mask)?;
         let previous = baseline(device, context, &mask)?;
         let (rw, rh) = (current.raw.width, current.raw.height);
         assert_eq!((rw, rh), (214, 91), "No enlarged live capture region in this tuning");
@@ -117,7 +118,6 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
             let v2 = current.read_rgba(&current.output)?;
             let before = row_std(&v1, H/2);
             let after = row_std(&v2, H/2);
-            // Sample the unchanged thin rim at its actual 1.5px inset.
             let rim = row_std(&v2, 1);
             assert!(before > 0.5, "The baseline fixture must actually contain measurable variation");
             assert!(after < before * 0.65 + 0.15, "Center suppression regressed: V1={before}, current={after}");
@@ -131,7 +131,6 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
             } }
             metrics.push(format!("{{\"theme\":\"{}\",\"stripe_center_std_v1\":{before:.6},\"stripe_center_std_v2\":{after:.6},\"stripe_rim_std_v2\":{rim:.6}}}", if dark {"dark"} else {"light"}));
         }
-        // These original bounds also apply to the FINAL material with reflection.
         for value in [0, 255] {
             let solid = fixture(rw, rh, |_, _| [value,value,value,255]);
             upload(&current, &solid, false);
@@ -165,12 +164,10 @@ fn spatial_material_gpu_contract() -> AppResult<()> {
                 }
             }
         }
-        let summary = format!("{{\"scope\":\"synthetic WARP pixels; no desktop capture or display timing; V1 uses original shader and blur scales\",\"material\":\"V2.2\",\"rim_probe_inset_pixels\":1.5,\"width\":{rw},\"height\":{rh},\"metrics\":[{}]}}", metrics.join(","));
+        let summary = format!("{{\"scope\":\"historical synthetic WARP contracts only; V2.3 tested separately\",\"material\":\"V2.2-pinned\",\"rim_probe_inset_pixels\":1.5,\"width\":{rw},\"height\":{rh},\"metrics\":[{}]}}", metrics.join(","));
         eprintln!("[material-v2] {summary}");
         if let Some(dir) = &directory { std::fs::write(dir.join("metrics.json"), summary)?; }
         let no_reflection = reflection_control(&current, &mask)?;
-        // Retain the exact historical center/rim regression on the transmission
-        // stage, then independently bound the final new reflection below.
         rim_refinement_contract(&no_reflection, &mask, directory.as_deref())?;
         surface_reflection_contract(&current, &no_reflection, &mask, directory.as_deref())?;
         Ok(())
@@ -307,8 +304,6 @@ unsafe fn surface_reflection_contract(current: &Pipeline, control: &Pipeline, ma
             metrics.push(format!("{{\"background\":{value},\"dark\":{dark},\"max_rgb_shift\":{max_shift},\"top_lift\":{top_lift:.4},\"bottom_lift\":{bottom_lift:.4}}}"));
         }
     }
-    // Invert the same stripes to measure INPUT-dependent contrast, cancelling the
-    // static reflection. A smooth gradient must not conceal sharper background.
     let stripes_a = fixture(rw,rh,|x,_|{let v=if x/8%2==0{0}else{255};[v,v,v,255]});
     let stripes_b = fixture(rw,rh,|x,_|{let v=if x/8%2==0{255}else{0};[v,v,v,255]});
     for dark in [false,true] {
