@@ -15,8 +15,6 @@ jobs:
   apply-and-check:
     runs-on: windows-latest
     timeout-minutes: 35
-    env:
-      GLASS_CI_NATIVE_FIXTURE: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,12 +38,21 @@ jobs:
           root=pathlib.Path(os.environ['RUNNER_TEMP'])
           (root/'adaptive-commit.txt').write_text(git('rev-parse','HEAD'))
           subprocess.run(['git','archive','--format=zip','-o',str(root/'adaptive-source.zip'),'HEAD','experiments/glass-live','clients/desktop-client','.github/workflows/adaptive-glass.yml'],check=True)
-      - name: Preflight actual native canvas and mouse routing in owned CI fixture
+      - name: Require three isolated native canvas and actual mouse-routing passes
         shell: pwsh
+        env:
+          GLASS_CI_NATIVE_FIXTURE: '1'
         run: |
-          cargo test --locked --manifest-path experiments/glass-live/Cargo.toml --lib native_canvas_visible_input_stays_capsule_and_both_windows_move -- --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Execute shared library unit tests, native host and actual HLSL on WARP
+          # This integration test owns the CI desktop/cursor. Never run it in
+          # parallel with the unit suite or infer success from zero selected tests.
+          for ($trial = 1; $trial -le 3; $trial++) {
+            $log = Join-Path $env:RUNNER_TEMP ('adaptive-native-' + $trial + '.txt')
+            cargo test --locked --manifest-path experiments/glass-live/Cargo.toml --lib voice_window::adaptive_window_checks::native_canvas_visible_input_stays_capsule_and_both_windows_move -- --ignored --exact --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $text = [string](Get-Content -LiteralPath $log -Raw)
+            if (-not $text.Contains('[adaptive-native] PASS:') -or -not $text.Contains('1 passed; 0 failed; 0 ignored;')) { throw 'Native fixture was not actually executed and passed' }
+          }
+      - name: Execute shared library unit tests and actual HLSL on WARP
         shell: pwsh
         run: |
           $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'adaptive-fixtures'
@@ -58,6 +65,7 @@ jobs:
           path: |
             ${{ runner.temp }}/adaptive-source.zip
             ${{ runner.temp }}/adaptive-commit.txt
+            ${{ runner.temp }}/adaptive-native-*.txt
             ${{ runner.temp }}/adaptive-fixtures*
           if-no-files-found: error
           retention-days: 7
@@ -76,15 +84,20 @@ jobs:
           $err = Join-Path $env:RUNNER_TEMP 'adaptive-selftest.stderr.txt'
           $p = Start-Process -FilePath $exe -ArgumentList '--liquid-glass-self-test' -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
           $null = $p.Handle
-          if (-not $p.WaitForExit(600000)) { $p.Kill(); throw 'Self-test timed out' }
-          $p.WaitForExit()
-          Get-Content $out
-          Get-Content $err
-          if ($p.ExitCode -ne 0 -or -not ([string](Get-Content $out -Raw)).Contains('[voice-glass-self-test] PASS')) { throw 'Formal optical self-test failed' }
-          Get-FileHash -Algorithm SHA256 -LiteralPath $exe | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'adaptive-executable.json')
+          try {
+            if (-not $p.WaitForExit(600000)) { $p.Kill(); $p.WaitForExit(); throw 'Self-test timed out' }
+            $p.WaitForExit()
+            Get-Content $out
+            Get-Content $err
+            $text = [string](Get-Content $out -Raw) + [string](Get-Content $err -Raw)
+            if ($p.ExitCode -ne 0 -or -not $text.Contains('[voice-glass-self-test] PASS') -or -not $text.Contains('[adaptive-glass] PASS;')) { throw 'Formal adaptive optical self-test failed' }
+          } finally { $p.Dispose() }
+          $commit = (git rev-parse HEAD | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -ne $env:GITHUB_SHA) { throw 'Build commit changed' }
           if ((git status --porcelain --untracked-files=no | Out-String).Trim()) { throw 'Tests changed tracked source or lockfiles' }
+          [ordered]@{commit=$commit; sha256=(Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash; material='LENS_ADAPTIVE_2'; formal_self_test='passed'; native_isolated_passes=3; desktop_capture=$false; microphone=$false} | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'adaptive-executable.json')
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: adaptive-voice-evidence
           path: |
