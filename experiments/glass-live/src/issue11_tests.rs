@@ -1,11 +1,10 @@
-//! Issue #11 stage-1 contract: synthetic input only, no windows/capture/OCR.
-//! glass.hlsl is retained unchanged from 3974edb as the literal V2.2 control.
+//! Frozen stage-1 parity plus independently exercised runtime material tests.
+//! glass.hlsl stays byte-identical to 3974edb. No user pixels/windows/capture.
 use super::*;
 
-unsafe fn reference_pipeline(device: ID3D11Device, context: ID3D11DeviceContext,
+pub(super) unsafe fn reference_pipeline(device: ID3D11Device, context: ID3D11DeviceContext,
                              w: u32, h: u32, mask: &[u8]) -> AppResult<Pipeline> {
     let mut p = Pipeline::new(device, context, w, h, mask)?;
-    // Independently compile all four original entry points, not generated config.
     let source = include_str!("glass.hlsl");
     let code = compile_source(source, s!("fullscreen_vs"), s!("vs_5_0"))?;
     let mut vertex = None;
@@ -21,6 +20,17 @@ unsafe fn reference_pipeline(device: ID3D11Device, context: ID3D11DeviceContext,
     }
     Ok(p)
 }
+unsafe fn configured_pipeline(device: ID3D11Device, context: ID3D11DeviceContext,
+    w: u32, h: u32, mask: &[u8], profile: material_config::Profile) -> AppResult<Pipeline> {
+    let mut p = Pipeline::new(device,context,w,h,mask)?;
+    let source = format!("{}\n{}\n{}",material_config::hlsl_header_for(profile)?,
+        include_str!("glass.hlsl"),include_str!("configured_material.hlsl"));
+    let code=compile_source(&source,s!("configured_material_ps"),s!("ps_5_0"))?;
+    let mut shader=None;
+    p.device.CreatePixelShader(blob_bytes(&code),None,Some(&mut shader))?;
+    p.material=shader.ok_or("Missing configured test shader")?;
+    Ok(p)
+}
 fn input(w: u32, h: u32, kind: u32, offset: u32) -> Vec<u8> {
     let mut pixels = Vec::with_capacity((w*h*4) as usize);
     for y in 0..h { for x in 0..w {
@@ -31,7 +41,6 @@ fn input(w: u32, h: u32, kind: u32, offset: u32) -> Vec<u8> {
             2 => [255,255,255,255],
             3 => if (x/3+y/11)%2==0 {[0,0,0,255]} else {[255,255,255,255]},
             4 => if x<w/2 {[64,48,220,255]} else {[224,112,32,255]},
-            // Synthetic coarse E-like letter structures, shifted without capture.
             _ => if x%17<3 || (x%17<12 && matches!(y%24, 3..=5|11..=13|19..=21))
                  {[15,15,15,255]} else {[249,249,249,255]},
         };
@@ -41,7 +50,6 @@ fn input(w: u32, h: u32, kind: u32, offset: u32) -> Vec<u8> {
 }
 unsafe fn upload(p: &Pipeline, pixels: &[u8], reference: bool) {
     p.context.UpdateSubresource(&p.raw.texture,0,None,pixels.as_ptr().cast(),p.raw.width*4,0);
-    // Pin the historical CPU filter scales as well as its shader.
     if reference { p.prepare_scales(0.20,0.045); } else { p.prepare(); }
 }
 #[test]
@@ -51,8 +59,6 @@ fn parameter_refactor_matches_v22_on_gpu() -> AppResult<()> {
         let mut max_rgb_error = 0u8;
         let mut compared_pixels = 0usize;
         let mut cases = 0usize;
-        // Sibling, not child: the historical material test creates its own root
-        // concurrently with create_dir(). Neither test owns the other's directory.
         let dir = std::env::var_os("GLASS_MATERIAL_FIXTURES")
             .map(|p| std::path::PathBuf::from(p).with_extension("issue11"));
         if let Some(dir) = &dir { std::fs::create_dir_all(dir)?; }
@@ -61,7 +67,9 @@ fn parameter_refactor_matches_v22_on_gpu() -> AppResult<()> {
                 let (x,y) = (i%w,i/w);
                 if y>h/3 && y<h*2/3 && x>h && x<w-h { match x%7 {0=>255,1=>128,_=>0} } else {0}
             }).collect();
-            let current = Pipeline::new(device.clone(),context.clone(),w,h,&mask)?;
+            // This test isolates the neutral profile explicitly. Current runtime
+            // defaults have their own contracts below; they are NOT called equal.
+            let current = configured_pipeline(device.clone(),context.clone(),w,h,&mask,material_config::Profile::V22)?;
             let baseline = reference_pipeline(device.clone(),context.clone(),w,h,&mask)?;
             assert_eq!(current.padding,(h as f32*0.65).ceil() as u32);
             assert_eq!((current.raw.width,current.raw.height),(baseline.raw.width,baseline.raw.height));
@@ -92,17 +100,19 @@ fn parameter_refactor_matches_v22_on_gpu() -> AppResult<()> {
                             if let Some(dir) = &dir {
                                 let dir = dir.join(format!("{}-{}",if kind==4 {"colors"} else {"text"},if dark {"dark"} else {"light"}));
                                 std::fs::create_dir_all(&dir)?;
-                                baseline.snapshot(&dir,1)?;
-                                current.snapshot(&dir,2)?;
+                                baseline.snapshot(&dir,1)?; current.snapshot(&dir,2)?;
                             }
                         }
                     }
                 }
             }
         }
-        let metrics = format!("{{\"stage\":1,\"scope\":\"synthetic WARP; retained V2.2 shader; no live capture or presentation\",\"baseline_commit\":\"3974edb0c7fbd0585e5f2e383b6669c9a4835288\",\"cases\":{cases},\"compared_pixels\":{compared_pixels},\"max_rgb_error\":{max_rgb_error},\"alpha_exact\":true}}");
+        let metrics = format!("{{\"stage\":1,\"scope\":\"synthetic WARP; neutral configured profile versus retained V2.2, NOT current visual acceptance\",\"baseline_commit\":\"3974edb0c7fbd0585e5f2e383b6669c9a4835288\",\"cases\":{cases},\"compared_pixels\":{compared_pixels},\"max_rgb_error\":{max_rgb_error},\"alpha_exact\":true}}");
         eprintln!("[issue11-refactor] {metrics}");
         if let Some(dir) = &dir { std::fs::write(dir.join("metrics.json"),metrics)?; }
         Ok(())
     }
 }
+
+#[path = "v23_tests.rs"]
+mod v23_tests;
