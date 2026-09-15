@@ -83,7 +83,12 @@ fn native_canvas_visible_input_stays_capsule_and_both_windows_move(){unsafe {
     presenter.present(&pipe).unwrap();
     let _=ShowWindow(canvas.0,SW_SHOWNOACTIVATE);let _=ShowWindow(body.0,SW_SHOWNOACTIVATE);
     SetWindowPos(body.0,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE).unwrap();
-    for _ in 0..12 {pump();std::thread::sleep(Duration::from_millis(16));}
+    // Match the live Session::frame cadence: the worker keeps submitting after
+    // ShowWindow. One hidden-window Present is not a steady displayed surface.
+    // Keep the SAME prepared GPU image/time; do not repaint the source or rebuild.
+    let first_shadow=rgb(at.x+81,at.y+44);
+    for _ in 0..12 {presenter.present(&pipe).unwrap();pump();std::thread::sleep(Duration::from_millis(16));}
+    eprintln!("[adaptive-native-diagnostic] first observed shadow={first_shadow:?}; fixed-frame presentation continued for 12 ticks (not a latency measurement)");
     assert_eq!(WindowFromPoint(POINT{x:at.x+81,y:at.y+19}),body.0);
     let margin_lookup=WindowFromPoint(POINT{x:at.x+81,y:at.y+46});
     eprintln!("[adaptive-native-diagnostic] body={:?} canvas={:?} paper=0x{:X} margin_lookup={:?}; body_ex=0x{:X} canvas_ex=0x{:X}",body.0,canvas.0,paper.handle,margin_lookup,GetWindowLongPtrW(body.0,GWL_EXSTYLE),GetWindowLongPtrW(canvas.0,GWL_EXSTYLE));
@@ -99,7 +104,7 @@ fn native_canvas_visible_input_stays_capsule_and_both_windows_move(){unsafe {
     let colored=[86u8,183,9,255].repeat((pipe.raw.width*pipe.raw.height) as usize);
     crate::voice_render_checks::upload_fixture_checked(&pipe,&colored).unwrap();
     for n in 91..=140 {pipe.render_voice(false,n as f32/60.,Phase::Activating,0.,1.);}
-    presenter.present(&pipe).unwrap();for _ in 0..12 {pump();std::thread::sleep(Duration::from_millis(16));}
+    for _ in 0..12 {presenter.present(&pipe).unwrap();pump();std::thread::sleep(Duration::from_millis(16));}
     let core=rgb(at.x+81,at.y+19);
     let material_visible=core[1] as i32-core[0] as i32>60;
     eprintln!("[adaptive-native-diagnostic] DWM_green={core:?}; visible={material_visible}");
@@ -117,7 +122,8 @@ fn native_canvas_visible_input_stays_capsule_and_both_windows_move(){unsafe {
     assert_eq!((a.left,a.top,a.right-a.left,a.bottom-a.top),(next.x,next.y,162,39));
     assert_eq!((a.left-b.left,a.top-b.top),(26,26));
     assert_eq!(WindowFromPoint(POINT{x:next.x+81,y:next.y+19}),body.0);
-    PAPER_CLICKS.store(0,Ordering::SeqCst);INPUT.with(|s|s.borrow_mut().click=false);
+    PAPER_CLICKS.store(0,Ordering::SeqCst);INPUT.with(|s|s.borrow().click);
+    INPUT.with(|s|s.borrow_mut().click=false);
     click_fixture(POINT{x:next.x+81,y:next.y+46},&owned);
     let moved_paper=PAPER_CLICKS.load(Ordering::SeqCst);let moved_body=INPUT.with(|s|s.borrow().click);
     assert!(shadow_matches && material_visible,"DWM did not display the actual complete material");
