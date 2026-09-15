@@ -23,6 +23,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Check immutable V2.2 shader reference
+        shell: pwsh
+        run: |
+          $baseline = (git rev-parse HEAD:experiments/glass-live/src/glass.hlsl | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $baseline -ne '7a8126afc379257a34d27a4dbff6ac9125267eda') {
+            throw 'V2.2 reference changed. Refactor parity must not compare two jointly edited shaders.'
+          }
       - name: Compile launchers and controller under Windows PowerShell 5.1
         shell: powershell
         run: |
@@ -57,13 +64,20 @@ jobs:
           if ($comparisons.Count -ne 8) { throw 'Expected eight V1/current text and color comparison images.' }
           $surface = @(Get-ChildItem -LiteralPath (Join-Path $fixtureRoot 'surface-reflection') -Filter '*.png')
           if ($surface.Count -ne 12) { throw 'Expected twelve same-input reflection-off/on comparison images.' }
-          foreach ($image in @($comparisons + $surface)) {
+          $issueRoot = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures.issue11'
+          $parity = @(Get-ChildItem -LiteralPath $issueRoot -Recurse -File -Filter '*.png')
+          if ($parity.Count -ne 8) { throw 'Expected eight fixed V2.2/configured parity PNGs.' }
+          $metrics = Get-Content -LiteralPath (Join-Path $issueRoot 'metrics.json') -Raw | ConvertFrom-Json
+          if ($metrics.stage -ne 1 -or $metrics.cases -ne 192 -or $metrics.compared_pixels -ne 2201472 -or $metrics.max_rgb_error -gt 1 -or -not $metrics.alpha_exact) {
+            throw 'Issue #11 parameter-refactor coverage or parity contract failed.'
+          }
+          foreach ($image in @($comparisons + $surface + $parity)) {
             $bitmap = [System.Drawing.Bitmap]::new($image.FullName)
             try {
               if ($bitmap.Width -ne 214 -or $bitmap.Height -ne 91) { throw 'Unexpected material comparison PNG size.' }
             } finally { $bitmap.Dispose() }
           }
-          'PNG decoding verified independently. This is not live-desktop/hardware acceptance.'
+          'PNG decoding and V2.2 parity metadata verified. This is not live-desktop/hardware acceptance.'
       - name: Upload independent preview and synthetic GPU fixtures
         uses: actions/upload-artifact@v4
         with:
@@ -73,5 +87,7 @@ jobs:
             ${{ runner.temp }}/glass-live-gpu-fixtures/*.png
             ${{ runner.temp }}/glass-material-v2-fixtures/**/*.png
             ${{ runner.temp }}/glass-material-v2-fixtures/**/metrics.json
+            ${{ runner.temp }}/glass-material-v2-fixtures.issue11/**/*.png
+            ${{ runner.temp }}/glass-material-v2-fixtures.issue11/metrics.json
           if-no-files-found: error
           retention-days: 7
