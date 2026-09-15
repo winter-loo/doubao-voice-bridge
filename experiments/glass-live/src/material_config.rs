@@ -31,7 +31,7 @@ pub struct OpticalConfig {
     pub surface_spread: [f32; 2],
     pub underside: [f32; 2],
 }
-/// Immutable V2.2 optics; Candidate may override named fields in optics().
+/// Immutable V2.2 optics; Candidate overrides named fields in optics().
 pub const OPTICS: OpticalConfig = OpticalConfig {
     bevel: 0.12, refraction: 0.065, narrow_mix: 0.52,
     protection: [0.025, 0.13], reference_height: 26.0,
@@ -61,6 +61,7 @@ pub struct ReadabilityConfig {
     pub veil_mix: f32,
     pub center_lift: f32,
     pub saturation: f32,
+    /// Luminance residual relative to the existing wide blurred sample.
     pub local_contrast: f32,
     /// Attenuates narrow-minus-wide residual; not an additional blur sigma.
     pub detail_suppression: f32,
@@ -104,9 +105,23 @@ pub fn theme(profile: Profile, dark: bool) -> ThemeConfig {
         t.readability.veil_mix = if dark { 0.08 } else { 0.10 };
         t.readability.center_lift = if dark { 0.0015 } else { 0.0010 };
     }
+    if matches!(profile,Profile::Rim|Profile::Candidate) {
+        // Narrower, softer paired highlights. Existing V2.2 area-light sheen is
+        // retained: stacking another white gradient would wash out the body.
+        t.rim = if dark { [0.060,0.14,0.010,0.005] } else { [0.035,0.48,0.025,0.007] };
+    }
+    if profile==Profile::Candidate {
+        t.readability.detail_suppression=if dark {0.44} else {0.50};
+        t.readability.local_contrast=if dark {0.82} else {0.85};
+        t.readability.saturation=if dark {0.94} else {0.97};
+    }
     t
 }
-pub fn optics(_profile: Profile) -> OpticalConfig { OPTICS }
+pub fn optics(profile: Profile) -> OpticalConfig {
+    if matches!(profile,Profile::Rim|Profile::Candidate) {
+        OpticalConfig {outer_rim:[0.50,0.30],inner_rim:[1.00,0.34],..OPTICS}
+    } else {OPTICS}
+}
 fn in_range(values: &[f32], lo: f32, hi: f32) -> bool {
     values.iter().all(|v| v.is_finite() && *v >= lo && *v <= hi)
 }
@@ -219,5 +234,17 @@ mod tests {
         assert!(!header.contains("NaN")&&!header.contains("inf"));
         assert_eq!(header,hlsl_header().unwrap());
         assert_ne!(header,hlsl_header_for(Profile::V22).unwrap());
+    }
+    #[test] fn staged_profiles_do_not_duplicate_layers_or_change_foreground() {
+        for dark in [false,true] {
+            let a=theme(Profile::V22,dark); let b=theme(Profile::Veil,dark);
+            let c=theme(Profile::Rim,dark); let d=theme(Profile::Candidate,dark);
+            assert_eq!(a.readability.veil_mix,0.0); assert!(b.readability.veil_mix>0.0);
+            assert_eq!(b.rim,a.rim); assert_ne!(c.rim,b.rim);
+            assert_eq!(c.readability.detail_suppression,0.0);
+            assert!(d.readability.detail_suppression>0.0 && d.readability.detail_suppression<1.0);
+            assert_eq!(a.foreground,d.foreground); assert_eq!(a.surface,d.surface);
+            assert!(optics(Profile::Rim).outer_rim[1]<OPTICS.outer_rim[1]);
+        }
     }
 }
