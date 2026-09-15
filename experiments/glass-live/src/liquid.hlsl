@@ -158,6 +158,21 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     if(style.z>.5) {
         float fg=wave_mask(local)*smoothstep(.28,.88,dynamics.z);
         float3 ink=white_ink>.5?float3(.95,.97,1):float3(.010,.016,.023);
+#ifdef LIQUID_VOICE_CONTENT
+        if(voice_state.x==2) {
+            // Restore the original GPUI recording palette (main.rs at dfb2b6d):
+            // per-bar sRGB interpolation #43DED2 -> #648DFF, rounded to bytes.
+            // Wave color is independent of adaptive text ink and desktop color.
+            float first=(geometry.z-78*scale)*.5+scale;
+            int i=(int)clamp(floor((local.x-first)/(4*scale)+.5),0,19);
+            float3 srgb=floor(lerp(float3(67,222,210),float3(100,141,255),i/19.0)+.5)/255.0;
+            float wave=saturate(.5-bar_distance(local,i))*smoothstep(.28,.88,dynamics.z);
+            body=lerp(body,linearize(srgb),wave);
+            // Do not repaint the colored bars with the shared monochrome mask.
+            // Text, including any future listening label, remains adaptive.
+            fg=text_mask.SampleLevel(clamped,local/geometry.zw,0)*smoothstep(.28,.88,dynamics.z);
+        }
+#endif
         body=lerp(body,ink,fg);
     }
 #endif
