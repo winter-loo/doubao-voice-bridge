@@ -2,6 +2,23 @@
 //! --liquid-glass-self-test path: no HWND, desktop duplication, audio or network.
 use crate::{AppResult,ensure,gpu::{self,Pipeline},voice_model::Phase};
 use std::path::Path;
+
+/// This boundary deliberately accepts bytes, not an unconstrained integer Vec.
+/// Validate the actual BGRA upload by reading it back as RGBA before interpreting
+/// shader results. This helper is only used by generated-fixture checks.
+pub(crate) unsafe fn upload_fixture_checked(p:&Pipeline,bgra:&[u8])->AppResult<()> {
+    ensure(bgra.len()==(p.raw.width*p.raw.height*4) as usize,"Invalid synthetic BGRA byte length")?;
+    p.context.UpdateSubresource(&p.raw.texture,0,None,bgra.as_ptr().cast(),p.raw.width*4,0);
+    let rgba=p.read_rgba(&p.raw)?;
+    ensure(rgba.len()==bgra.len(),"Synthetic upload readback size differs")?;
+    for (actual,expected) in rgba.chunks_exact(4).zip(bgra.chunks_exact(4)) {
+        ensure(actual==[expected[2],expected[1],expected[0],expected[3]],
+            "Synthetic background upload changed channels or row pitch")?;
+    }
+    p.prepare();
+    Ok(())
+}
+
 pub(crate) unsafe fn verify(directory:Option<&Path>)->AppResult<()> {
     let (d,c)=gpu::create_device(None)?;
     let (w,h)=(162,39);
@@ -11,15 +28,15 @@ pub(crate) unsafe fn verify(directory:Option<&Path>)->AppResult<()> {
     if let Some(dir)=directory{std::fs::create_dir_all(dir)?;}
     let mut number=0;
     for dark in [false,true]{for kind in 0..3{
-        let mut input=vec![0;(rw*rh*4) as usize];
+        let mut input:Vec<u8>=vec![0u8;(rw*rh*4) as usize];
         for y in 0..rh{for x in 0..rw{
-            let rgb=match kind{
+            let bgra:[u8;4]=match kind{
                 0=>[248,248,248,255],
                 1=>if x<rw/2{[64,48,220,255]}else{[224,112,32,255]},
                 _=>if x%24<2||y%16<2{[16,16,16,255]}else{[235,235,235,255]},
-            };input[((y*rw+x)*4) as usize..][..4].copy_from_slice(&rgb);
+            };input[((y*rw+x)*4) as usize..][..4].copy_from_slice(&bgra);
         }}
-        p.context.UpdateSubresource(&p.raw.texture,0,None,input.as_ptr().cast(),rw*4,0);p.prepare();
+        upload_fixture_checked(&p,&input)?;
         for phase in [Phase::Activating,Phase::Listening,Phase::Optimizing,Phase::Completed,Phase::Failed]{
             let mask=crate::voice_window::content_mask(w,h,1.5,phase)?;p.set_voice_mask(&mask)?;
             let t=2.+number as f32;
@@ -34,7 +51,7 @@ pub(crate) unsafe fn verify(directory:Option<&Path>)->AppResult<()> {
     }}
     p.render_voice(false,100.,Phase::Hidden,0.,0.);
     ensure(p.read_rgba(&p.output)?.iter().all(|v|*v==0),"Closed voice overlay left visible pixels")?;
-    eprintln!("[voice-render-contract] PASS; 30 generated state/theme/background cases; actual audio-level control; close alpha zero; no capture/audio/network");
+    eprintln!("[voice-render-contract] PASS; 30 generated state/theme/background cases; BGRA input readback exact; actual audio-level control; close alpha zero; no capture/audio/network");
     Ok(())
 }
 #[cfg(test)]mod tests{
