@@ -9,10 +9,11 @@ use windows::{core::{s, Interface, PCSTR}, Win32::{
     },
 }};
 
-// V2 keeps the same two separable passes and texture geometry. The stronger
-// center filter fits inside the existing .65 * height source padding (3 sigma).
-const CENTER_SIGMA_FRACTION: f32 = 0.20;
-const EDGE_SIGMA_FRACTION: f32 = 0.045;
+#[path = "material_config.rs"]
+mod material_config;
+// One validated configuration drives the host filter support and shader constants.
+const CENTER_SIGMA_FRACTION: f32 = material_config::BLUR.center_fraction;
+const EDGE_SIGMA_FRACTION: f32 = material_config::BLUR.edge_fraction;
 
 pub unsafe fn create_device(adapter: Option<&IDXGIAdapter1>) -> AppResult<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None; let mut context = None;
@@ -58,7 +59,11 @@ unsafe fn compile_source(source: &str, entry: PCSTR, target: PCSTR) -> AppResult
     Ok(code.ok_or("Compiler returned no bytecode")?)
 }
 unsafe fn compile(entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
-    compile_source(include_str!("glass.hlsl"), entry, target)
+    // Keep glass.hlsl untouched as the literal V2.2 control. The configured entry
+    // reuses its transfer/filter/geometry helpers but has its own tone/rim code.
+    let source = format!("{}\n{}\n{}", material_config::hlsl_header()?,
+        include_str!("glass.hlsl"), include_str!("configured_material.hlsl"));
+    compile_source(&source, entry, target)
 }
 unsafe fn blob_bytes(b: &ID3DBlob) -> &[u8] { slice::from_raw_parts(b.GetBufferPointer().cast(), b.GetBufferSize()) }
 
@@ -72,10 +77,11 @@ pub struct Pipeline {
 }
 impl Pipeline {
     pub unsafe fn new(device: ID3D11Device, context: ID3D11DeviceContext, width: u32, height: u32, mask: &[u8]) -> AppResult<Self> {
+        material_config::validate()?;
         ensure(width >= height && height >= 20 && height <= 120 && width <= 1024, "Invalid pipeline geometry")?;
         ensure(mask.len() == width as usize * height as usize, "Invalid foreground mask")?;
-        let padding = (height as f32 * 0.65).ceil() as u32;
-        ensure(padding >= (3.0 * (height as f32 * CENTER_SIGMA_FRACTION).min(20.0)).ceil() as u32,
+        let padding = (height as f32 * material_config::BLUR.padding_fraction).ceil() as u32;
+        ensure(padding >= (3.0 * (height as f32 * CENTER_SIGMA_FRACTION).min(material_config::BLUR.max_sigma_pixels)).ceil() as u32,
             "Center blur support exceeds captured padding")?;
         let rw = width + padding * 2; let rh = height + padding * 2;
         let mut vertex = None; let b = compile(s!("fullscreen_vs"), s!("vs_5_0"))?;
@@ -84,7 +90,7 @@ impl Pipeline {
             let b = compile(entry, s!("ps_5_0"))?; let mut ps = None;
             device.CreatePixelShader(blob_bytes(&b), None, Some(&mut ps))?; Ok(ps.ok_or("No pixel shader")?)
         };
-        let convert = make_ps(s!("convert_ps"))?; let blur = make_ps(s!("blur_ps"))?; let material = make_ps(s!("material_ps"))?;
+        let convert = make_ps(s!("convert_ps"))?; let blur = make_ps(s!("blur_ps"))?; let material = make_ps(s!("configured_material_ps"))?;
         let mut constants = None;
         device.CreateBuffer(&D3D11_BUFFER_DESC { ByteWidth: size_of::<Constants>() as u32,
             Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() }, None, Some(&mut constants))?;
@@ -136,7 +142,7 @@ impl Pipeline {
         let mut c = self.params();
         self.pass(&self.linear, &self.convert, &[Some(self.raw.view.clone())], c);
         for (sigma, target) in [(self.output.height as f32 * center_fraction, &self.wide), (self.output.height as f32 * edge_fraction, &self.narrow)] {
-            c.filter = [self.padding as f32, sigma.min(20.), 1., 0.];
+            c.filter = [self.padding as f32, sigma.min(material_config::BLUR.max_sigma_pixels), 1., 0.];
             self.pass(&self.temporary, &self.blur, &[Some(self.linear.view.clone())], c);
             c.filter[2] = 0.; c.filter[3] = 1.;
             self.pass(target, &self.blur, &[Some(self.temporary.view.clone())], c);
@@ -244,10 +250,13 @@ pub unsafe fn self_test(directory: Option<&Path>) -> AppResult<()> {
     fixture.fill(255); pipe.context.UpdateSubresource(&pipe.raw.texture,0,None,fixture.as_ptr().cast(),w*4,0);
     pipe.prepare(); pipe.render(true,0.,false); let rgba=pipe.read_rgba(&pipe.output)?;
     ensure(rgba[(20*160+80)*4..][..3].iter().all(|&v|v<110), "Dark text-protection tone is too bright on white")?;
-    eprintln!("[glass-live-self-test] PASS: four HLSL entry points compiled; GPU color separation, silhouette alpha, stripe attenuation, dark tone and readback tested on WARP. No desktop capture/window; not hardware performance or presentation acceptance.");
+    eprintln!("[glass-live-self-test] PASS: configured material plus original transfer/filter entry points compiled; GPU color separation, silhouette alpha, stripe attenuation, dark tone and readback tested on WARP. No desktop capture/window; not hardware performance or presentation acceptance.");
     Ok(())
 }
 
 #[cfg(test)]
 #[path = "material_tests.rs"]
 mod material_tests;
+#[cfg(test)]
+#[path = "issue11_tests.rs"]
+mod issue11_tests;
