@@ -12,82 +12,48 @@ concurrency:
   group: adaptive-liquid-glass-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  windows:
+  apply-and-check:
     runs-on: windows-latest
     timeout-minutes: 35
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             clients/desktop-client
             experiments/glass-live
           key: voice-liquid-integration
-      - name: Install the exact reviewed source candidate once, never move the baseline tag
+      - name: Check immutable reference and archive exact source
         shell: python
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          import os, pathlib, subprocess, urllib.request, json, base64, zlib, hashlib, re
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          if not pathlib.Path('experiments/glass-live/src/adaptive.rs').exists():
-              parts=['98d44424c21e6a9f0791a3e1e7d72d429c34c061','12fe1c8c214f79a43626079f2eafc513e86ec1da','ab9cabe240117c6b1ed4408a65f067a5030e7bba']
-              packed=b''
-              for sha in parts:
-                  req=urllib.request.Request('https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/git/blobs/'+sha,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
-                  with urllib.request.urlopen(req,timeout=30) as response: obj=json.load(response)
-                  value=base64.b64decode(obj['content'])
-                  assert hashlib.sha1(b'blob '+str(len(value)).encode()+b'\0'+value).hexdigest()==sha
-                  packed+=value
-              assert hashlib.sha256(packed).hexdigest()=='a55a7c7c107474abc596abd987e80606b3891925b39e0e8ab73478c557931f88'
-              patch=zlib.decompress(packed)
-              allowed={'clients/desktop-client/src/voice_glass.rs'}|{'experiments/glass-live/src/'+name for name in ['adaptive.hlsl','adaptive.rs','adaptive_checks.rs','adaptive_model.rs','adaptive_window_checks.rs','gpu.rs','lib.rs','liquid.rs','liquid_gpu.rs','voice_window.rs']}
-              entries=re.split(rb'(?m)^diff --git ',patch)[1:]
-              after={}
-              git('config','core.autocrlf','false')
-              for entry in entries:
-                  header=entry.splitlines()[0].decode(); a,b=header.split(' ')
-                  assert a[2:]==b[2:] and b[2:] in allowed
-                  path=b[2:]
-                  m=re.search(rb'(?m)^index ([0-9a-f]{40})\.\.([0-9a-f]{40})',entry);assert m
-                  before=m[1].decode();after[path]=m[2].decode()
-                  if before=='0'*40: assert not pathlib.Path(path).exists()
-                  else:
-                      assert git('rev-parse','HEAD:'+path)==before,(path,'source changed')
-                      blob=subprocess.check_output(['git','show','HEAD:'+path]);pathlib.Path(path).write_bytes(blob)
-              assert set(after)==allowed
-              p=pathlib.Path(os.environ['RUNNER_TEMP'])/'adaptive-reviewed.patch';p.write_bytes(patch)
-              subprocess.run(['git','apply','--check',str(p)],check=True)
-              subprocess.run(['git','apply',str(p)],check=True)
-              # Full-index patch hashes verify exact resulting bytes; Windows stat
-              # caching and CRLF checkout metadata cannot substitute for this check.
-              for path,sha in after.items():
-                  value=pathlib.Path(path).read_bytes()
-                  assert hashlib.sha1(b'blob '+str(len(value)).encode()+b'\0'+value).hexdigest()==sha,(path,'patched bytes differ')
-              subprocess.run(['git','add','--',*sorted(allowed)],check=True)
-              assert set(git('diff','--cached','--name-only').splitlines())==allowed
-              for path,sha in after.items(): assert git('rev-parse',':'+path)==sha,(path,'index differs')
-              git('config','user.name','github-actions[bot]');git('config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
-              git('commit','-m','feat(glass): adaptive optical convergence, exterior canvas and first-visible timing')
-              remote=git('ls-remote','origin','refs/heads/feat/glass-custom-material').split()[0]
-              assert remote==os.environ['GITHUB_SHA'],'Concurrent source edit: refuse branch update'
-              subprocess.run(['git','push','origin','HEAD:refs/heads/feat/glass-custom-material'],check=True)
-          pathlib.Path(os.environ['RUNNER_TEMP'],'adaptive-commit.txt').write_text(git('rev-parse','HEAD'))
-          subprocess.run(['git','archive','--format=zip','-o',str(pathlib.Path(os.environ['RUNNER_TEMP'],'adaptive-source.zip')),'HEAD','experiments/glass-live','clients/desktop-client','.github/workflows/adaptive-glass.yml'],check=True)
-      - name: Preserve approved historical optical reference
-        shell: pwsh
-        run: |
-          $reference = git hash-object experiments/glass-live/src/liquid_reference.hlsl
-          if ($LASTEXITCODE -ne 0 -or $reference -ne '4e72b8fbb6b8db4ac6f8d426a26d2d368fb27692') { throw 'Approved reference changed' }
+          import subprocess, pathlib, os
+          def git(*a): return subprocess.check_output(['git',*a],text=True).strip()
+          path='experiments/glass-live/src/liquid_reference.hlsl'
+          assert git('rev-parse','HEAD:'+path)=='4e72b8fbb6b8db4ac6f8d426a26d2d368fb27692'
+          expected=subprocess.check_output(['git','show','HEAD:'+path])
+          assert pathlib.Path(path).read_bytes().replace(b'\r\n',b'\n')==expected
+          assert not git('status','--porcelain','--untracked-files=no')
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          (root/'adaptive-commit.txt').write_text(git('rev-parse','HEAD'))
+          subprocess.run(['git','archive','--format=zip','-o',str(root/'adaptive-source.zip'),'HEAD','experiments/glass-live','clients/desktop-client','.github/workflows/adaptive-glass.yml'],check=True)
       - name: Execute shared library unit tests, native host and actual HLSL on WARP
         shell: pwsh
         run: |
           $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'adaptive-fixtures'
           cargo test --locked --manifest-path experiments/glass-live/Cargo.toml -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: adaptive-renderer-evidence
+          path: |
+            ${{ runner.temp }}/adaptive-source.zip
+            ${{ runner.temp }}/adaptive-commit.txt
+            ${{ runner.temp }}/adaptive-fixtures*
+          if-no-files-found: error
+          retention-days: 7
       - name: Test and build formal voice client, not the standalone preview
         shell: pwsh
         run: |
@@ -116,10 +82,8 @@ jobs:
           name: adaptive-voice-evidence
           path: |
             clients/desktop-client/target/release/DoubaoVoiceClient.exe
-            ${{ runner.temp }}/adaptive-source.zip
             ${{ runner.temp }}/adaptive-commit.txt
             ${{ runner.temp }}/adaptive-executable.json
             ${{ runner.temp }}/adaptive-selftest.*.txt
-            ${{ runner.temp }}/adaptive-fixtures*
           if-no-files-found: error
           retention-days: 7
