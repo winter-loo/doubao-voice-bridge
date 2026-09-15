@@ -1,15 +1,23 @@
-// Original runtime shader. Evolves our glass-material reference; no third-party
-// displacement textures or shader code. SDR BGRA capture -> linear FP16 passes
-// -> sRGB-encoded, premultiplied BGRA8 composition surface. Alpha is only coverage.
+// Original runtime shader. No third-party shader code or displacement assets.
+// SDR capture -> linear FP16 blur -> sRGB premultiplied BGRA8.
+// V2: protected center, transmitting bevel, separate theme tones, directional rim.
+// Alpha remains silhouette coverage, NEVER material transparency.
 cbuffer Parameters : register(b0) {
     float4 geometry; // ROI width,height; capsule width,height
     float4 filter;   // padding; sigma; horizontal/vertical direction
-    float4 style;    // dark; time seconds; foreground enabled; blur multiplier
+    float4 style;    // dark; time seconds; foreground enabled; reserved
 };
 Texture2D<float4> image0 : register(t0);
 Texture2D<float4> image1 : register(t1);
 Texture2D<float> text_mask : register(t2);
 SamplerState clamped : register(s0);
+
+// Dimensionless art parameters; lengths below scale with physical capsule height.
+// Keep filter support/padding consistent with gpu.rs::prepare().
+static const float BEVEL_FRACTION = .18;
+static const float REFRACTION_FRACTION = .095;
+static const float RIM_NARROW_MIX = .72;
+static const float3 LUMA = float3(.2126, .7152, .0722);
 
 float4 fullscreen_vs(uint id : SV_VertexID) : SV_POSITION {
     float2 p = float2((id << 1) & 2, id & 2);
@@ -48,32 +56,64 @@ float3 capsule(float2 p) {
     float len = length(v);
     return len < .00001 ? float3(-r, 0, 0) : float3(len - r, v / len);
 }
+
+// These are bounded linear-light tone mappings, not low-alpha overlays. Luminance
+// contrast is compressed harder than chroma so a soft environmental color wash
+// survives without reintroducing the background's sharp text.
+float3 light_tone(float3 scene, float protection) {
+    float y = dot(scene, LUMA);
+    float3 chroma = scene - y.xxx;
+    float luminance = lerp(.48 + .44 * y, .84 + .105 * y, protection);
+    float chroma_gain = lerp(.62, .24, protection);
+    return saturate(luminance.xxx + chroma * chroma_gain + float3(-.002, 0, .004));
+}
+float3 dark_tone(float3 scene, float protection) {
+    float y = dot(scene, LUMA);
+    float3 chroma = scene - y.xxx;
+    // Charcoal center, not the old uniformly pale smoke on a white background.
+    // The bevel has its own brighter transmission; foreground remains independent.
+    float luminance = lerp(.016 + .105 * y, .013 + .045 * y, protection);
+    float chroma_gain = lerp(.13, .09, protection);
+    return saturate(luminance.xxx + chroma * chroma_gain + float3(-.001, 0, .003));
+}
+float3 rim_lighting(float3 body, float2 p, float3 field, bool dark) {
+    float h = geometry.w;
+    float scale = h / 26;
+    float inset = max(0, -field.x);
+    float facing = max(0, dot(field.yz, float2(-.35, -.93675)));
+    float opposing = max(0, dot(field.yz, float2(.35, .93675)));
+    float outer_rim = exp(-pow((inset - .60 * scale) / (.44 * scale), 2));
+    float inner_rim = exp(-pow((inset - 1.60 * scale) / (.65 * scale), 2));
+    // Modulate along the capsule as well as by its normal: no uniform white stroke.
+    float light_arc = .30 + .70 * exp(-pow((p.x - geometry.z * .28) / (geometry.z * .42), 2));
+    float inner_shadow = inner_rim * opposing * opposing * (dark ? .18 : .10);
+    body *= 1 - inner_shadow;
+    float highlight = outer_rim * (pow(facing, 3) * light_arc * (dark ? .12 : .40)
+                                    + pow(opposing, 3) * (dark ? .025 : .065));
+    body = lerp(body, 1, saturate(highlight));
+    body += inner_rim * pow(facing, 3) * (dark ? .009 : .013);
+    return saturate(body);
+}
 float4 material_ps(float4 pos : SV_POSITION) : SV_TARGET {
     float2 p = pos.xy;
     float3 f = capsule(p);
     float coverage = saturate(.5 - f.x);
     if (coverage <= 0) return 0;
     float h = geometry.w;
-    float t = saturate(1 + f.x / max(1, h * .15));
-    float edge = t * t * (3 - 2 * t);
-    float2 uv = (p + filter.xx - f.yz * (h * .07 * edge)) / geometry.xy;
-    // Broad low-pass in the center; restrained, narrower transmission at the rim.
-    float3 c = lerp(image0.SampleLevel(clamped, uv, 0).rgb,
-                    image1.SampleLevel(clamped, uv, 0).rgb, edge * .45);
-    float luminance = dot(c, float3(.2126, .7152, .0722));
-    c = lerp(luminance.xxx, c, .78);
-    // Central contrast is deliberately bounded; a dark lens over a white page
-    // must not become a pale gray button with unreadable white foreground.
-    c = style.x > .5 ? c * .10 + float3(.010, .013, .020)
-                        : lerp(c, float3(.94, .96, .98), .62);
-    float facing = max(0, dot(f.yz, float2(-.305, -.952)));
-    float s = h / 26;
-    float rim = exp(-pow((f.x + 1.1 * s) / (.5 * s), 2));
-    c = saturate(c * (1 - .07 * edge * (1 - facing)) + .16 * facing * facing * rim);
-    float foreground = 0;
+    float inset = max(0, -f.x);
+    float bevel = 1 - smoothstep(0, h * BEVEL_FRACTION, inset);
+    float protection = smoothstep(h * .055, h * .23, inset);
+    float2 uv = (p + filter.xx - f.yz * (h * REFRACTION_FRACTION * bevel)) / geometry.xy;
+    // Broad low-pass under ALL foreground content, narrower already-blurred scene
+    // only near the perimeter. Never blend unfiltered desktop pixels into the body.
+    float3 scene = lerp(image0.SampleLevel(clamped, uv, 0).rgb,
+                        image1.SampleLevel(clamped, uv, 0).rgb, bevel * RIM_NARROW_MIX);
+    bool dark = style.x > .5;
+    float3 c = dark ? dark_tone(scene, protection) : light_tone(scene, protection);
+    c = rim_lighting(c, p, f, dark);
     if (style.z > .5) {
-        foreground = text_mask.SampleLevel(clamped, p / geometry.zw, 0);
-        // Illustrative voice bars, not microphone data. Foreground is AFTER blur.
+        float foreground = text_mask.SampleLevel(clamped, p / geometry.zw, 0);
+        // Foreground layout, colors and animation are unchanged from V1.
         [unroll] for (int i = 0; i < 5; ++i) {
             float x = h * (.32 + i * .105);
             float length_y = h * (.07 + .12 * (.5 + .5 * sin(style.y * 3.5 + i * 1.3)));
@@ -81,7 +121,7 @@ float4 material_ps(float4 pos : SV_POSITION) : SV_TARGET {
             float d = length(max(q, 0)) + min(max(q.x, q.y), 0) - h * .012;
             foreground = max(foreground, saturate(.5 - d));
         }
-        c = lerp(c, style.x > .5 ? float3(.95, .97, 1) : float3(.012, .020, .035), foreground);
+        c = lerp(c, dark ? float3(.95, .97, 1) : float3(.012, .020, .035), foreground);
     }
     // Encode BEFORE premultiplication; swapchain is UNORM (not an sRGB RTV).
     return float4(encode_srgb(c) * coverage, coverage);
