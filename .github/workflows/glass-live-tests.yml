@@ -28,7 +28,7 @@ jobs:
         run: |
           $baseline = (git rev-parse HEAD:experiments/glass-live/src/glass.hlsl | Out-String).Trim()
           if ($LASTEXITCODE -ne 0 -or $baseline -ne '7a8126afc379257a34d27a4dbff6ac9125267eda') {
-            throw 'V2.2 reference changed. Refactor parity must not compare two jointly edited shaders.'
+            throw 'V2.2 reference changed. Do not compare two jointly edited shaders.'
           }
       - name: Compile launchers and controller under Windows PowerShell 5.1
         shell: powershell
@@ -52,7 +52,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Type -AssemblyName System.Drawing
           $images = @(Get-ChildItem -LiteralPath $dir -Filter '*.png')
-          if ($images.Count -ne 3) { throw 'Expected three GPU fixture images.' }
+          if ($images.Count -ne 3) { throw 'Expected three runtime GPU fixture images.' }
           foreach ($image in $images) {
             $bitmap = [System.Drawing.Bitmap]::new($image.FullName)
             try {
@@ -61,23 +61,30 @@ jobs:
           }
           $fixtureRoot = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures'
           $comparisons = @(Get-ChildItem -LiteralPath $fixtureRoot -Filter '*.png')
-          if ($comparisons.Count -ne 8) { throw 'Expected eight V1/current text and color comparison images.' }
+          if ($comparisons.Count -ne 8) { throw 'Expected eight historical V1/V2.2 comparison images.' }
           $surface = @(Get-ChildItem -LiteralPath (Join-Path $fixtureRoot 'surface-reflection') -Filter '*.png')
-          if ($surface.Count -ne 12) { throw 'Expected twelve same-input reflection-off/on comparison images.' }
+          if ($surface.Count -ne 12) { throw 'Expected twelve historical reflection-off/on comparison images.' }
           $issueRoot = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures.issue11'
           $parity = @(Get-ChildItem -LiteralPath $issueRoot -Recurse -File -Filter '*.png')
-          if ($parity.Count -ne 8) { throw 'Expected eight fixed V2.2/configured parity PNGs.' }
+          if ($parity.Count -ne 8) { throw 'Expected eight V2.2/neutral-profile parity PNGs.' }
           $metrics = Get-Content -LiteralPath (Join-Path $issueRoot 'metrics.json') -Raw | ConvertFrom-Json
           if ($metrics.stage -ne 1 -or $metrics.cases -ne 192 -or $metrics.compared_pixels -ne 2201472 -or $metrics.max_rgb_error -gt 1 -or -not $metrics.alpha_exact) {
-            throw 'Issue #11 parameter-refactor coverage or parity contract failed.'
+            throw 'Parameter-refactor parity contract failed.'
           }
-          foreach ($image in @($comparisons + $surface + $parity)) {
+          $v23Root = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures.issue11-v23'
+          $v23 = @(Get-ChildItem -LiteralPath $v23Root -Recurse -File -Filter '*.png')
+          if ($v23.Count -ne 48) { throw 'Expected 6 backgrounds x 2 themes x 4 material stages.' }
+          $current = Get-Content -LiteralPath (Join-Path $v23Root 'metrics.json') -Raw | ConvertFrom-Json
+          if ($current.cases -ne 36 -or -not $current.alpha_exact -or -not $current.opaque_foreground_exact -or $current.min_synthetic_foreground_contrast -lt 7 -or $current.max_veil_light_rgb_shift -gt 4 -or $current.max_veil_dark_rgb_shift -gt 12) {
+            throw 'Current V2.3 material contract or coverage failed.'
+          }
+          foreach ($image in @($comparisons + $surface + $parity + $v23)) {
             $bitmap = [System.Drawing.Bitmap]::new($image.FullName)
             try {
               if ($bitmap.Width -ne 214 -or $bitmap.Height -ne 91) { throw 'Unexpected material comparison PNG size.' }
             } finally { $bitmap.Dispose() }
           }
-          'PNG decoding and V2.2 parity metadata verified. This is not live-desktop/hardware acceptance.'
+          'Decoded historical/neutral/current outputs independently. No real-desktop or motion acceptance implied.'
       - name: Upload independent preview and synthetic GPU fixtures
         uses: actions/upload-artifact@v4
         with:
@@ -89,5 +96,8 @@ jobs:
             ${{ runner.temp }}/glass-material-v2-fixtures/**/metrics.json
             ${{ runner.temp }}/glass-material-v2-fixtures.issue11/**/*.png
             ${{ runner.temp }}/glass-material-v2-fixtures.issue11/metrics.json
+            ${{ runner.temp }}/glass-material-v2-fixtures.issue11-v23/**/*.png
+            ${{ runner.temp }}/glass-material-v2-fixtures.issue11-v23/metrics.json
+            ${{ runner.temp }}/glass-material-v2-fixtures.issue11-v23/parameters.txt
           if-no-files-found: error
           retention-days: 7
