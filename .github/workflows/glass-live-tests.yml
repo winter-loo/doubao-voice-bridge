@@ -23,12 +23,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Parse launcher under Windows PowerShell 5.1
+      - name: Compile launchers and controller under Windows PowerShell 5.1
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           & './experiments/glass-live/run-preview.ps1' -CompileOnly
-      - name: Compile and run portable tests on Windows
+          & './experiments/glass-live/review-preview.ps1' -CompileOnly
+      - name: Run unit, hidden-window control and same-frame GPU pair tests; build Windows executable
         shell: pwsh
         run: |
           cargo test --locked --manifest-path experiments/glass-live/Cargo.toml
