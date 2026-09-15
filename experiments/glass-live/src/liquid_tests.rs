@@ -75,35 +75,32 @@ fn actual_liquid_pipeline_has_transmission_lensing_and_input_response()->AppResu
                     }
                 }
             }
-            // A true no-lens ablation retains identical blur/tint/lighting/ink.
             let mut flat=Pipeline::new(device.clone(),context.clone(),w,h,&mask)?;
             let src=format!("#define LIQUID_TEST_NO_LENS 1\n{}\n{}",include_str!("glass.hlsl"),include_str!("liquid.hlsl"));
             let b=compile_source(&src,s!("liquid_material_ps"),s!("ps_5_0"))?;let mut shader=None;flat.device.CreatePixelShader(blob_bytes(&b),None,Some(&mut shader))?;flat.base.material=shader.ok_or("No no-lens control")?;
             let input=source(rw,rh,4,0);upload(&p,&input);upload(&flat,&input);
-            p.render(false,12.0,false);
+            // Warm source-dependent adaptation before testing spring settling.
+            // Otherwise changing shadows would be misclassified as elastic drift.
+            for i in 0..=120 { p.render(false,12.0+i as f32/60.0,false); }
             for i in 0..2 {p.context.CopyResource(&flat.adaptation[i].texture,&p.adaptation[i].texture);}
             flat.adapt_index.set(p.adapt_index.get());*flat.motion.borrow_mut()=*p.motion.borrow();
-            flat.render(false,12.0,false);
+            flat.render(false,14.0,false);
             let curved=p.read_rgba(&p.output)?;let straight=flat.read_rgba(&flat.output)?;
             let different=curved.chunks_exact(4).zip(straight.chunks_exact(4)).filter(|(a,b)|a[3]==255&&b[3]==255&&(0..3).any(|k|a[k].abs_diff(b[k])>8)).count();
             assert!(different>(w*h/30) as usize,"No measurable optical displacement: {different}");
-            // Same timestamp is a pure re-render. Input history cannot drift inside SAVE.
-            p.render(false,12.0,false);assert_eq!(curved,p.read_rgba(&p.output)?);
+            p.render(false,14.0,false);assert_eq!(curved,p.read_rgba(&p.output)?);
             if w==162 {if let Some(d)=&dir{
                 let child=d.join("lensing-ablation");std::fs::create_dir_all(&child)?;flat.snapshot(&child,1)?;p.snapshot(&child,2)?;
             }}
-            // Pointer press and release act on material even with the voice bars OFF.
             let still=curved;
-            for i in 1..=40 {p.render_input(false,12.0+i as f32/120.0,false,[0.8,0.6],true,[0.65,0.1],false);}
+            for i in 1..=40 {p.render_input(false,14.0+i as f32/120.0,false,[0.8,0.6],true,[0.65,0.1],false);}
             let pressed=p.read_rgba(&p.output)?;assert_ne!(still,pressed,"Interaction only changed the foreground, not liquid material");
-            for i in 41..=480{p.render_input(false,12.0+i as f32/120.0,false,[0.3,0.18],false,[0.0;2],false);}
+            for i in 41..=480{p.render_input(false,14.0+i as f32/120.0,false,[0.3,0.18],false,[0.0;2],false);}
             let settled=p.read_rgba(&p.output)?;
             let max=still.iter().zip(&settled).map(|(a,b)|a.abs_diff(*b)).max().unwrap_or(0);
             assert!(max<=1,"Material failed to settle without perpetual idle oscillation: {max}");
             metrics.push(format!("{{\"size\":[{w},{h}],\"lensing_changed_pixels\":{different},\"settled_max_error\":{max}}}"));
         }
-        // Actual shader frames, not a generated illustration. Synthetic input
-        // playback on WARP, not a capture/present performance claim.
         if let Some(d)=&dir {
             let w=270;let h=60;let mask=label_mask(w,h)?;
             let p=Pipeline::new(device.clone(),context.clone(),w,h,&mask)?;
@@ -119,3 +116,5 @@ fn actual_liquid_pipeline_has_transmission_lensing_and_input_response()->AppResu
         eprintln!("[liquid-optics-contract] {json}");if let Some(d)=&dir{std::fs::write(d.join("metrics.json"),json)?;}
     } Ok(())
 }
+
+include!("liquid_legibility_tests.rs");
