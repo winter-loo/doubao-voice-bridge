@@ -34,8 +34,6 @@ jobs:
           def git(*args):
               return subprocess.check_output(['git', *args], text=True).strip()
           if not pathlib.Path('experiments/glass-live/src/adaptive.rs').exists():
-              # Git blobs below are three lossless transport chunks of the reviewed
-              # UTF-8 source diff. They contain no executable binary or user data.
               parts=['98d44424c21e6a9f0791a3e1e7d72d429c34c061','12fe1c8c214f79a43626079f2eafc513e86ec1da','ab9cabe240117c6b1ed4408a65f067a5030e7bba']
               packed=b''
               for sha in parts:
@@ -48,24 +46,30 @@ jobs:
               patch=zlib.decompress(packed)
               allowed={'clients/desktop-client/src/voice_glass.rs'}|{'experiments/glass-live/src/'+name for name in ['adaptive.hlsl','adaptive.rs','adaptive_checks.rs','adaptive_model.rs','adaptive_window_checks.rs','gpu.rs','lib.rs','liquid.rs','liquid_gpu.rs','voice_window.rs']}
               entries=re.split(rb'(?m)^diff --git ',patch)[1:]
-              seen=set()
+              after={}
+              git('config','core.autocrlf','false')
               for entry in entries:
                   header=entry.splitlines()[0].decode(); a,b=header.split(' ')
                   assert a[2:]==b[2:] and b[2:] in allowed
-                  path=b[2:];seen.add(path)
+                  path=b[2:]
                   m=re.search(rb'(?m)^index ([0-9a-f]{40})\.\.([0-9a-f]{40})',entry);assert m
-                  before=m[1].decode()
+                  before=m[1].decode();after[path]=m[2].decode()
                   if before=='0'*40: assert not pathlib.Path(path).exists()
                   else:
                       assert git('rev-parse','HEAD:'+path)==before,(path,'source changed')
-                      # Normalize only these exact clean checkout files for git apply.
                       blob=subprocess.check_output(['git','show','HEAD:'+path]);pathlib.Path(path).write_bytes(blob)
-              assert seen==allowed
-              git('config','core.autocrlf','false')
+              assert set(after)==allowed
               p=pathlib.Path(os.environ['RUNNER_TEMP'])/'adaptive-reviewed.patch';p.write_bytes(patch)
-              subprocess.run(['git','apply','--check','--index',str(p)],check=True)
-              subprocess.run(['git','apply','--index',str(p)],check=True)
+              subprocess.run(['git','apply','--check',str(p)],check=True)
+              subprocess.run(['git','apply',str(p)],check=True)
+              # Full-index patch hashes verify exact resulting bytes; Windows stat
+              # caching and CRLF checkout metadata cannot substitute for this check.
+              for path,sha in after.items():
+                  value=pathlib.Path(path).read_bytes()
+                  assert hashlib.sha1(b'blob '+str(len(value)).encode()+b'\0'+value).hexdigest()==sha,(path,'patched bytes differ')
+              subprocess.run(['git','add','--',*sorted(allowed)],check=True)
               assert set(git('diff','--cached','--name-only').splitlines())==allowed
+              for path,sha in after.items(): assert git('rev-parse',':'+path)==sha,(path,'index differs')
               git('config','user.name','github-actions[bot]');git('config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
               git('commit','-m','feat(glass): adaptive optical convergence, exterior canvas and first-visible timing')
               remote=git('ls-remote','origin','refs/heads/feat/glass-custom-material').split()[0]
