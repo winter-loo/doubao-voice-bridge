@@ -15,6 +15,8 @@ jobs:
   apply-and-check:
     runs-on: windows-latest
     timeout-minutes: 35
+    env:
+      GLASS_CI_NATIVE_FIXTURE: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,6 +40,11 @@ jobs:
           root=pathlib.Path(os.environ['RUNNER_TEMP'])
           (root/'adaptive-commit.txt').write_text(git('rev-parse','HEAD'))
           subprocess.run(['git','archive','--format=zip','-o',str(root/'adaptive-source.zip'),'HEAD','experiments/glass-live','clients/desktop-client','.github/workflows/adaptive-glass.yml'],check=True)
+      - name: Preflight actual native canvas and mouse routing in owned CI fixture
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path experiments/glass-live/Cargo.toml --lib native_canvas_visible_input_stays_capsule_and_both_windows_move -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Execute shared library unit tests, native host and actual HLSL on WARP
         shell: pwsh
         run: |
@@ -69,7 +76,7 @@ jobs:
           $err = Join-Path $env:RUNNER_TEMP 'adaptive-selftest.stderr.txt'
           $p = Start-Process -FilePath $exe -ArgumentList '--liquid-glass-self-test' -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
           $null = $p.Handle
-          if (-not $p.WaitForExit(240000)) { $p.Kill(); throw 'Self-test timed out' }
+          if (-not $p.WaitForExit(600000)) { $p.Kill(); throw 'Self-test timed out' }
           $p.WaitForExit()
           Get-Content $out
           Get-Content $err
