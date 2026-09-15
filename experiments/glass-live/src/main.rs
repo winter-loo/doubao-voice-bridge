@@ -1,10 +1,11 @@
-//! Standalone custom-glass milestone. No GPUI, microphone, network or hotkeys.
-//! Live capture requires an explicit flag. Self-test never captures the desktop.
+//! Windows optical liquid glass. No microphone, network or global hotkeys.
+//! Live capture requires explicit consent. Self-test never captures the desktop.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod png;
 mod review;
 #[cfg(windows)]
+#[path = "liquid_gpu.rs"]
 mod gpu;
 #[cfg(windows)]
 mod desktop;
@@ -61,10 +62,11 @@ fn run() -> AppResult<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help") {
         println!("GlassLivePreview --allow-desktop-capture [--compact] [--theme=light|dark] [--seconds=600] [--snapshot-dir=NEW_DIR] [--review-mode]\n\
+                  Material: LENS_TRANSMISSION_1. Curved refraction, live transmission, adaptive ink, local glyph support, contact highlights and press/drag springs.\n\
                   Controls: left drag=move; left click=light/dark. Normal mode: middle click=local PNG, right click=close. No global hotkey.\n\
                   Review mode: middle/right mouse clicks do NOT save/close. Use review-preview.ps1 and one explicit SAVE for a same-frame light/dark pair. System close still works.\n\
                   Capture exclusion also hides this preview from many other screenshot/recording tools.\n\
-                  --self-test runs WARP shader/texture/readback checks without capturing or showing windows.");
+                  --self-test runs the actual optical renderer on WARP without capturing or showing windows.");
         return Ok(());
     }
     let options = Options::parse(args.into_iter())?;
@@ -89,8 +91,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn parse(a: &[&str]) -> AppResult<Options> { Options::parse(a.iter().map(|s| s.to_string())) }
     #[test] fn capture_requires_opt_in() { assert!(parse(&[]).is_err()); }
+    fn parse(a: &[&str]) -> AppResult<Options> { Options::parse(a.iter().map(|s| s.to_string())) }
     #[test] fn self_test_is_not_capture_consent() {
         let o = parse(&["--self-test"]).unwrap(); assert!(!o.allow_capture);
         assert!(parse(&["--self-test", "--allow-desktop-capture"]).is_err());
