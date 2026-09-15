@@ -122,4 +122,9 @@ impl AdaptivePresenter {
 
 #[path="adaptive_checks.rs"]
 mod checks;
-pub unsafe fn self_test(directory:Option<&Path>)->AppResult<()> {checks::verify(directory)}
+#[path="adaptive_review.rs"]
+mod review_evidence;
+pub unsafe fn self_test(directory:Option<&Path>)->AppResult<()> {
+    checks::verify(directory)?;
+    review_evidence::verify(directory)
+}
