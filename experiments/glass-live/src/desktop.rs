@@ -1,8 +1,8 @@
 //! Original standalone host: one small DirectComposition window, no HostBackdrop.
-//! Desktop frames stay GPU-resident. Only an explicit middle click performs a
-//! bounded local readback when a snapshot directory was supplied by the caller.
-use crate::{ensure, gpu::{self, Pipeline, Presenter}, AppResult, Options};
-use std::{cell::RefCell, mem::size_of, time::{Duration, Instant}};
+//! Desktop frames stay GPU-resident. Readback requires an explicit snapshot
+//! action; review mode exports both themes from the same cached frame.
+use crate::{ensure, gpu::{self, Pipeline, Presenter}, review, AppResult, Options};
+use std::{cell::RefCell, io::Write, mem::size_of, time::{Duration, Instant}};
 use windows::{core::{w, Interface}, Win32::{
     Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{Direct3D11::*, Dxgi::{Common::*, *}, Gdi::*},
@@ -14,8 +14,20 @@ use windows::{core::{w, Interface}, Win32::{
 struct Input {
     dragging: bool, moved: bool, anchor: POINT, original: POINT,
     new_position: Option<POINT>, toggle: bool, snapshot: bool, display_changed: bool,
+    control: review::Control,
+    ignored_mouse_logged: bool,
 }
 thread_local! { static INPUT: RefCell<Input> = RefCell::new(Input::default()); }
+fn mark_exit(reason: &'static str) {
+    let first = INPUT.with(|s| { let mut s=s.borrow_mut(); let first=s.control.exit_reason.is_none(); s.control.stop(reason); first });
+    if first { eprintln!("[glass-live] exit-request reason={reason}"); }
+}
+fn review_mouse_note() {
+    INPUT.with(|s| { let mut s=s.borrow_mut(); if !s.ignored_mouse_logged {
+        s.ignored_mouse_logged=true;
+        eprintln!("[glass-review] middle/right mouse action ignored; use terminal SAVE or CANCEL");
+    } });
+}
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match message {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
@@ -46,10 +58,36 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             let _=ReleaseCapture(); LRESULT(0)
         }
         WM_CAPTURECHANGED => {INPUT.with(|s|s.borrow_mut().dragging=false);LRESULT(0)}
-        WM_MBUTTONDOWN => {INPUT.with(|s|s.borrow_mut().snapshot=true);LRESULT(0)}
-        WM_RBUTTONDOWN | WM_CLOSE => {let _=DestroyWindow(hwnd);LRESULT(0)}
+        WM_MBUTTONDOWN => {
+            if INPUT.with(|s|s.borrow().control.enabled) { review_mouse_note(); }
+            else { INPUT.with(|s|s.borrow_mut().snapshot=true); }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            if INPUT.with(|s|s.borrow().control.right_click_closes()) {
+                mark_exit("WM_RBUTTONDOWN"); let _=DestroyWindow(hwnd);
+            } else { review_mouse_note(); }
+            LRESULT(0)
+        }
+        review::SAVE_PAIR_MESSAGE => {
+            if lp.0==0 && INPUT.with(|s|s.borrow_mut().control.request_pair(wp.0)) {
+                eprintln!("[glass-review] pair-request accepted; request=1");
+            }
+            LRESULT(0)
+        }
+        review::CLOSE_REVIEW_MESSAGE => {
+            if wp.0==1 && lp.0==0 && INPUT.with(|s|s.borrow().control.enabled) {
+                mark_exit("controller-close"); let _=DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {mark_exit("WM_CLOSE");let _=DestroyWindow(hwnd);LRESULT(0)}
+        WM_SYSCOMMAND if wp.0 & 0xfff0 == SC_CLOSE as usize => {
+            mark_exit("SC_CLOSE"); DefWindowProcW(hwnd,message,wp,lp)
+        }
+        WM_ENDSESSION if wp.0!=0 => {mark_exit("WM_ENDSESSION");PostQuitMessage(0);LRESULT(0)}
         WM_DISPLAYCHANGE | WM_DPICHANGED => {INPUT.with(|s|s.borrow_mut().display_changed=true);LRESULT(0)}
-        WM_DESTROY => {PostQuitMessage(0);LRESULT(0)}
+        WM_DESTROY => {mark_exit("WM_DESTROY");PostQuitMessage(0);LRESULT(0)}
         _ => DefWindowProcW(hwnd,message,wp,lp),
     }
 }
@@ -149,7 +187,6 @@ unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<
         let mut rect=RECT{left:(height as f32*0.92)as i32,top:0,right:width as i32-(height as f32*0.25)as i32,bottom:height as i32};
         let mut text:Vec<u16>="优化识别中".encode_utf16().collect();
         let drawn=DrawTextW(dc,&mut text,&mut rect,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        // A DIB section must synchronize batched GDI writes before CPU access.
         let flushed=GdiFlush().as_bool();
         let pixels=std::slice::from_raw_parts(bits as *const u8,(width*height*4)as usize);
         let mask=pixels.chunks_exact(4).map(|p|p[0].max(p[1]).max(p[2])).collect::<Vec<_>>();
@@ -161,6 +198,7 @@ unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<
 
 pub unsafe fn run(options:Options)->AppResult<()> {
     ensure(options.allow_capture,"Capture was not authorized")?;
+    INPUT.with(|s|*s.borrow_mut()=Input{control:review::Control::new(options.review_mode),..Input::default()});
     CoInitializeEx(None,COINIT_APARTMENTTHREADED).ok()?;let _apartment=Apartment;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
     let (factory,adapter,output,desc,monitor)=choose_output()?;
@@ -188,7 +226,6 @@ pub unsafe fn run(options:Options)->AppResult<()> {
     let region=CreateRoundRectRgn(0,0,width as i32+1,height as i32+1,height as i32,height as i32);
     ensure(!region.0.is_null(),"Capsule region creation failed")?;
     if SetWindowRgn(hwnd,Some(region),false)==0 {let _=DeleteObject(HGDIOBJ(region.0));return Err("Capsule window region failed".into());}
-    // Strictly scoped to this temporary HWND, set before SHOW and capture start.
     SetWindowDisplayAffinity(hwnd,WDA_EXCLUDEFROMCAPTURE)?;
     let mut affinity=0u32;GetWindowDisplayAffinity(hwnd,&mut affinity)?;
     ensure(affinity==WDA_EXCLUDEFROMCAPTURE.0,"Capture exclusion readback failed; refusing recursive capture")?;
@@ -199,19 +236,24 @@ pub unsafe fn run(options:Options)->AppResult<()> {
     while !capture.acquire(&pipe)? {ensure(first.elapsed()<Duration::from_secs(3),"No initial desktop frame within 3 seconds")?;std::thread::sleep(Duration::from_millis(10));}
     capture.crop(&pipe,position)?;pipe.prepare();pipe.render(options.dark,0.,true);presenter.present(&pipe)?;
     let _=ShowWindow(hwnd,SW_SHOWNOACTIVATE);
-    eprintln!("[glass-live] READY pid={}; hwnd=0x{:X}; capsule={}x{}; dpi={}; no microphone; capture-excluded; right-click closes",
-        std::process::id(),hwnd.0 as usize,width,height,dpi);
-    eprintln!("[glass-live] left drag=move, left click=theme, middle click=local snapshot if enabled; lifetime={}s",options.seconds);
+    eprintln!("[glass-live] READY pid={}; hwnd=0x{:X}; capsule={}x{}; dpi={}; no microphone; capture-excluded; review={}",
+        std::process::id(),hwnd.0 as usize,width,height,dpi,options.review_mode);
+    eprintln!("[glass-live] left drag=move, left click=theme; lifetime={}s",options.seconds);
+    if options.review_mode { eprintln!("[glass-review] control-v1; mouse-close=disabled; explicit SAVE exports one same-frame light/dark pair"); }
+    else { eprintln!("[glass-live] middle click=local snapshot if enabled; right click=close"); }
     let start=Instant::now();let mut dark=options.dark;let mut rendered=1u64;let mut snapshots=0u32;
     let mut msg=MSG::default();let mut done=false;
     let outcome=(||->AppResult<()>{
         while !done&&start.elapsed()<Duration::from_secs(options.seconds){
             let tick=Instant::now();
             for _ in 0..64 {if !PeekMessageW(&mut msg,None,0,0,PM_REMOVE).as_bool(){break;}
-                if msg.message==WM_QUIT{done=true;break;}let _=TranslateMessage(&msg);DispatchMessageW(&msg);}
+                if msg.message==WM_QUIT{
+                    mark_exit("WM_QUIT");eprintln!("[glass-live] WM_QUIT code={}",msg.wParam.0);done=true;break;
+                }let _=TranslateMessage(&msg);DispatchMessageW(&msg);}
             if done{break;}
-            let (move_to,toggle,snapshot,changed)=INPUT.with(|s|{let mut s=s.borrow_mut();
-                let v=(s.new_position.take(),s.toggle,s.snapshot,s.display_changed);s.toggle=false;s.snapshot=false;v});
+            let (move_to,toggle,snapshot,pair,changed)=INPUT.with(|s|{let mut s=s.borrow_mut();
+                let pair=s.control.take_pair();
+                let v=(s.new_position.take(),s.toggle,s.snapshot,pair,s.display_changed);s.toggle=false;s.snapshot=false;v});
             ensure(!changed,"Display/DPI changed; close and restart the preview on the supported output")?;
             let mut moved=false;
             if let Some(p)=move_to{
@@ -222,16 +264,64 @@ pub unsafe fn run(options:Options)->AppResult<()> {
             if toggle{dark=!dark;}
             let fresh=capture.acquire(&pipe)?;
             if fresh||moved{capture.crop(&pipe,position)?;pipe.prepare();}
-            pipe.render(dark,start.elapsed().as_secs_f32(),true);presenter.present(&pipe)?;rendered+=1;
+            let phase=start.elapsed().as_secs_f32();
+            pipe.render(dark,phase,true);presenter.present(&pipe)?;rendered+=1;
             if snapshot{if let Some(dir)=options.snapshots.as_deref(){
                 ensure(snapshots<100,"Snapshot limit reached (100)")?;snapshots+=1;pipe.snapshot(dir,snapshots)?;
             }else{eprintln!("[glass-live] snapshot ignored: no explicit snapshot directory");}}
+            if pair {
+                let dir=options.snapshots.as_deref().ok_or("Review pair requires snapshot directory")?;
+                review::save_pair(&pipe,dir,dark,phase,true)?;
+                let metadata=format!("{{\"complete\":true,\"request\":1,\"pid\":{},\"captured_frame\":{},\"phase_seconds\":{},\"lens\":[{},{},{},{}],\"padding\":{},\"light\":\"snapshot-0001.png\",\"dark\":\"snapshot-0002.png\",\"source\":\"same-cached-frame GPU composites, not DWM screenshots\"}}",
+                    std::process::id(),capture.frames,phase,position.x,position.y,width,height,pipe.padding);
+                let temp=dir.join("pair.json.tmp");
+                let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+                file.write_all(metadata.as_bytes())?;file.sync_all()?;drop(file);
+                std::fs::rename(temp,dir.join("pair.json"))?;
+                eprintln!("[glass-review] PAIR_SAVED request=1; captured_frame={}; selected_theme_restored=true",capture.frames);
+            }
             if let Some(delay)=Duration::from_millis(16).checked_sub(tick.elapsed()){std::thread::sleep(delay);}
         }Ok(())
     })();
-    // Remove the window immediately on capture/device loss; never leave stale glass.
+    let reason=if outcome.is_err(){"runtime-error"}else if !done{"lifetime-limit"}else{
+        INPUT.with(|s|s.borrow().control.exit_reason.unwrap_or("WM_QUIT"))
+    };
+    mark_exit(reason);
     let _=ShowWindow(hwnd,SW_HIDE);
-    eprintln!("[glass-live] stopped; captured_frames={}; submitted_frames={}; elapsed_seconds={:.2}; these counters are not display FPS",capture.frames,rendered,start.elapsed().as_secs_f64());
+    eprintln!("[glass-live] stopped; reason={}; captured_frames={}; submitted_frames={}; elapsed_seconds={:.2}; these counters are not display FPS",reason,capture.frames,rendered,start.elapsed().as_secs_f64());
     drop(presenter);drop(capture);drop(pipe);drop(window);
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn hidden_window_review_buttons_do_not_close_and_explicit_close_is_traced() {
+        unsafe {
+            INPUT.with(|s|*s.borrow_mut()=Input{control:review::Control::new(true),..Input::default()});
+            let module=GetModuleHandleW(None).unwrap();
+            let name=w!("DoubaoReviewControlHiddenTest");
+            assert_ne!(RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(window_proc),hInstance:HINSTANCE(module.0),lpszClassName:name,..Default::default()}),0);
+            let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,name,w!("hidden control test"),WS_POPUP,0,0,1,1,None,None,Some(HINSTANCE(module.0)),None).unwrap();
+            let window=Window(hwnd);
+            // No ShowWindow, GPU, desktop capture, synthetic system input or hotkey.
+            window_proc(hwnd,WM_RBUTTONDOWN,WPARAM(0),LPARAM(0));
+            window_proc(hwnd,WM_MBUTTONDOWN,WPARAM(0),LPARAM(0));
+            assert!(IsWindow(Some(hwnd)).as_bool());
+            assert!(INPUT.with(|s|s.borrow().control.exit_reason.is_none()));
+            assert!(!INPUT.with(|s|s.borrow().snapshot));
+            window_proc(hwnd,review::SAVE_PAIR_MESSAGE,WPARAM(1),LPARAM(0));
+            assert!(INPUT.with(|s|s.borrow_mut().control.take_pair()));
+            window_proc(hwnd,review::SAVE_PAIR_MESSAGE,WPARAM(1),LPARAM(0));
+            assert!(!INPUT.with(|s|s.borrow_mut().control.take_pair()));
+            window_proc(hwnd,review::CLOSE_REVIEW_MESSAGE,WPARAM(1),LPARAM(0));
+            assert!(!IsWindow(Some(hwnd)).as_bool());
+            assert_eq!(INPUT.with(|s|s.borrow().control.exit_reason),Some("controller-close"));
+            let mut msg=MSG::default();
+            while PeekMessageW(&mut msg,None,0,0,PM_REMOVE).as_bool() {}
+            drop(window);
+            UnregisterClassW(name,Some(HINSTANCE(module.0))).unwrap();
+        }
+    }
 }
