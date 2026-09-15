@@ -3,6 +3,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod png;
+mod review;
 #[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
@@ -19,13 +20,14 @@ pub struct Options {
     pub self_test: bool,
     pub compact: bool,
     pub dark: bool,
+    pub review_mode: bool,
     pub seconds: u64,
     pub snapshots: Option<std::path::PathBuf>,
 }
 impl Options {
     fn parse(args: impl Iterator<Item = String>) -> AppResult<Self> {
         let mut o = Self { allow_capture: false, self_test: false, compact: false,
-            dark: false, seconds: 600, snapshots: None };
+            dark: false, review_mode: false, seconds: 600, snapshots: None };
         for arg in args {
             match arg.as_str() {
                 "--allow-desktop-capture" => o.allow_capture = true,
@@ -33,6 +35,7 @@ impl Options {
                 "--compact" => o.compact = true,
                 "--theme=dark" => o.dark = true,
                 "--theme=light" => o.dark = false,
+                "--review-mode" => o.review_mode = true,
                 _ if arg.starts_with("--seconds=") => {
                     o.seconds = arg[10..].parse()?;
                     ensure((5..=1800).contains(&o.seconds), "seconds must be 5..1800")?;
@@ -48,6 +51,8 @@ impl Options {
         ensure(o.self_test || o.allow_capture,
             "Live mode requires --allow-desktop-capture. It captures the primary SDR display locally on GPU and excludes THIS preview from system screen capture. Use --self-test for a no-capture GPU test.")?;
         ensure(!(o.self_test && o.allow_capture), "Do not combine self-test and live capture")?;
+        ensure(!o.review_mode || (o.allow_capture && !o.self_test && o.snapshots.is_some()),
+            "Review mode requires live capture consent and a new --snapshot-dir; it is not a self-test mode")?;
         Ok(o)
     }
 }
@@ -55,8 +60,9 @@ impl Options {
 fn run() -> AppResult<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help") {
-        println!("GlassLivePreview --allow-desktop-capture [--compact] [--theme=light|dark] [--seconds=600] [--snapshot-dir=NEW_DIR]\n\
-                  Controls: left drag=move; left click=light/dark; middle click=save a local crop (only when snapshot-dir was supplied); right click=close. No global hotkey.\n\
+        println!("GlassLivePreview --allow-desktop-capture [--compact] [--theme=light|dark] [--seconds=600] [--snapshot-dir=NEW_DIR] [--review-mode]\n\
+                  Controls: left drag=move; left click=light/dark. Normal mode: middle click=local PNG, right click=close. No global hotkey.\n\
+                  Review mode: middle/right mouse clicks do NOT save/close. Use review-preview.ps1 and one explicit SAVE for a same-frame light/dark pair. System close still works.\n\
                   Capture exclusion also hides this preview from many other screenshot/recording tools.\n\
                   --self-test runs WARP shader/texture/readback checks without capturing or showing windows.");
         return Ok(());
@@ -94,5 +100,10 @@ mod tests {
         assert!(parse(&["--allow-desktop-capture", "--unknown"]).is_err());
         assert_eq!(parse(&["--allow-desktop-capture", "--seconds=60"]).unwrap().seconds, 60);
         assert_eq!(parse(&["--self-test", "--snapshot-dir=test"]).unwrap().snapshots.unwrap(), std::path::PathBuf::from("test"));
+    }
+    #[test] fn review_requires_both_live_consent_and_snapshot_directory() {
+        assert!(parse(&["--self-test","--review-mode","--snapshot-dir=test"]).is_err());
+        assert!(parse(&["--allow-desktop-capture","--review-mode"]).is_err());
+        assert!(parse(&["--allow-desktop-capture","--review-mode","--snapshot-dir=test"]).unwrap().review_mode);
     }
 }
