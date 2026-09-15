@@ -9,6 +9,11 @@ use windows::{core::{s, Interface, PCSTR}, Win32::{
     },
 }};
 
+// V2 keeps the same two separable passes and texture geometry. The stronger
+// center filter fits inside the existing .65 * height source padding (3 sigma).
+const CENTER_SIGMA_FRACTION: f32 = 0.20;
+const EDGE_SIGMA_FRACTION: f32 = 0.045;
+
 pub unsafe fn create_device(adapter: Option<&IDXGIAdapter1>) -> AppResult<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None; let mut context = None;
     let base_adapter: Option<IDXGIAdapter> = adapter.map(|a| a.cast()).transpose()?;
@@ -42,8 +47,7 @@ impl Texture {
 #[derive(Clone, Copy)]
 struct Constants { geometry: [f32; 4], filter: [f32; 4], style: [f32; 4] }
 
-unsafe fn compile(entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
-    let source = include_str!("glass.hlsl");
+unsafe fn compile_source(source: &str, entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
     let mut code = None; let mut errors: Option<ID3DBlob> = None;
     let result = D3DCompile(source.as_ptr().cast(), source.len(), s!("glass-live.hlsl"), None, None,
         entry, target, 1 << 15, 0, &mut code, Some(&mut errors));
@@ -52,6 +56,9 @@ unsafe fn compile(entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
         return Err(format!("HLSL compilation failed: {detail}").into());
     }
     Ok(code.ok_or("Compiler returned no bytecode")?)
+}
+unsafe fn compile(entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
+    compile_source(include_str!("glass.hlsl"), entry, target)
 }
 unsafe fn blob_bytes(b: &ID3DBlob) -> &[u8] { slice::from_raw_parts(b.GetBufferPointer().cast(), b.GetBufferSize()) }
 
@@ -68,6 +75,8 @@ impl Pipeline {
         ensure(width >= height && height >= 20 && height <= 120 && width <= 1024, "Invalid pipeline geometry")?;
         ensure(mask.len() == width as usize * height as usize, "Invalid foreground mask")?;
         let padding = (height as f32 * 0.65).ceil() as u32;
+        ensure(padding >= (3.0 * (height as f32 * CENTER_SIGMA_FRACTION).min(20.0)).ceil() as u32,
+            "Center blur support exceeds captured padding")?;
         let rw = width + padding * 2; let rh = height + padding * 2;
         let mut vertex = None; let b = compile(s!("fullscreen_vs"), s!("vs_5_0"))?;
         device.CreateVertexShader(blob_bytes(&b), None, Some(&mut vertex))?;
@@ -121,9 +130,12 @@ impl Pipeline {
             filter: [self.padding as f32, 0., 0., 0.], style: [0.; 4] }
     }
     pub unsafe fn prepare(&self) {
+        self.prepare_scales(CENTER_SIGMA_FRACTION, EDGE_SIGMA_FRACTION);
+    }
+    unsafe fn prepare_scales(&self, center_fraction: f32, edge_fraction: f32) {
         let mut c = self.params();
         self.pass(&self.linear, &self.convert, &[Some(self.raw.view.clone())], c);
-        for (sigma, target) in [(self.output.height as f32 * 0.16, &self.wide), (self.output.height as f32 * 0.035, &self.narrow)] {
+        for (sigma, target) in [(self.output.height as f32 * center_fraction, &self.wide), (self.output.height as f32 * edge_fraction, &self.narrow)] {
             c.filter = [self.padding as f32, sigma.min(20.), 1., 0.];
             self.pass(&self.temporary, &self.blur, &[Some(self.linear.view.clone())], c);
             c.filter[2] = 0.; c.filter[3] = 1.;
@@ -235,3 +247,7 @@ pub unsafe fn self_test(directory: Option<&Path>) -> AppResult<()> {
     eprintln!("[glass-live-self-test] PASS: four HLSL entry points compiled; GPU color separation, silhouette alpha, stripe attenuation, dark tone and readback tested on WARP. No desktop capture/window; not hardware performance or presentation acceptance.");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "material_tests.rs"]
+mod material_tests;
