@@ -1,6 +1,6 @@
 // Original runtime shader. No third-party shader code or displacement assets.
 // SDR capture -> linear FP16 blur -> sRGB premultiplied BGRA8.
-// V2.1: narrow optical rim; retain the V2 protected center and foreground.
+// V2.2: retain V2.1's narrow rim and filters; add bounded surface reflection.
 // Alpha remains silhouette coverage, NEVER material transparency.
 cbuffer Parameters : register(b0) {
     float4 geometry; // ROI width,height; capsule width,height
@@ -32,7 +32,7 @@ float3 encode_srgb(float3 c) {
     c = saturate(c);
     return float3(c.r <= .0031308 ? c.r * 12.92 : 1.055 * pow(c.r, 1 / 2.4) - .055,
                   c.g <= .0031308 ? c.g * 12.92 : 1.055 * pow(c.g, 1 / 2.4) - .055,
-                  c.b <= .0031308 ? c.b * 12.92 : 1.055 * pow(c.b, 1 / 2.4) - .055);
+                  c.b <= .0031308 ? c.b / 12.92 : 1.055 * pow(c.b, 1 / 2.4) - .055);
 }
 float4 convert_ps(float4 p : SV_POSITION) : SV_TARGET {
     return float4(linearize(image0.SampleLevel(clamped, p.xy / geometry.xy, 0).rgb), 1);
@@ -57,12 +57,11 @@ float3 capsule(float2 p) {
     return len < .00001 ? float3(-r, 0, 0) : float3(len - r, v / len);
 }
 
-// Only the transmitting edge endpoint changes; protection=1 is exactly V2.
+// The transmitting edge and protected center retain the V2.1 tone mapping.
 // Keep chroma distinct from luminance and never let raw text leak through alpha.
 float3 light_tone(float3 scene, float protection) {
     float y = dot(scene, LUMA);
     float3 chroma = scene - y.xxx;
-    // The old .48 + .44*y endpoint produced a dark, broad lip over black ink.
     float luminance = lerp(.70 + .24 * y, .84 + .105 * y, protection);
     float chroma_gain = lerp(.40, .24, protection);
     return saturate(luminance.xxx + chroma * chroma_gain + float3(-.002, 0, .004));
@@ -70,7 +69,6 @@ float3 light_tone(float3 scene, float protection) {
 float3 dark_tone(float3 scene, float protection) {
     float y = dot(scene, LUMA);
     float3 chroma = scene - y.xxx;
-    // Reduce the pale perimeter on white pages, not the charcoal center.
     float luminance = lerp(.014 + .070 * y, .013 + .045 * y, protection);
     float chroma_gain = lerp(.11, .09, protection);
     return saturate(luminance.xxx + chroma * chroma_gain + float3(-.001, 0, .003));
@@ -94,6 +92,24 @@ float3 rim_lighting(float3 body, float2 p, float3 field, bool dark) {
     body += inner_rim * pow(facing, 3) * (dark ? .004 : .006);
     return saturate(body);
 }
+
+// A restrained, static area-light reflection, not a reconstructed Apple shader.
+// This is separate from transmission: no raw sampling, extra pass, blur change,
+// opacity change or animation. It must never brighten foreground glyphs.
+float3 surface_reflection(float3 body, float2 p, float inset, bool dark) {
+    float2 uv = p / geometry.zw;
+    // Preserve the thin outer rim exactly; ease into a broad interior shoulder.
+    float interior = smoothstep(.08 * geometry.w, .20 * geometry.w, inset);
+    float2 light_shape = (uv - float2(.30, .22)) / float2(.52, .28);
+    float reflection = exp(-dot(light_shape, light_shape)) * interior;
+    float underside = exp(-pow((uv.y - .80) / .20, 2)) * interior;
+    // Separate amplitudes: a small lift for charcoal, almost imperceptible pearl.
+    // Multiplication contracts scene contrast; reflection adds only a smooth field.
+    body *= 1 - underside * (dark ? .025 : .006);
+    body += reflection * (dark ? .012 : .010);
+    return saturate(body);
+}
+
 float4 material_ps(float4 pos : SV_POSITION) : SV_TARGET {
     float2 p = pos.xy;
     float3 f = capsule(p);
@@ -102,8 +118,6 @@ float4 material_ps(float4 pos : SV_POSITION) : SV_TARGET {
     float h = geometry.w;
     float inset = max(0, -f.x);
     float bevel = 1 - smoothstep(0, h * BEVEL_FRACTION, inset);
-    // Reach the unchanged protected body after .13h, rather than .23h.
-    // For the 39px lens this removes the soft ~9px lip; no extra blur pass.
     float protection = smoothstep(h * .025, h * .13, inset);
     float2 uv = (p + filter.xx - f.yz * (h * REFRACTION_FRACTION * bevel)) / geometry.xy;
     // Both sources are already blurred. The thinner edge mixes LESS of the
@@ -113,6 +127,9 @@ float4 material_ps(float4 pos : SV_POSITION) : SV_TARGET {
     bool dark = style.x > .5;
     float3 c = dark ? dark_tone(scene, protection) : light_tone(scene, protection);
     c = rim_lighting(c, p, f, dark);
+#ifndef GLASS_SURFACE_REFLECTION_TEST_OFF
+    c = surface_reflection(c, p, inset, dark);
+#endif
     if (style.z > .5) {
         float foreground = text_mask.SampleLevel(clamped, p / geometry.zw, 0);
         // Foreground layout, colors and animation are unchanged from V1.
