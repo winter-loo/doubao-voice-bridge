@@ -1,0 +1,62 @@
+name: Production voice overlay integration
+on:
+  push:
+    branches: ['feat/liquid-glass-voice-integration']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: voice-overlay-integration-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git archive --format=zip --output=integration-sources.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: integration-sources
+          path: integration-sources.zip
+          retention-days: 3
+  windows-client:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            clients/desktop-client/target
+            experiments/glass-live/target
+          key: voice-integration-windows-${{ hashFiles('clients/desktop-client/Cargo.lock', 'experiments/glass-live/Cargo.lock') }}
+          restore-keys: voice-integration-windows-
+      - name: Build and test the actual production client (no application launch)
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run shared optical renderer regressions without desktop capture
+        shell: pwsh
+        run: |
+          $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'voice-optics'
+          cargo test --locked --manifest-path experiments/glass-live/Cargo.toml -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload integrated executable and renderer evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoubaoVoiceClient-integration
+          path: |
+            clients/desktop-client/target/release/DoubaoVoiceClient.exe
+            ${{ runner.temp }}/voice-optics.voice/**/*.png
+            ${{ runner.temp }}/voice-optics.voice/**/*.json
+          if-no-files-found: error
+          retention-days: 7
