@@ -193,3 +193,6 @@ pub unsafe fn self_test(directory:Option<&Path>)->AppResult<()> {
 #[cfg(test)] mod tests { include!("liquid_tests.rs"); }
 
 #[cfg(test)] mod voice_parity { include!("voice_parity_tests.rs"); }
+
+#[path="adaptive.rs"]
+pub mod adaptive;

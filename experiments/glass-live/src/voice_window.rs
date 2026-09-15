@@ -1,11 +1,12 @@
 //! Dedicated Win32/D3D owner thread. Never runs in GPUI's paint callback.
 //! Only this in-process window is capture-excluded. No recorder, IPC or audio.
-use crate::{AppResult, ensure, desktop::{self,Capture}, gpu::{self,Pipeline,Presenter}};
+use crate::{AppResult, ensure, desktop::{self,Capture}, gpu::{self,AdaptivePipeline as Pipeline,AdaptivePresenter as Presenter}};
+use crate::adaptive_model::{CanvasGeometry,PresentationClock};
 use crate::voice_model::{Phase,View};
 use crate::voice_overlay::{Callbacks,Event,Shared};
 use std::{cell::RefCell,mem::size_of,sync::Arc,time::{Duration,Instant}};
 use windows::{core::w,Win32::{
-    Foundation::{HINSTANCE,HWND,LPARAM,LRESULT,POINT,RECT,WPARAM},
+    Foundation::{COLORREF,HINSTANCE,HWND,LPARAM,LRESULT,POINT,RECT,WPARAM},
     Graphics::{Dwm::DwmFlush,Gdi::*},
     System::{Com::{CoInitializeEx,CoUninitialize,COINIT_APARTMENTTHREADED},LibraryLoader::GetModuleHandleW},
     UI::{HiDpi::*,Input::KeyboardAndMouse::{SetCapture,ReleaseCapture},WindowsAndMessaging::*},
@@ -44,6 +45,19 @@ unsafe extern "system" fn proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT {
         _=>DefWindowProcW(hwnd,msg,wp,lp),
     }
 }
+// Visual-only layered HWND: WS_EX_TRANSPARENT passes input to OTHER threads /
+// processes as well. HTTRANSPARENT alone would only forward within our thread.
+unsafe extern "system" fn canvas_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE=>LRESULT(MA_NOACTIVATE as isize),
+        WM_NCHITTEST=>LRESULT(HTTRANSPARENT as isize),
+        WM_ERASEBKGND=>LRESULT(1),
+        WM_PAINT=>{let _=ValidateRect(Some(hwnd),None);LRESULT(0)},
+        WM_DISPLAYCHANGE|WM_DPICHANGED=>{INPUT.with(|s|s.borrow_mut().display_changed=true);LRESULT(0)},
+        WM_CLOSE=>{INPUT.with(|s|s.borrow_mut().close=true);LRESULT(0)},
+        _=>DefWindowProcW(hwnd,msg,wp,lp),
+    }
+}
 struct Window(HWND);
 impl Drop for Window {fn drop(&mut self){unsafe{let _=ShowWindow(self.0,SW_HIDE);if IsWindow(Some(self.0)).as_bool(){let _=DestroyWindow(self.0);}}}}
 struct ThreadContext {old:DPI_AWARENESS_CONTEXT,instance:HINSTANCE}
@@ -58,17 +72,57 @@ impl ThreadContext {
         if RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(proc),hInstance:instance,hCursor:cursor,lpszClassName:w!("DoubaoVoiceLiquidOverlay"),..Default::default()})==0{
             SetThreadDpiAwarenessContext(old);CoUninitialize();return Err("Could not register production glass window".into());
         }
+        if RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(canvas_proc),hInstance:instance,lpszClassName:w!("DoubaoVoiceLiquidCanvas"),..Default::default()})==0 {
+            let _=UnregisterClassW(w!("DoubaoVoiceLiquidOverlay"),Some(instance));
+            SetThreadDpiAwarenessContext(old);CoUninitialize();return Err("Could not register glass canvas".into());
+        }
         Ok(Self{old,instance})
     }
 }
 impl Drop for ThreadContext {fn drop(&mut self){unsafe{
+    let _=UnregisterClassW(w!("DoubaoVoiceLiquidCanvas"),Some(self.instance));
     let _=UnregisterClassW(w!("DoubaoVoiceLiquidOverlay"),Some(self.instance));SetThreadDpiAwarenessContext(self.old);CoUninitialize();
 }}}
 
-// Field order deliberately releases composition/capture/GPU BEFORE the HWND.
+unsafe fn create_pair(context:&ThreadContext,point:POINT)->AppResult<(Window,Window)> {
+    let canvas=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP|WS_EX_LAYERED|WS_EX_TRANSPARENT,
+        w!("DoubaoVoiceLiquidCanvas"),w!("Doubao Voice Glass Canvas"),WS_POPUP,
+        point.x,point.y,1,1,None,None,Some(context.instance),None)?;
+    let canvas_window=Window(canvas);
+    SetLayeredWindowAttributes(canvas,COLORREF(0),255,LWA_ALPHA)?;
+    // A transparent NOREDIRECTION input surface above the visual canvas. It
+    // retains the old capsule Region and never draws or samples desktop pixels.
+    let hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,
+        w!("DoubaoVoiceLiquidOverlay"),w!("Doubao Voice Liquid Glass"),WS_POPUP,
+        point.x,point.y,1,1,Some(canvas),None,Some(context.instance),None)?;
+    let window=Window(hwnd);
+    Ok((window,canvas_window))
+}
+unsafe fn configure_pair(body:HWND,canvas:HWND,position:POINT,layout:CanvasGeometry,exclude:bool)->AppResult<()> {
+    let m=layout.margin as i32;
+    SetWindowPos(canvas,Some(HWND_TOPMOST),position.x-m,position.y-m,layout.canvas_width() as i32,layout.canvas_height() as i32,SWP_NOACTIVATE)?;
+    SetWindowPos(body,Some(HWND_TOPMOST),position.x,position.y,layout.width as i32,layout.height as i32,SWP_NOACTIVATE)?;
+    let region=CreateRoundRectRgn(0,0,layout.width as i32+1,layout.height as i32+1,layout.height as i32,layout.height as i32);
+    ensure(!region.0.is_null(),"Cannot allocate glass hit region")?;
+    if SetWindowRgn(body,Some(region),false)==0{let _=DeleteObject(HGDIOBJ(region.0));return Err("Cannot set glass hit region".into());}
+    if exclude {for owned in [canvas,body] {
+        SetWindowDisplayAffinity(owned,WDA_EXCLUDEFROMCAPTURE)?;
+        let mut affinity=0;GetWindowDisplayAffinity(owned,&mut affinity)?;
+        ensure(affinity==WDA_EXCLUDEFROMCAPTURE.0,"Capture exclusion unavailable; refuse recursive sampling")?;
+    }}
+    Ok(())
+}
+unsafe fn move_pair(body:HWND,canvas:HWND,position:POINT,margin:i32)->AppResult<()> {
+    let batch=BeginDeferWindowPos(2)?;
+    let batch=DeferWindowPos(batch,canvas,None,position.x-margin,position.y-margin,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)?;
+    let batch=DeferWindowPos(batch,body,None,position.x,position.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)?;
+    EndDeferWindowPos(batch)?;Ok(())
+}
+
+// Field order deliberately releases composition/capture/GPU BEFORE the HWNDs.
 struct Session {
-    presenter:Presenter,capture:Capture,pipe:Pipeline,window:Window,
-    generation:u64,position:POINT,work:RECT,scale:f32,start:Instant,
+    presenter:Presenter,capture:Capture,pipe:Pipeline,window:Window,canvas_window:Window,
+    generation:u64,position:POINT,work:RECT,scale:f32,start:Instant,visual_clock:PresentationClock,
     phase:Phase,shown:bool,have_frame:bool,
 }
 impl Session {
@@ -77,32 +131,24 @@ impl Session {
         let (factory,adapter,output,_desc,monitor)=desktop::choose_output()?;
         INPUT.with(|s|*s.borrow_mut()=Input::default());
         let work=monitor.rcWork;
-        let hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,
-            w!("DoubaoVoiceLiquidOverlay"),w!("Doubao Voice Liquid Glass"),WS_POPUP,
-            (work.left+work.right)/2,(work.top+work.bottom)/2,1,1,None,None,Some(context.instance),None)?;
-        let window=Window(hwnd);
+        let (window,canvas_window)=create_pair(context,POINT{x:(work.left+work.right)/2,y:(work.top+work.bottom)/2})?;
+        let hwnd=window.0;let canvas=canvas_window.0;
         let dpi=GetDpiForWindow(hwnd);ensure((96..=288).contains(&dpi),"Unsupported overlay DPI; use solid fallback")?;
         let scale=dpi as f32/96.;let width=(108.*scale).round() as u32;let height=(26.*scale).round() as u32;
         let mask=content_mask(width,height,scale,view.phase)?;
         let (device,device_context)=gpu::create_device(Some(&adapter))?;
         let pipe=Pipeline::new_voice(device,device_context,width,height,&mask)?;
-        let pad=pipe.padding as i32;
+        let pad=pipe.layout.capture_safe_margin(pipe.padding) as i32;
         ensure(work.right-work.left>width as i32+pad*2&&work.bottom-work.top>height as i32+pad*2,"Work area too small")?;
         let proposed=previous.unwrap_or(POINT{x:(work.left+work.right-width as i32)/2,y:work.bottom-height as i32-pad-20});
         let position=clamp_position(proposed,work,width,height,pad);
-        SetWindowPos(hwnd,Some(HWND_TOPMOST),position.x,position.y,width as i32,height as i32,SWP_NOACTIVATE)?;
-        let region=CreateRoundRectRgn(0,0,width as i32+1,height as i32+1,height as i32,height as i32);
-        ensure(!region.0.is_null(),"Cannot allocate glass hit region")?;
-        if SetWindowRgn(hwnd,Some(region),false)==0{let _=DeleteObject(HGDIOBJ(region.0));return Err("Cannot set glass hit region".into());}
-        SetWindowDisplayAffinity(hwnd,WDA_EXCLUDEFROMCAPTURE)?;
-        let mut affinity=0;GetWindowDisplayAffinity(hwnd,&mut affinity)?;
-        ensure(affinity==WDA_EXCLUDEFROMCAPTURE.0,"Capture exclusion unavailable; refuse recursive sampling")?;
-        let presenter=Presenter::new(hwnd,&factory,&pipe.device,width,height)?;
+        configure_pair(hwnd,canvas,position,pipe.layout,true)?;
+        let presenter=Presenter::new(canvas,hwnd,&factory,&pipe)?;
         presenter.bind_input(&pipe);
         // Only after explicit consent, current generation checks and exclusion.
         ensure(shared.allows(view.generation),"Session superseded before desktop capture")?;
         let capture=Capture{duplication:output.DuplicateOutput(&pipe.device)?,cache:None,rect:_desc.DesktopCoordinates,frames:0};
-        Ok(Self{presenter,capture,pipe,window,generation:view.generation,position,work,scale,start:Instant::now(),phase:view.phase,shown:false,have_frame:false})
+        Ok(Self{presenter,capture,pipe,window,canvas_window,generation:view.generation,position,work,scale,start:Instant::now(),visual_clock:PresentationClock::default(),phase:view.phase,shown:false,have_frame:false})
     }
     unsafe fn frame(&mut self,view:View,shared:&Shared,callbacks:Callbacks)->AppResult<bool>{
         let mut msg=MSG::default();
@@ -117,9 +163,11 @@ impl Session {
         if !shared.allows(self.generation){return Ok(false);}
         let mut moved=false;
         if let Some(p)=position {
-            let p=clamp_position(p,self.work,self.pipe.output.width,self.pipe.output.height,self.pipe.padding as i32);
+            let p=clamp_position(p,self.work,self.pipe.layout.width,self.pipe.layout.height,self.pipe.layout.capture_safe_margin(self.pipe.padding) as i32);
             moved=p.x!=self.position.x||p.y!=self.position.y;
-            if moved{SetWindowPos(self.window.0,None,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)?;self.position=p;}
+            if moved {
+                move_pair(self.window.0,self.canvas_window.0,p,self.pipe.layout.margin as i32)?;self.position=p;
+            }
         }
         let fresh=self.capture.acquire(&self.pipe)?;
         if fresh{self.have_frame=true;}
@@ -133,20 +181,22 @@ impl Session {
             self.pipe.set_voice_mask(&mask)?;self.phase=view.phase;
         }
         let level=(callbacks.level)();
-        self.pipe.render_voice(view.dark,self.start.elapsed().as_secs_f32(),view.phase,level,view.opacity);
+        let visual_time=self.visual_clock.sample(self.start.elapsed(),true).unwrap();
+        self.pipe.render_voice(view.dark,visual_time,view.phase,level,view.opacity);
         // A completion/new-session arriving during a GPU pass must not reshow old content.
         if !shared.allows(self.generation){return Ok(false);}
         self.presenter.present(&self.pipe)?;
         if !self.shown {
+            let _=ShowWindow(self.canvas_window.0,SW_SHOWNOACTIVATE);
             let _=ShowWindow(self.window.0,SW_SHOWNOACTIVATE);
             SetWindowPos(self.window.0,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)?;
             self.shown=true;shared.active(true,callbacks);
-            eprintln!("[voice-glass] LIVE generation={}; material=LENS_TRANSMISSION_1; in-process; actual voice state; no microphone/save API",self.generation);
+            eprintln!("[voice-glass] LIVE generation={}; material=LENS_ADAPTIVE_2; in-process; actual voice state; visual clock starts with valid source; no microphone/save API",self.generation);
         }
         Ok(true)
     }
 }
-impl Drop for Session {fn drop(&mut self){unsafe{let _=ShowWindow(self.window.0,SW_HIDE);}
+impl Drop for Session {fn drop(&mut self){unsafe{let _=ShowWindow(self.window.0,SW_HIDE);let _=ShowWindow(self.canvas_window.0,SW_HIDE);}
     eprintln!("[voice-glass] session released; generation={}; desktop_frames={}; no screen images saved",self.generation,self.capture.frames);
 }}
 fn clamp_position(p:POINT,work:RECT,w:u32,h:u32,pad:i32)->POINT {
@@ -226,6 +276,7 @@ pub(crate) fn run(shared:Arc<Shared>,fallback_hwnd:isize,callbacks:Callbacks){un
     drop(context);
 }}
 
+#[cfg(test)] static WINDOW_TEST_LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn fixed_geometry_stays_inside_roi_and_only_recording_can_finish(){
@@ -235,6 +286,7 @@ pub(crate) fn run(shared:Arc<Shared>,fallback_hwnd:isize,callbacks:Callbacks){un
         assert!(!Phase::Optimizing.can_finish()&&!Phase::Completed.can_finish()&&!Phase::Failed.can_finish());
     }
     #[test] fn production_window_messages_never_expose_preview_controls(){unsafe{
+        let _serial=WINDOW_TEST_LOCK.lock().unwrap();
         let _context=ThreadContext::new().unwrap();
         let h=CreateWindowExW(WS_EX_TOOLWINDOW,w!("DoubaoVoiceLiquidOverlay"),w!("hidden test"),WS_POPUP,0,0,1,1,None,None,Some(_context.instance),None).unwrap();
         let _window=Window(h);INPUT.with(|s|*s.borrow_mut()=Input::default());
@@ -245,3 +297,7 @@ pub(crate) fn run(shared:Arc<Shared>,fallback_hwnd:isize,callbacks:Callbacks){un
         // No ShowWindow, desktop duplication, audio, system input injection or hotkeys.
     }}
 }
+
+#[cfg(test)]
+#[path="adaptive_window_checks.rs"]
+mod adaptive_window_checks;

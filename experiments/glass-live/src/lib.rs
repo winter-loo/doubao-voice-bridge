@@ -3,6 +3,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod png;
+mod adaptive_model;
+pub const MATERIAL_NAME: &str = "LENS_ADAPTIVE_2";
 mod review;
 pub mod voice_model;
 #[cfg(windows)]
@@ -112,4 +114,4 @@ mod tests {
 #[cfg(windows)]
 mod voice_render_checks;
 #[cfg(windows)]
-pub fn voice_self_test() -> AppResult<()> { unsafe { voice_render_checks::verify(None) } }
+pub fn voice_self_test() -> AppResult<()> { unsafe { voice_render_checks::verify(None)?; gpu::adaptive_self_test(None) } }

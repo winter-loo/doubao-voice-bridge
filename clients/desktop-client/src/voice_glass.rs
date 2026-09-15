@@ -43,7 +43,7 @@ pub fn finished(generation:u64){if let Some(e)=ENGINE.get(){e.finished(generatio
 pub fn failed(generation:u64){if let Some(e)=ENGINE.get(){e.failed(generation);}}
 pub fn shutdown(){if let Some(e)=ENGINE.get(){e.shutdown();}}
 fn on_event(event:Event){match event{
-    Event::Presenting(active)=>log(if active{"selected=Liquid; material=LENS_TRANSMISSION_1; voice-state content"}else{"optical surface released"}),
+    Event::Presenting(active)=>log(if active{"selected=Liquid; material=LENS_ADAPTIVE_2; voice-state content"}else{"optical surface released"}),
     Event::Unavailable(error)=>log(&format!("selected=Solid; voice session preserved; {error}")),
     Event::FinishRequested(generation)=>{
         if generation==crate::overlay_generation() && matches!(crate::overlay_phase(),OverlayPhase::Activating|OverlayPhase::Listening){

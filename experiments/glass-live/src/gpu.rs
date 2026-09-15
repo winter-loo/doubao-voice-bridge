@@ -211,8 +211,13 @@ impl Presenter {
         Ok(Self { chain, composition, target, _visual: visual })
     }
     pub unsafe fn present(&self, pipe: &Pipeline) -> AppResult<()> {
+        self.present_texture(&pipe.context, &pipe.output)
+    }
+    pub unsafe fn present_texture(&self, context: &ID3D11DeviceContext, texture: &Texture) -> AppResult<()> {
+        let desc = self.chain.GetDesc1()?;
+        ensure(desc.Width == texture.width && desc.Height == texture.height, "Canvas/swapchain dimensions differ")?;
         let back: ID3D11Texture2D = self.chain.GetBuffer(0)?;
-        pipe.context.CopyResource(&back, &pipe.output.texture);
+        context.CopyResource(&back, &texture.texture);
         self.chain.Present(1, DXGI_PRESENT(0)).ok()?; Ok(())
     }
 }
