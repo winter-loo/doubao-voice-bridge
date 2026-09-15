@@ -29,7 +29,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & './experiments/glass-live/run-preview.ps1' -CompileOnly
           & './experiments/glass-live/review-preview.ps1' -CompileOnly
-      - name: Run unit, control, GPU pair and V1-V2 material tests; build Windows executable
+      - name: Run unit, control, GPU pair and material regression tests; build Windows executable
         shell: pwsh
         run: |
           $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures'
@@ -52,9 +52,12 @@ jobs:
               if ($bitmap.Width -ne 212 -or $bitmap.Height -ne 92) { throw 'Unexpected decoded PNG size.' }
             } finally { $bitmap.Dispose() }
           }
-          $comparisons = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures') -Filter '*.png')
-          if ($comparisons.Count -ne 8) { throw 'Expected eight V1/V2 text and color comparison images.' }
-          foreach ($image in $comparisons) {
+          $fixtureRoot = Join-Path $env:RUNNER_TEMP 'glass-material-v2-fixtures'
+          $comparisons = @(Get-ChildItem -LiteralPath $fixtureRoot -Filter '*.png')
+          if ($comparisons.Count -ne 8) { throw 'Expected eight V1/current text and color comparison images.' }
+          $surface = @(Get-ChildItem -LiteralPath (Join-Path $fixtureRoot 'surface-reflection') -Filter '*.png')
+          if ($surface.Count -ne 12) { throw 'Expected twelve same-input reflection-off/on comparison images.' }
+          foreach ($image in @($comparisons + $surface)) {
             $bitmap = [System.Drawing.Bitmap]::new($image.FullName)
             try {
               if ($bitmap.Width -ne 214 -or $bitmap.Height -ne 91) { throw 'Unexpected material comparison PNG size.' }
@@ -68,7 +71,7 @@ jobs:
           path: |
             experiments/glass-live/target/release/GlassLivePreview.exe
             ${{ runner.temp }}/glass-live-gpu-fixtures/*.png
-            ${{ runner.temp }}/glass-material-v2-fixtures/*.png
-            ${{ runner.temp }}/glass-material-v2-fixtures/metrics.json
+            ${{ runner.temp }}/glass-material-v2-fixtures/**/*.png
+            ${{ runner.temp }}/glass-material-v2-fixtures/**/metrics.json
           if-no-files-found: error
           retention-days: 7
