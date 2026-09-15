@@ -1,0 +1,87 @@
+name: Apply reviewed voice integration
+on:
+  push:
+    branches: ['feat/glass-custom-material']
+    paths: ['tools/migrations/integrate_voice_glass.py', 'tools/migrations/voice-shared-edits.json', 'experiments/glass-live/src/voice_*.rs', 'experiments/glass-live/src/voice_*.hlsl', 'clients/desktop-client/src/voice_glass.rs', '.github/workflows/voice-glass-apply.yml']
+permissions:
+  contents: read
+concurrency:
+  group: apply-reviewed-voice-integration
+  cancel-in-progress: false
+jobs:
+  apply-and-check:
+    if: github.event_name == 'push' && github.repository == 'winter-loo/doubao-voice-bridge' && github.ref == 'refs/heads/feat/glass-custom-material'
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            clients/desktop-client
+            experiments/glass-live
+          key: voice-liquid-integration
+      - name: Apply exact reviewed source edits
+        shell: pwsh
+        run: |
+          python tools/migrations/integrate_voice_glass.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $reference = git hash-object experiments/glass-live/src/liquid_reference.hlsl
+          if ($LASTEXITCODE -ne 0 -or $reference -ne '4e72b8fbb6b8db4ac6f8d426a26d2d368fb27692') { throw 'Approved optical reference changed' }
+      - name: Compile library and test actual production optical content on WARP
+        shell: pwsh
+        run: |
+          $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'integration-fixtures'
+          cargo test --locked --manifest-path experiments/glass-live/Cargo.toml -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Resolve added path dependency without general dependency update and test the formal client
+        shell: pwsh
+        run: |
+          cargo test --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --stat -- clients/desktop-client/Cargo.lock
+          cargo build --release --locked --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Execute the formal client optical self-test before any UI, microphone or network
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'voice-selftest.stdout.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'voice-selftest.stderr.txt'
+          $p = Start-Process -FilePath './clients/desktop-client/target/release/DoubaoVoiceClient.exe' -ArgumentList '--liquid-glass-self-test' -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'Isolated no-capture self-test timed out' }
+          Get-Content $out
+          Get-Content $err
+          if ($p.ExitCode -ne 0) { throw ('Formal self-test failed: ' + $p.ExitCode) }
+          if (-not ([string](Get-Content $out -Raw)).Contains('[voice-glass-self-test] PASS')) { throw 'Formal executable did not execute optical integration' }
+      - name: Commit only tested source and lock changes; refuse concurrent branch updates
+        shell: pwsh
+        run: |
+          git fetch --no-tags origin refs/heads/feat/glass-custom-material
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $remote = (git rev-parse FETCH_HEAD | Out-String).Trim()
+          $base = (git rev-parse HEAD | Out-String).Trim()
+          if ($remote -ne $base) { throw 'Branch advanced during validation; no push attempted' }
+          git add -- clients/desktop-client/src/main.rs clients/desktop-client/src/client_settings.rs clients/desktop-client/src/windows_shell.rs clients/desktop-client/Cargo.toml clients/desktop-client/Cargo.lock experiments/glass-live/Cargo.toml experiments/glass-live/src/main.rs experiments/glass-live/src/lib.rs experiments/glass-live/src/desktop.rs experiments/glass-live/src/liquid.rs experiments/glass-live/src/liquid.hlsl experiments/glass-live/src/liquid_reference.hlsl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = (git diff --cached --name-only | Out-String).Trim()
+          if ($changed.Length -gt 0) {
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(client): integrate approved liquid optics into production voice lifecycle'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git push origin HEAD:refs/heads/feat/glass-custom-material
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          git rev-parse HEAD | Set-Content (Join-Path $env:RUNNER_TEMP 'integrated-commit.txt')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: integrated-voice-client-tested
+          path: |
+            clients/desktop-client/target/release/DoubaoVoiceClient.exe
+            ${{ runner.temp }}/integrated-commit.txt
+            ${{ runner.temp }}/voice-selftest.*.txt
+            ${{ runner.temp }}/integration-fixtures.voice/*.png
+          if-no-files-found: error
+          retention-days: 7
