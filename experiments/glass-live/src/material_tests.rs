@@ -80,7 +80,8 @@ unsafe fn export(pipe: &Pipeline, directory: &Path, name: &str) -> AppResult<()>
             rgba[b+k] = (layer[a+k] as u32 + (rgba[b+k] as u32 * (255-layer[a+3]) as u32+127)/255).min(255) as u8;
         }
     } }
-    crate::png::write(&directory.join(name), pipe.raw.width, pipe.raw.height, &rgba)
+    crate::png::write(&directory.join(name), pipe.raw.width, pipe.raw.height, &rgba)?;
+    Ok(())
 }
 
 #[test]
