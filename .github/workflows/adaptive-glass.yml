@@ -1,0 +1,91 @@
+name: Adaptive liquid glass regression
+on:
+  push:
+    branches: ['feat/glass-custom-material']
+    paths:
+      - 'experiments/glass-live/**'
+      - 'clients/desktop-client/src/voice_glass.rs'
+      - '.github/workflows/adaptive-glass.yml'
+permissions:
+  contents: read
+concurrency:
+  group: adaptive-liquid-glass-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive the exact renderer and integration source, never user screen data
+        run: |
+          git archive --format=zip -o source.zip HEAD experiments/glass-live clients/desktop-client .github/workflows tools/migrations docs/liquid-glass
+          git rev-parse HEAD > source-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adaptive-source
+          path: |
+            source.zip
+            source-commit.txt
+          retention-days: 7
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            clients/desktop-client
+            experiments/glass-live
+          key: voice-liquid-integration
+      - name: Preserve approved historical optical reference
+        shell: pwsh
+        run: |
+          $reference = git hash-object experiments/glass-live/src/liquid_reference.hlsl
+          if ($LASTEXITCODE -ne 0 -or $reference -ne '4e72b8fbb6b8db4ac6f8d426a26d2d368fb27692') { throw 'Approved reference changed' }
+          git rev-parse HEAD | Set-Content (Join-Path $env:RUNNER_TEMP 'adaptive-commit.txt')
+      - name: Execute shared library unit tests and actual HLSL on WARP
+        shell: pwsh
+        run: |
+          $env:GLASS_MATERIAL_FIXTURES = Join-Path $env:RUNNER_TEMP 'adaptive-fixtures'
+          cargo test --locked --manifest-path experiments/glass-live/Cargo.toml -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test and build formal voice client, not the standalone preview
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Execute formal EXE self-test without desktop capture, audio or network
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path clients/desktop-client/target/release/DoubaoVoiceClient.exe
+          $out = Join-Path $env:RUNNER_TEMP 'adaptive-selftest.stdout.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'adaptive-selftest.stderr.txt'
+          $p = Start-Process -FilePath $exe -ArgumentList '--liquid-glass-self-test' -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'Self-test timed out' }
+          $p.WaitForExit()
+          Get-Content $out
+          Get-Content $err
+          if ($p.ExitCode -ne 0 -or -not ([string](Get-Content $out -Raw)).Contains('[voice-glass-self-test] PASS')) { throw 'Formal optical self-test failed' }
+          Get-FileHash -Algorithm SHA256 -LiteralPath $exe | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'adaptive-executable.json')
+          if ((git status --porcelain --untracked-files=no | Out-String).Trim()) { throw 'Tests changed tracked source or lockfiles' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: adaptive-voice-evidence
+          path: |
+            clients/desktop-client/target/release/DoubaoVoiceClient.exe
+            ${{ runner.temp }}/adaptive-commit.txt
+            ${{ runner.temp }}/adaptive-executable.json
+            ${{ runner.temp }}/adaptive-selftest.*.txt
+            ${{ runner.temp }}/adaptive-fixtures*
+          if-no-files-found: error
+          retention-days: 7
