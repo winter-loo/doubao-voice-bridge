@@ -65,7 +65,7 @@ mod tests {
         assert!(!on.request_pair(1)); assert!(on.exit_reason.is_none());
     }
     #[test]
-    fn_first_exit_cause_is_preserved() {
+    fn first_exit_cause_is_preserved() {
         let mut c = Control::new(true);
         c.stop("controller-close"); c.stop("WM_DESTROY"); c.stop("WM_QUIT");
         assert_eq!(c.exit_reason, Some("controller-close"));
