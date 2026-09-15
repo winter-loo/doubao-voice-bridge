@@ -77,7 +77,7 @@ mod tests {
             let (device, context) = crate::gpu::create_device(None).unwrap();
             let pipe = crate::gpu::Pipeline::new(device, context, 160, 40, &vec![0; 160*40]).unwrap();
             let (w,h) = (pipe.raw.width, pipe.raw.height);
-            let mut pixels = vec![0; (w*h*4) as usize];
+            let mut pixels = vec![0u8; (w*h*4) as usize];
             for y in 0..h { for x in 0..w {
                 let c = if x < w/2 { [64,48,220,255] } else { [224,112,32,255] };
                 pixels[((y*w+x)*4) as usize..][..4].copy_from_slice(&c);
