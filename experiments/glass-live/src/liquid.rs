@@ -1,6 +1,6 @@
 use super::*;
 use std::{cell::{Cell, RefCell}, ops::Deref};
-use windows::Win32::{Foundation::{BOOL, POINT, RECT}, UI::{Input::KeyboardAndMouse::GetCapture, WindowsAndMessaging::{GetCursorPos, GetWindowRect, GetWindowThreadProcessId, WindowFromPoint, SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS}}};
+use windows::Win32::{Foundation::{POINT, RECT}, UI::{Input::KeyboardAndMouse::GetCapture, WindowsAndMessaging::{GetCursorPos, GetWindowRect, GetWindowThreadProcessId, WindowFromPoint, SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS}}};
 use super::super::motion::Motion;
 
 #[repr(C)]
@@ -117,8 +117,9 @@ impl Presenter {
     pub unsafe fn new(hwnd:HWND,factory:&IDXGIFactory2,device:&ID3D11Device,w:u32,h:u32)->AppResult<Self> {
         let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
         ensure(pid==std::process::id(),"Refusing to bind optical input to a foreign window")?;
-        let mut animated=BOOL(1);
-        let reduced=SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,Some((&mut animated as *mut BOOL).cast()),SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok() && !animated.as_bool();
+        // SPI_GETCLIENTAREAANIMATION writes a Win32 BOOL, whose ABI is an i32.
+        let mut animated=1i32;
+        let reduced=SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,Some((&mut animated as *mut i32).cast()),SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok() && animated==0;
         eprintln!("[liquid-optics] material=LENS_TRANSMISSION_1; refracted live scene; local glyph protection; adaptive ink; input springs; reduced-motion={reduced}; NOT V2.3 paint");
         Ok(Self{inner:super::Presenter::new(hwnd,factory,device,w,h)?,hwnd,reduced})
     }
