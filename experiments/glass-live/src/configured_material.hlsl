@@ -18,13 +18,28 @@ float configured_content_weight(float2 p, float inset) {
     float2 q = abs(p - cfg_content_center * geometry.zw) - (half_size - radius);
     float distance = length(max(q, 0)) + min(max(q.x, q.y), 0) - radius;
     float weight = 1 - smoothstep(-cfg_content_feather * geometry.w, 0, distance);
-    // Keep the outer 8% inset completely untouched, including antialias coverage.
     return weight * smoothstep(.08 * geometry.w, .20 * geometry.w, inset);
 }
 float3 configured_veil(float3 body, float weight, bool dark) {
     float4 r = dark ? cfg_dark_readability : cfg_light_readability;
     float3 target = dark ? cfg_dark_veil_rgb : cfg_light_veil_rgb;
     return saturate(lerp(body, target, weight * r.x) + weight * r.y);
+}
+// Two PRE-BLURRED inputs. Convex residual attenuation is not a novel high-pass
+// detector: it reduces the existing narrow contribution, mainly near the rim.
+// The center already uses wide blur and must not be weakened to add it back.
+float3 configured_detail(float3 wide, float3 narrow, float mix_weight, bool dark) {
+    float3 scene = lerp(wide, narrow, mix_weight);
+    float strength = dark ? cfg_dark_detail : cfg_light_detail;
+    float4 r = dark ? cfg_dark_readability : cfg_light_readability;
+    if (strength > 0 || r.z < 1 || r.w < 1) {
+        scene = lerp(scene, wide, strength);
+        float y = dot(scene, LUMA);
+        float local_mean = dot(wide, LUMA);
+        float adjusted_y = lerp(local_mean, y, r.z);
+        scene = saturate(adjusted_y.xxx + (scene - y.xxx) * r.w);
+    }
+    return scene;
 }
 float3 configured_rim(float3 body, float2 p, float3 field, bool dark) {
     float scale = geometry.w / cfg_reference_height;
@@ -62,9 +77,9 @@ float4 configured_material_ps(float4 pos : SV_POSITION) : SV_TARGET {
     float bevel = 1 - smoothstep(0, h * cfg_bevel, inset);
     float protection = smoothstep(h * cfg_protection.x, h * cfg_protection.y, inset);
     float2 uv = (p + filter.xx - f.yz * (h * cfg_refraction * bevel)) / geometry.xy;
-    float3 scene = lerp(image0.SampleLevel(clamped, uv, 0).rgb,
-                        image1.SampleLevel(clamped, uv, 0).rgb, bevel * cfg_narrow_mix);
     bool dark = style.x > .5;
+    float3 scene = configured_detail(image0.SampleLevel(clamped, uv, 0).rgb,
+        image1.SampleLevel(clamped, uv, 0).rgb, bevel * cfg_narrow_mix, dark);
     float3 c = configured_tone(scene, protection, dark);
     c = configured_veil(c, configured_content_weight(p, inset), dark);
     c = configured_rim(c, p, f, dark);
