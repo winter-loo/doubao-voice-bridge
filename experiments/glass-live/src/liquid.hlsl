@@ -39,7 +39,6 @@ float4 liquid_adapt_ps(float4 pos:SV_POSITION):SV_TARGET {
     return float4(y,light_ink,dark_ink,1+lerp(max(0,old.a-1),saturate(detail*4),t));
 }
 
-// Analytic capsule geometry and normal, including bounded input-driven flex.
 float3 liquid_field(float2 p, out float2 local, out float2 size) {
     float h=geometry.w;
     float margin=max(1.0,h*.045);
@@ -50,7 +49,6 @@ float3 liquid_field(float2 p, out float2 local, out float2 size) {
     q.y+=h*.008;
     q.y-=q.x/geometry.z*h*.045*dynamics.x*contact.w;
     q/=stretch;
-    // Materialize by changing lens shape and optical strength, not an opaque fade.
     float appearing=lerp(.40,1,smoothstep(0,1,dynamics.z));
     size.y*=appearing;
     float r=size.y*.5;
@@ -60,20 +58,19 @@ float3 liquid_field(float2 p, out float2 local, out float2 size) {
     local=q+geometry.zw*.5;
     return float3((len-r)*min(stretch.x,stretch.y),len>.00001?v/len:float2(0,0));
 }
+float bar_distance(float2 p,int i) {
+    float h=geometry.w;
+    float x=h*(.32+i*.105);
+    float hy=h*(.07+.12*(.5+.5*sin(style.y*3.5+i*1.3)));
+    float2 q=abs(p-float2(x,h*.5))-float2(h*.025,hy);
+    return length(max(q,0))+min(max(q.x,q.y),0)-h*.012;
+}
 float wave_mask(float2 p) {
     float fg=text_mask.SampleLevel(clamped,p/geometry.zw,0);
-    float h=geometry.w;
-    [unroll] for(int i=0;i<5;i++) {
-        float x=h*(.32+i*.105);
-        float hy=h*(.07+.12*(.5+.5*sin(style.y*3.5+i*1.3)));
-        float2 q=abs(p-float2(x,h*.5))-float2(h*.025,hy);
-        float d=length(max(q,0))+min(max(q.x,q.y),0)-h*.012;
-        fg=max(fg,saturate(.5-d));
-    }
+    [unroll] for(int i=0;i<5;i++) { fg=max(fg,saturate(.5-bar_distance(p,i))); }
     return fg;
 }
 float3 transmit(float3 scene,bool dark) {
-    // Real scene dynamic range, not the former .84+.105*y / .013+.045*y paint.
     return dark?scene*float3(.45,.46,.48)+float3(.006,.008,.012)
                :scene*float3(.88,.89,.90)+float3(.072,.074,.077);
 }
@@ -84,7 +81,6 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float coverage=saturate(.5-field.x);
     float4 adapt=adaptation.Load(int3(0,0,0));
     float complexity=saturate(adapt.a-1);
-    // Shadow is confined to this small transparent canvas, not a rectangular fill.
     float2 dummy,ds; float shadow_d=liquid_field(p-float2(0,h*.026),dummy,ds).x;
     float shadow=(.10+.16*complexity)*exp(-pow(max(0,shadow_d)/(h*.052),2));
     shadow*=smoothstep(0,1,dynamics.z);
@@ -104,22 +100,21 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float2 uv=scene_uv(local+bend);
     float edge=1-smoothstep(h*.075,h*.28,inset);
     float support=glyph_support.SampleLevel(clamped,local/geometry.zw,0);
-    // Keep live bar silhouettes sharp, frost only the immediate glyph neighborhood.
-    float2 bq=abs(local-float2(h*.53,h*.50))-float2(h*.32,h*.24);
-    float bar_support=1-smoothstep(0,h*.065,length(max(bq,0)));
-    support=max(support,bar_support);
+    // Waveform support follows its five animated strokes, not their bounding box.
+    // A rectangular white patch around the icon would contradict transmission.
+    [unroll] for(int i=0;i<5;i++) {
+        support=max(support,1-smoothstep(-h*.012,h*.055,bar_distance(local,i)));
+    }
     if(style.z<.5) support=0;
     float frost=lerp(.62,1,support)*(1-edge*.91);
     float3 narrow=image1.SampleLevel(clamped,uv,0).rgb;
     float3 wide=image0.SampleLevel(clamped,uv,0).rgb;
     float3 scene=lerp(narrow,wide,saturate(frost));
-    // Minute dispersion stays at the refracting perimeter, never rainbow outlines.
     float2 dispersion=field.yz*(h*.004*edge)/geometry.xy;
     scene.r=lerp(scene.r,image1.SampleLevel(clamped,uv+dispersion,0).r,edge*.24);
     scene.b=lerp(scene.b,image1.SampleLevel(clamped,uv-dispersion,0).b,edge*.24);
     float3 body=transmit(scene,dark);
 
-    // Fresnel/geometry-controlled reflection with a moving contact light.
     float2 direction=normalize(float2(-.32,-.94)+(contact.xy-float2(.3,.18))*.95);
     float facing=max(0,dot(field.yz,direction));
     float opposing=max(0,dot(field.yz,-direction));
@@ -133,14 +128,11 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float reflection=outer*(.18+.50*pow(facing,3)*arc)+fresnel*edge*.10;
     body=lerp(body,lerp(float3(1,1,1),ambient,.18),saturate(reflection));
     body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity);
-    // A separated inner caustic follows the bent light, not a broad white bevel.
     body+=shoulder*pow(facing,4)*(.018+.032*contact.z);
     float2 spot=(p/geometry.zw-contact.xy)/float2(.30,.65);
     float contact_glow=exp(-dot(spot,spot))*contact.z*.09;
     body=lerp(body,1,saturate(contact_glow));
 
-    // Adaptive ink polarity is uniform per control and hysteretic on the GPU.
-    // Legibility protection is local to strokes, NOT a solid capsule-shaped paint.
     float white_ink=dark?adapt.b:adapt.g;
     float y=dot(body,LUMA);
     if(white_ink>.5) {
