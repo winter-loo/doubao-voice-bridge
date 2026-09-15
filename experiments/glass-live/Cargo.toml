@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+name = "doubao_glass_live"
+path = "src/lib.rs"
+
 [[bin]]
 name = "GlassLivePreview"
 path = "src/main.rs"
@@ -18,6 +22,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_UI_HiDpi",

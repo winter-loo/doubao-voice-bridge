@@ -45,6 +45,7 @@ const ID_SERVER: usize = 1001;
 const ID_MICROPHONE: usize = 1002;
 const ID_STARTUP: usize = 1003;
 const ID_SAVE: usize = 1004;
+const ID_LIQUID_GLASS: usize = 1005;
 const ID_SETTINGS: usize = 2001;
 const ID_QUIT: usize = 2002;
 
@@ -56,6 +57,7 @@ struct ShellState {
     server_edit: isize,
     microphone_combo: isize,
     startup_checkbox: isize,
+    liquid_checkbox: isize,
     status_label: isize,
     devices: Vec<InputDeviceInfo>,
 }
@@ -96,7 +98,7 @@ fn run_shell(overlay: isize) -> Result<(), String> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             520,
-            390,
+            465,
             None,
             None,
             Some(instance),
@@ -121,6 +123,7 @@ fn run_shell(overlay: isize) -> Result<(), String> {
                 server_edit: controls.server_edit.0 as isize,
                 microphone_combo: controls.microphone_combo.0 as isize,
                 startup_checkbox: controls.startup_checkbox.0 as isize,
+                liquid_checkbox: controls.liquid_checkbox.0 as isize,
                 status_label: controls.status_label.0 as isize,
                 devices,
             }))
@@ -143,6 +146,7 @@ struct Controls {
     server_edit: HWND,
     microphone_combo: HWND,
     startup_checkbox: HWND,
+    liquid_checkbox: HWND,
     status_label: HWND,
 }
 
@@ -259,12 +263,22 @@ fn create_controls(
             Some(WPARAM(usize::from(settings.start_with_windows))),
             None,
         );
+        let liquid_checkbox = create_control(
+            w!("BUTTON"), w!("Liquid Glass (local desktop sampling)"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+            28, 262, 448, 28, parent, ID_LIQUID_GLASS, instance,
+        )?;
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            liquid_checkbox, BM_SETCHECK, Some(WPARAM(usize::from(crate::voice_glass::enabled()))), None,
+        );
+        create_control(w!("STATIC"),w!("Glass is excluded from system screenshots/recording."),
+            WS_CHILD | WS_VISIBLE,28,292,448,24,parent,0,instance)?;
         let status_label = create_control(
             w!("STATIC"),
             w!("Not connected"),
             WS_CHILD | WS_VISIBLE,
             28,
-            272,
+            347,
             290,
             24,
             parent,
@@ -276,7 +290,7 @@ fn create_controls(
             w!("Save and connect"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
             328,
-            262,
+            337,
             148,
             36,
             parent,
@@ -287,6 +301,7 @@ fn create_controls(
             server_edit,
             microphone_combo,
             startup_checkbox,
+            liquid_checkbox,
             status_label,
         })
     }
@@ -412,6 +427,7 @@ unsafe extern "system" fn window_proc(
             log_shell(&format!("command {command}"));
             match command {
                 ID_SAVE => save_settings(),
+                ID_LIQUID_GLASS => change_liquid_glass(),
                 ID_SETTINGS => show_settings(),
                 ID_QUIT => quit_application(),
                 _ => {}
@@ -424,6 +440,10 @@ unsafe extern "system" fn window_proc(
                 WM_RBUTTONUP => show_tray_menu(window),
                 _ => {}
             }
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED => {
+            crate::voice_glass::refresh_theme();
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -593,6 +613,7 @@ fn configure_autostart(enabled: bool) -> Result<(), String> {
 }
 
 fn quit_application() {
+    crate::voice_glass::shutdown();
     let Some(state) = SHELL_STATE.get().and_then(|state| state.lock().ok()) else {
         return;
     };
@@ -643,4 +664,34 @@ fn log_shell(message: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{message}");
     }
+}
+
+// Independent of server reachability. No mutex is held across the modal consent UI.
+fn change_liquid_glass() {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_YESNO, MB_ICONINFORMATION, IDYES};
+    let (window, checkbox) = {
+        let Some(state) = SHELL_STATE.get().and_then(|s| s.lock().ok()) else { return; };
+        (state.window, state.liquid_checkbox)
+    };
+    let requested = unsafe { windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+        hwnd(checkbox), BM_GETCHECK, None, None).0 == 1 };
+    let mut enabled = requested;
+    if requested && !crate::voice_glass::enabled() {
+        enabled = unsafe { MessageBoxW(Some(hwnd(window)),
+            w!("Liquid Glass reads your primary SDR desktop locally on the GPU only while the voice overlay is visible. No screenshots are saved or uploaded. The glass window is excluded from ordinary system screenshots and recording to prevent recursive capture. Unsupported displays use the solid overlay. Enable?"),
+            w!("Enable Liquid Glass"), MB_YESNO | MB_ICONINFORMATION) } == IDYES;
+    }
+    let Some(state) = SHELL_STATE.get().and_then(|s| s.lock().ok()) else { return; };
+    let result = ClientSettings::load().and_then(|mut settings| {
+        settings.liquid_glass = enabled;
+        settings.save()
+    });
+    if let Err(error) = result {
+        set_status(&state,&error); enabled = crate::voice_glass::enabled();
+    } else {
+        crate::voice_glass::configure(enabled);
+        set_status(&state,if enabled { "Liquid Glass enabled" } else { "Liquid Glass disabled" });
+    }
+    unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+        hwnd(checkbox),BM_SETCHECK,Some(WPARAM(usize::from(enabled))),None); }
 }

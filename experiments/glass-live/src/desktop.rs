@@ -98,14 +98,14 @@ impl Drop for Window {
 struct Apartment;
 impl Drop for Apartment {fn drop(&mut self){unsafe{CoUninitialize()}}}
 
-struct Capture {
-    duplication: IDXGIOutputDuplication,
-    cache: Option<ID3D11Texture2D>,
+pub(crate) struct Capture {
+    pub(crate) duplication: IDXGIOutputDuplication,
+    pub(crate) cache: Option<ID3D11Texture2D>,
     pub rect: RECT,
     pub frames: u64,
 }
 impl Capture {
-    unsafe fn acquire(&mut self, pipe: &Pipeline) -> AppResult<bool> {
+    pub(crate) unsafe fn acquire(&mut self, pipe: &Pipeline) -> AppResult<bool> {
         let mut info=DXGI_OUTDUPL_FRAME_INFO::default(); let mut resource=None;
         match self.duplication.AcquireNextFrame(0,&mut info,&mut resource) {
             Err(e) if e.code()==DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
@@ -129,7 +129,7 @@ impl Capture {
         })();
         let released=self.duplication.ReleaseFrame();result?;released?;Ok(true)
     }
-    unsafe fn crop(&self, pipe:&Pipeline, position:POINT) -> AppResult<()> {
+    pub(crate) unsafe fn crop(&self, pipe:&Pipeline, position:POINT) -> AppResult<()> {
         let x=position.x-self.rect.left-pipe.padding as i32;
         let y=position.y-self.rect.top-pipe.padding as i32;
         ensure(x>=0&&y>=0&&x+pipe.raw.width as i32<=self.rect.right-self.rect.left
@@ -140,7 +140,7 @@ impl Capture {
     }
 }
 
-unsafe fn choose_output() -> AppResult<(IDXGIFactory2,IDXGIAdapter1,IDXGIOutput1,DXGI_OUTPUT_DESC,MONITORINFO)> {
+pub(crate) unsafe fn choose_output() -> AppResult<(IDXGIFactory2,IDXGIAdapter1,IDXGIOutput1,DXGI_OUTPUT_DESC,MONITORINFO)> {
     ensure(GetSystemMetrics(SM_CMONITORS)==1,"This first preview supports one SDR, unrotated display. No display settings were changed")?;
     let factory:IDXGIFactory2=CreateDXGIFactory1()?;
     let mut index=0;
@@ -171,6 +171,9 @@ unsafe fn choose_output() -> AppResult<(IDXGIFactory2,IDXGIAdapter1,IDXGIOutput1
 
 /// GDI is used ONCE to rasterize our own text coverage, never for desktop capture.
 unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<u8>> {
+    text_mask_for_label(width,height,scale,compact,"优化识别中",true)
+}
+pub(crate) unsafe fn text_mask_for_label(width:u32,height:u32,scale:f32,compact:bool,label:&str,icon:bool)->AppResult<Vec<u8>> {
     let dc=CreateCompatibleDC(None);ensure(!dc.0.is_null(),"Text mask DC creation failed")?;
     let result=(||->AppResult<Vec<u8>>{
         let mut info=BITMAPINFO::default();info.bmiHeader=BITMAPINFOHEADER{biSize:size_of::<BITMAPINFOHEADER>()as u32,
@@ -184,8 +187,8 @@ unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<
         let old_font=SelectObject(dc,HGDIOBJ(font.0));
         std::ptr::write_bytes(bits.cast::<u8>(),0,(width*height*4)as usize);
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,COLORREF(0x00ffffff));
-        let mut rect=RECT{left:(height as f32*0.92)as i32,top:0,right:width as i32-(height as f32*0.25)as i32,bottom:height as i32};
-        let mut text:Vec<u16>="优化识别中".encode_utf16().collect();
+        let mut rect=RECT{left:(height as f32*if icon{0.92}else{0.25})as i32,top:0,right:width as i32-(height as f32*0.25)as i32,bottom:height as i32};
+        let mut text:Vec<u16>=label.encode_utf16().collect();
         let drawn=DrawTextW(dc,&mut text,&mut rect,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         let flushed=GdiFlush().as_bool();
         let pixels=std::slice::from_raw_parts(bits as *const u8,(width*height*4)as usize);

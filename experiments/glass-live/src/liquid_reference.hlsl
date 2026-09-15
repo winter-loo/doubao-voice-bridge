@@ -58,7 +58,6 @@ float3 liquid_field(float2 p, out float2 local, out float2 size) {
     local=q+geometry.zw*.5;
     return float3((len-r)*min(stretch.x,stretch.y),len>.00001?v/len:float2(0,0));
 }
-#ifndef LIQUID_VOICE_CONTENT
 float bar_distance(float2 p,int i) {
     float h=geometry.w;
     float x=h*(.32+i*.105);
@@ -71,7 +70,6 @@ float wave_mask(float2 p) {
     [unroll] for(int i=0;i<5;i++) { fg=max(fg,saturate(.5-bar_distance(p,i))); }
     return fg;
 }
-#endif
 float3 transmit(float3 scene,bool dark) {
     return dark?scene*float3(.45,.46,.48)+float3(.006,.008,.012)
                :scene*float3(.88,.89,.90)+float3(.072,.074,.077);
@@ -86,13 +84,7 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float2 dummy,ds; float shadow_d=liquid_field(p-float2(0,h*.026),dummy,ds).x;
     float shadow=(.10+.16*complexity)*exp(-pow(max(0,shadow_d)/(h*.052),2));
     shadow*=smoothstep(0,1,dynamics.z);
-    if(coverage<=0) {
-#ifdef LIQUID_VOICE_CONTENT
-        return float4(0,0,0,shadow)*voice_state.z;
-#else
-        return float4(0,0,0,shadow);
-#endif
-    }
+    if(coverage<=0) return float4(0,0,0,shadow);
     bool dark=style.x>.5;
     float radius=size.y*.5;
     float r=saturate(1-inset/max(radius,1));
@@ -110,11 +102,7 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float support=glyph_support.SampleLevel(clamped,local/geometry.zw,0);
     // Waveform support follows its five animated strokes, not their bounding box.
     // A rectangular white patch around the icon would contradict transmission.
-    #ifdef LIQUID_VOICE_CONTENT
-    [unroll] for(int i=0;i<20;i++) {
-#else
     [unroll] for(int i=0;i<5;i++) {
-#endif
         support=max(support,1-smoothstep(-h*.012,h*.055,bar_distance(local,i)));
     }
     if(style.z<.5) support=0;
@@ -162,9 +150,5 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     }
 #endif
     float alpha=coverage+shadow*(1-coverage);
-    #ifdef LIQUID_VOICE_CONTENT
-    return float4(optical_encode(body)*coverage,alpha)*voice_state.z;
-#else
     return float4(optical_encode(body)*coverage,alpha);
-#endif
 }

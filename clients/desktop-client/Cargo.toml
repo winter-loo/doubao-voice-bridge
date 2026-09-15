@@ -27,6 +27,7 @@ unicode-segmentation = "1"
 embed-resource = "3.0.11"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+doubao-glass-live = { path = "../../experiments/glass-live" }
 cpal = "0.17"
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
 windows = { version = "0.61", features = [

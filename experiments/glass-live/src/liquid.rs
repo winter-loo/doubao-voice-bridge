@@ -12,6 +12,8 @@ struct OpticalConstants { contact: [f32;4], dynamics: [f32;4] }
 pub struct Pipeline {
     base: super::Pipeline,
     interaction: ID3D11Buffer,
+    voice: Option<ID3D11Buffer>,
+    visibility: Cell<f32>,
     halo: Texture,
     adaptation: [Texture;2],
     adapt_index: Cell<usize>,
@@ -61,9 +63,41 @@ impl Pipeline {
         base.context.UpdateSubresource(&halo.texture,0,None,support.as_ptr().cast(),w,0);
         let adaptation=[Texture::new(&base.device,1,1,DXGI_FORMAT_R16G16B16A16_FLOAT)?,Texture::new(&base.device,1,1,DXGI_FORMAT_R16G16B16A16_FLOAT)?];
         for texture in &adaptation { base.context.ClearRenderTargetView(&texture.target,&[0.0;4]); }
-        Ok(Self{base,interaction:interaction.ok_or("No optical uniform buffer")?,halo,adaptation,adapt_index:Cell::new(0),
+        Ok(Self{base,voice:None,visibility:Cell::new(1.0),interaction:interaction.ok_or("No optical uniform buffer")?,halo,adaptation,adapt_index:Cell::new(0),
             adapt_shader:adapt_shader.ok_or("No GPU adaptation shader")?,motion:RefCell::new(Motion::default()),
             hwnd:Cell::new(HWND::default()),last_position:Cell::new(None),reduced_motion:Cell::new(false)})
+    }
+    /// Production content uses the same optical body and adaptation shader.
+    pub unsafe fn new_voice(device:ID3D11Device,context:ID3D11DeviceContext,w:u32,h:u32,mask:&[u8])->AppResult<Self> {
+        let mut p=Self::new(device,context,w,h,mask)?;
+        let source=format!("#define LIQUID_VOICE_CONTENT 1\n{}\n{}\n{}",include_str!("glass.hlsl"),include_str!("voice_content.hlsl"),include_str!("liquid.hlsl"));
+        let b=compile_source(&source,s!("liquid_material_ps"),s!("ps_5_0"))?;
+        let mut material=None;p.device.CreatePixelShader(blob_bytes(&b),None,Some(&mut material))?;
+        p.base.material=material.ok_or("No voice liquid shader")?;
+        let mut voice=None;
+        p.device.CreateBuffer(&D3D11_BUFFER_DESC{ByteWidth:16,Usage:D3D11_USAGE_DEFAULT,BindFlags:D3D11_BIND_CONSTANT_BUFFER.0 as u32,..Default::default()},None,Some(&mut voice))?;
+        p.voice=Some(voice.ok_or("No voice uniform buffer")?);
+        Ok(p)
+    }
+    pub unsafe fn set_voice_mask(&self,mask:&[u8])->AppResult<()> {
+        let w=self.output.width;let h=self.output.height;
+        ensure(mask.len()==(w*h) as usize,"Voice mask geometry mismatch")?;
+        let support=make_support(mask,w as usize,h as usize);
+        self.context.UpdateSubresource(&self.base.mask.texture,0,None,mask.as_ptr().cast(),w,0);
+        self.context.UpdateSubresource(&self.halo.texture,0,None,support.as_ptr().cast(),w,0);
+        Ok(())
+    }
+    pub unsafe fn render_voice(&self,dark:bool,time:f32,phase:crate::voice_model::Phase,level:f32,opacity:f32) {
+        let level=if level.is_finite(){level.clamp(0.0,1.0)}else{0.0};
+        let opacity=if opacity.is_finite(){opacity.clamp(0.0,1.0)}else{0.0};
+        self.visibility.set(opacity);
+        if let Some(buffer)=&self.voice {
+            let values=[phase as u32 as f32,if phase==crate::voice_model::Phase::Listening{level}else{0.0},opacity,0.0];
+            self.context.UpdateSubresource(buffer,0,None,values.as_ptr().cast(),0,0);
+            self.context.PSSetConstantBuffers(2,Some(&[Some(buffer.clone())]));
+        }
+        self.render(dark,time,true);
+        self.context.PSSetConstantBuffers(2,Some(&[None]));
     }
     pub unsafe fn prepare(&self) {
         // 4.485px bulk scattering / 0.702px transmitting rim for a 39px canvas.
@@ -92,7 +126,7 @@ impl Pipeline {
     unsafe fn render_input(&self,dark:bool,time:f32,foreground:bool,point:[f32;2],pressed:bool,drift:[f32;2],reduced:bool) {
         let mut state=self.motion.borrow_mut(); let dt=state.step(time,point,pressed,drift,reduced);
         let c=OpticalConstants{contact:[state.point[0],state.point[1],state.press,if reduced{0.0}else{1.0}],
-            dynamics:[state.drift[0],state.drift[1],if reduced{1.0}else{(time/0.24).clamp(0.0,1.0)},dt]};
+            dynamics:[state.drift[0],state.drift[1],if reduced{1.0}else{(time/0.24).clamp(0.0,1.0).min(self.visibility.get())},dt]};
         drop(state);
         self.context.UpdateSubresource(&self.interaction,0,None,(&c as *const OpticalConstants).cast(),0,0);
         self.context.PSSetConstantBuffers(1,Some(&[Some(self.interaction.clone())]));
@@ -123,8 +157,11 @@ impl Presenter {
         eprintln!("[liquid-optics] material=LENS_TRANSMISSION_1; refracted live scene; local glyph protection; adaptive ink; input springs; reduced-motion={reduced}; NOT V2.3 paint");
         Ok(Self{inner:super::Presenter::new(hwnd,factory,device,w,h)?,hwnd,reduced})
     }
+    pub unsafe fn bind_input(&self,pipe:&Pipeline) {
+        pipe.hwnd.set(self.hwnd);pipe.reduced_motion.set(self.reduced);
+    }
     pub unsafe fn present(&self,pipe:&Pipeline)->AppResult<()> {
-        pipe.hwnd.set(self.hwnd);pipe.reduced_motion.set(self.reduced);self.inner.present(&pipe.base)
+        self.bind_input(pipe);self.inner.present(&pipe.base)
     }
 }
 
@@ -154,3 +191,5 @@ pub unsafe fn self_test(directory:Option<&Path>)->AppResult<()> {
 }
 
 #[cfg(test)] mod tests { include!("liquid_tests.rs"); }
+
+#[cfg(test)] mod voice_parity { include!("voice_parity_tests.rs"); }
