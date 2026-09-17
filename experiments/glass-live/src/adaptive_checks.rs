@@ -3,6 +3,9 @@
 use super::*;
 use crate::voice_render_checks::upload_fixture_checked;
 
+#[path = "white_entrance_checks.rs"]
+mod white_entrance;
+
 fn fixture(w:u32,h:u32,kind:u32)->Vec<u8> {
     let mut out=vec![0u8;(w*h*4) as usize];
     for y in 0..h {for x in 0..w {
@@ -35,6 +38,8 @@ unsafe fn advance(p:&AdaptivePipeline,dark:bool,from:f32,to:f32,phase:Phase) {
 fn max_diff(a:&[u8],b:&[u8])->u8 {a.iter().zip(b).map(|(a,b)|a.abs_diff(*b)).max().unwrap_or(0)}
 
 pub(super) unsafe fn verify(directory:Option<&Path>)->AppResult<()> {
+    let entrance_directory = directory.map(|d| d.join("entrance"));
+    white_entrance::verify(entrance_directory.as_deref())?;
     let (device,context)=create_device(None)?;
     if let Some(d)=directory {std::fs::create_dir_all(d)?;}
     let mut frame_count=0usize;let mut palette_cases=0usize;let mut palette_pixels=0usize;let mut palette_error=0u8;
