@@ -301,3 +301,7 @@ pub(crate) fn run(shared:Arc<Shared>,fallback_hwnd:isize,callbacks:Callbacks){un
 #[cfg(test)]
 #[path="adaptive_window_checks.rs"]
 mod adaptive_window_checks;
+
+#[cfg(test)]
+#[path="manual_native_review.rs"]
+mod manual_native_review;
