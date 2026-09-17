@@ -65,12 +65,17 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     // Apply the transient once, without feeding it back into steady history.
     material.r-=.42*crest;material.g-=.08*crest;material.w=crest;
     float white_relief=style.x>.5?0:white_risk;
+    // Optical finish only: preserve the density/clarity trajectory and early rim.
+    // Ease into the lighter white resting contour, then hold the factor constant.
+    // Reduced motion starts at rest; black, chromatic and dark-theme relief is zero.
+    float resting_relief=white_relief*(adaptive_time.z>.5?1:smoothstep(.40,.60,adaptive_time.x));
     float broad_d=liquid_field(p-float2(0,h*.065),dummy,ds).x;float contact_d=liquid_field(p-float2(0,h*.025),dummy,ds).x;
     float broad=(.018+.102*material.b+.020*complexity+.035*material.w)*exp(-.5*pow(max(0,broad_d)/(h*.16),2));
     float tight=(.020+.080*material.b+.025*material.w)*exp(-.5*pow(max(0,contact_d)/(h*.040),2));
     // Keep the exterior reach, but avoid a heavy two-ring button on white.
     // Black/chromatic scenes retain their previous shadow and rim treatment.
     broad*=lerp(1,.65,white_relief);tight*=lerp(1,.52,white_relief);
+    broad*=lerp(1,.80,resting_relief);tight*=lerp(1,.65,resting_relief);
     float shadow=1-(1-broad)*(1-tight);
     float reveal=adaptive_time.z>.5?1:smoothstep(0,.10,adaptive_time.x);shadow*=reveal;
     if(coverage<=0){
@@ -107,7 +112,7 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float rim_scale=scale*rim_fraction;
     float outer=exp(-pow((inset-.48*rim_scale)/(.33*rim_scale),2));float shoulder=exp(-pow((inset-1.32*rim_scale)/(.52*rim_scale),2));float fresnel=.035+.50*pow(1-normal.z,5);
     float3 ambient=(image0.SampleLevel(clamped,scene_uv(p-field.yz*h*.25),0).rgb+image0.SampleLevel(clamped,scene_uv(p+field.yz*h*.25),0).rgb)*.5;float arc=.40+.60*exp(-pow((p.x/geometry.z-contact.x)/.34,2));float reflection=outer*(.18+.50*pow(facing,3)*arc)+fresnel*edge*.10;
-    body=lerp(body,lerp(float3(1,1,1),ambient,.18),saturate(reflection));body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity+.025*material.w)*lerp(1,.65,white_relief);body+=shoulder*pow(facing,4)*(.018+.032*contact.z);
+    body=lerp(body,lerp(float3(1,1,1),ambient,.18),saturate(reflection));body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity+.025*material.w)*lerp(1,.65,white_relief)*lerp(1,.65,resting_relief);body+=shoulder*pow(facing,4)*(.018+.032*contact.z);
     float2 spot=(p/geometry.zw-contact.xy)/float2(.30,.65);float contact_glow=exp(-dot(spot,spot))*contact.z*.09;body=lerp(body,1,saturate(contact_glow));
     float white_ink=dark?adapt.b:adapt.g;float y=dot(body,LUMA);if(!dark&&material.w>.18)white_ink=0;
     if(white_ink>.5){float needed=y>.16?1-.16/max(y,.001):0;body*=1-support*needed;}else{float needed=y<.30?(.30-y)/max(.001,1-y):0;body=lerp(body,1,support*needed);}
