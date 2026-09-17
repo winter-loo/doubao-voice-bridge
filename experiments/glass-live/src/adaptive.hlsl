@@ -1,11 +1,24 @@
 // Background-conditioned convergence, not a replay of Apple's private shader.
-// The 140 ms release is our engineering choice; there is no scheduled gray flash.
+// Bright flat scenes use a short risk-conditioned density crest before releasing
+// to high transmission. This follows the observed iPhone response shape without
+// replaying recorded pixels or scheduling a fixed gray flash.
 // Shared refraction, transfer functions, voice strokes and the tagged control
 // remain in liquid.hlsl / voice_content.hlsl. Scene pixels never leave the GPU.
 cbuffer AdaptiveSurface : register(b3) {
     float4 canvas_space; // exterior visual margin xy; canvas dimensions xy
     float4 adaptive_time; // first-visible-frame age; foreground age; reduced motion
 };
+
+float white_density_crest(float age, float risk, float complexity) {
+    // Continuous attack -> crest -> release. The crest is background-conditioned:
+    // white/flat scenes receive the strongest temporary density; detailed/chromatic
+    // scenes receive little or none. It is exactly zero at entry and at steady state.
+    float attack=smoothstep(.055,.125,age);
+    float release=1-smoothstep(.145,.390,age);
+    float shape=attack*release;
+    float confidence=risk*(1-.42*complexity);
+    return saturate(shape*confidence);
+}
 
 float4 adaptive_reduce_ps(float4 position:SV_POSITION):SV_TARGET {
     float3 mean=0;
@@ -32,7 +45,7 @@ float4 adaptive_reduce_ps(float4 position:SV_POSITION):SV_TARGET {
     bool reduced=adaptive_time.z>.5;
     float dt=max(0,dynamics.w);
     float tracking=reduced?1:1-exp(-dt/.060);
-    float settling=reduced?1:1-exp(-dt/.140);
+    float settling=reduced?1:1-exp(-dt/.115);
     float y=first?current_y:lerp(old.r,current_y,tracking);
     // Select ink from current scene risk (with hysteresis), not stale scene color.
     // The material's coefficients may converge; the background texture never lags.
@@ -42,13 +55,14 @@ float4 adaptive_reduce_ps(float4 position:SV_POSITION):SV_TARGET {
     float dark_ink=dark_y<.185?1:(dark_y>.245?0:old.b);
     if(first) {light_ink=light_y<.215?1:0;dark_ink=dark_y<.215?1:0;}
     if(position.x<1) return float4(y,light_ink,dark_ink,1+(first?complexity:lerp(max(0,old.a-1),complexity,tracking)));
-    float4 target=float4(light_target,dark_target,edge_risk,white_risk);
-    if(first && !reduced) {
-        // Start at a conservative, scene-conditioned optical density; relax toward
-        // transmission from the first presented frame, never after a magic delay.
-        return float4(light_target-.32*white_risk,dark_target-.07*white_risk,edge_risk*.65,white_risk);
-    }
-    return first?target:lerp(old_material,target,settling);
+    float crest=reduced?0:white_density_crest(adaptive_time.x,white_risk,complexity);
+    // x/y are steady transmission coefficients. z is edge/shadow risk. w carries
+    // the current density crest so the material and text protection share one state.
+    float crest_density=.47*crest;
+    float crest_edge=.20*crest;
+    float4 target=float4(light_target-crest_density,dark_target-.08*crest,clamp(edge_risk+crest_edge,0,1),crest);
+    if(first) return reduced?float4(light_target,dark_target,edge_risk,0):float4(light_target,dark_target,edge_risk*.72,0);
+    return lerp(old_material,target,settling);
 }
 
 float adaptive_text(float2 p) {
@@ -67,12 +81,18 @@ float adaptive_text(float2 p) {
 
 float3 adaptive_transmit(float3 scene,bool dark,float4 material) {
     // Chroma remains carried by the real refracted source, not by a gray overlay.
-    return dark?scene*material.g*float3(.9783,1,1.0435)+float3(.006,.008,.012)
-        :scene*material.r*float3(.990,1,1.010)+float3(.008,.009,.010)+material.a*.012;
+    // material.w is a transient white-background density crest; at steady state it
+    // returns to zero, so a white desktop does not become a permanent gray plate.
+    float crest=material.w;
+    float light_gain=max(.38,material.r);
+    float dark_gain=max(.30,material.g);
+    float3 transmitted=dark?scene*dark_gain*float3(.9783,1,1.0435)+float3(.006,.008,.012)
+                           :scene*light_gain*float3(.990,1,1.010)+float3(.008,.009,.010);
+    if(!dark) transmitted*=1-.055*crest;
+    return transmitted;
 }
 
 float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
-
     float2 p=pos.xy-canvas_space.xy, local, size;
     float3 field=liquid_field(p,local,size);
     float h=geometry.w, inset=max(0,-field.x);
@@ -83,8 +103,8 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float2 dummy,ds;
     float broad_d=liquid_field(p-float2(0,h*.065),dummy,ds).x;
     float contact_d=liquid_field(p-float2(0,h*.025),dummy,ds).x;
-    float broad=(.018+.102*material.b+.020*complexity)*exp(-.5*pow(max(0,broad_d)/(h*.16),2));
-    float tight=(.020+.080*material.b)*exp(-.5*pow(max(0,contact_d)/(h*.040),2));
+    float broad=(.018+.102*material.b+.020*complexity+.035*material.w)*exp(-.5*pow(max(0,broad_d)/(h*.16),2));
+    float tight=(.020+.080*material.b+.025*material.w)*exp(-.5*pow(max(0,contact_d)/(h*.040),2));
     float shadow=1-(1-broad)*(1-tight);
     float reveal=adaptive_time.z>.5?1:smoothstep(0,.10,adaptive_time.x);
     shadow*=reveal;
@@ -110,9 +130,7 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float2 uv=scene_uv(local+bend);
     float edge=1-smoothstep(h*.075,h*.28,inset);
     float support=glyph_support.SampleLevel(clamped,local/geometry.zw,0);
-    // Waveform support follows its five animated strokes, not their bounding box.
-    // A rectangular white patch around the icon would contradict transmission.
-    #ifdef LIQUID_VOICE_CONTENT
+#ifdef LIQUID_VOICE_CONTENT
     [unroll] for(int i=0;i<20;i++) {
 #else
     [unroll] for(int i=0;i<5;i++) {
@@ -141,7 +159,7 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float arc=.40+.60*exp(-pow((p.x/geometry.z-contact.x)/.34,2));
     float reflection=outer*(.18+.50*pow(facing,3)*arc)+fresnel*edge*.10;
     body=lerp(body,lerp(float3(1,1,1),ambient,.18),saturate(reflection));
-    body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity+.025*material.a);
+    body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity+.025*material.w);
     body+=shoulder*pow(facing,4)*(.018+.032*contact.z);
     float2 spot=(p/geometry.zw-contact.xy)/float2(.30,.65);
     float contact_glow=exp(-dot(spot,spot))*contact.z*.09;
@@ -149,17 +167,18 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
 
     float white_ink=dark?adapt.b:adapt.g;
     float y=dot(body,LUMA);
+    // During the white-background density crest, bias text protection toward the
+    // darker ink decision. Once the material releases, normal hysteresis resumes.
+    if(!dark && material.w>.18) white_ink=0;
     if(white_ink>.5) {
         float needed=y>.16?1-.16/max(y,.001):0;
         body*=1-support*needed;
     } else {
         float needed=y<.30?(.30-y)/max(.001,1-y):0;
-        body=lerp(body,1,support*needed);
+        body=lerp(body,1,support*needed;
     }
 #ifndef LIQUID_TEST_INK_OFF
     if(style.z>.5) {
-        // Short independent clarity timeline. Recording bars stay sharp and driven by
-        // current audio; only text uses the resolving coverage kernel above.
         float foreground=adaptive_time.z>.5?1:lerp(.65,1,smoothstep(0,.09,adaptive_time.y));
         float fg=adaptive_text(local);
         if(voice_state.x!=2) { [unroll] for(int k=0;k<20;k++) {fg=max(fg,saturate(.5-bar_distance(local,k)));} }
@@ -167,16 +186,11 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
         float3 ink=white_ink>.5?float3(.95,.97,1):float3(.010,.016,.023);
 #ifdef LIQUID_VOICE_CONTENT
         if(voice_state.x==2) {
-            // Restore the original GPUI recording palette (main.rs at dfb2b6d):
-            // per-bar sRGB interpolation #43DED2 -> #648DFF, rounded to bytes.
-            // Wave color is independent of adaptive text ink and desktop color.
             float first=(geometry.z-78*scale)*.5+scale;
             int i=(int)clamp(floor((local.x-first)/(4*scale)+.5),0,19);
             float3 srgb=floor(lerp(float3(67,222,210),float3(100,141,255),i/19.0)+.5)/255.0;
             float wave=saturate(.5-bar_distance(local,i));
             body=lerp(body,linearize(srgb),wave);
-            // Do not repaint the colored bars with the shared monochrome mask.
-            // Text, including any future listening label, remains adaptive.
             fg=adaptive_text(local)*foreground;
         }
 #endif
@@ -184,7 +198,7 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     }
 #endif
     float alpha=coverage+shadow*(1-coverage);
-    #ifdef LIQUID_VOICE_CONTENT
+#ifdef LIQUID_VOICE_CONTENT
     return float4(optical_encode(body)*coverage,alpha)*voice_state.z;
 #else
     return float4(optical_encode(body)*coverage,alpha);
