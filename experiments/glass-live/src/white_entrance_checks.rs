@@ -121,6 +121,13 @@ pub(super) unsafe fn verify(directory: Option<&Path>) -> AppResult<()> {
             if means[1] - crest < 12.0 || means[6] - crest < 10.0 {
                 failures.push("White material lacks a measurable density crest followed by release".into());
             }
+            // A late trough used to pass the peak-anywhere check above. Require
+            // actual recovery at the next samples, not just a timed target that
+            // acquires another low-pass lag. These are engineering shape bounds.
+            if means[4] - means[3] < 4.0 || means[5] - means[4] < 8.0 || means[6] < 240.0 {
+                failures.push(format!("White recovery remains delayed: 133/200/300/400ms={:.3}/{:.3}/{:.3}/{:.3}",
+                    means[3], means[4], means[5], means[6]));
+            }
             if means[7] < 245.0 || means[8] < 245.0 || (means[8] - means[7]).abs() > 3.0 {
                 failures.push("White material has not returned to a near-white stable surface by 600-800ms".into());
             }
