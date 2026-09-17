@@ -72,7 +72,14 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
 #ifdef LIQUID_TEST_NO_LENS
     bend=0;
 #endif
-    float2 uv=scene_uv(local+bend);float edge=1-smoothstep(h*.075,h*.28,inset);float support=glyph_support.SampleLevel(clamped,local/geometry.zw,0);
+    // liquid_field contracts the entrance height, not the logical text/wave grid.
+    // Full-height rim bands otherwise flood the thin opening capsule's center,
+    // causing a false brightness pulse even on black with zero density crest.
+    // Derive the ratio from the field's actual size; it is exactly one at rest.
+    float full_height=h-2.3*max(1.0,h*.045);
+    float rim_fraction=saturate(size.y/max(1.0,full_height));
+    float rim_height=h*rim_fraction;
+    float2 uv=scene_uv(local+bend);float edge=1-smoothstep(rim_height*.075,rim_height*.28,inset);float support=glyph_support.SampleLevel(clamped,local/geometry.zw,0);
 #ifdef LIQUID_VOICE_CONTENT
     [unroll] for(int i=0;i<20;i++){
 #else
@@ -83,7 +90,9 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     if(style.z<.5)support=0;float frost=lerp(.62,1,support)*(1-edge*.91);float3 narrow=image1.SampleLevel(clamped,uv,0).rgb;float3 wide=image0.SampleLevel(clamped,uv,0).rgb;float3 scene=lerp(narrow,wide,saturate(frost));
     float2 dispersion=field.yz*(h*.004*edge)/geometry.xy;scene.r=lerp(scene.r,image1.SampleLevel(clamped,uv+dispersion,0).r,edge*.24);scene.b=lerp(scene.b,image1.SampleLevel(clamped,uv-dispersion,0).b,edge*.24);float3 body=adaptive_transmit(scene,dark,material);
     float2 direction=normalize(float2(-.32,-.94)+(contact.xy-float2(.3,.18))*.95);float facing=max(0,dot(field.yz,direction));float opposing=max(0,dot(field.yz,-direction));float scale=h/26;
-    float outer=exp(-pow((inset-.48*scale)/(.33*scale),2));float shoulder=exp(-pow((inset-1.32*scale)/(.52*scale),2));float fresnel=.035+.50*pow(1-normal.z,5);
+    // Keep scale unchanged for the original 20-bar content below.
+    float rim_scale=scale*rim_fraction;
+    float outer=exp(-pow((inset-.48*rim_scale)/(.33*rim_scale),2));float shoulder=exp(-pow((inset-1.32*rim_scale)/(.52*rim_scale),2));float fresnel=.035+.50*pow(1-normal.z,5);
     float3 ambient=(image0.SampleLevel(clamped,scene_uv(p-field.yz*h*.25),0).rgb+image0.SampleLevel(clamped,scene_uv(p+field.yz*h*.25),0).rgb)*.5;float arc=.40+.60*exp(-pow((p.x/geometry.z-contact.x)/.34,2));float reflection=outer*(.18+.50*pow(facing,3)*arc)+fresnel*edge*.10;
     body=lerp(body,lerp(float3(1,1,1),ambient,.18),saturate(reflection));body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity+.025*material.w);body+=shoulder*pow(facing,4)*(.018+.032*contact.z);
     float2 spot=(p/geometry.zw-contact.xy)/float2(.30,.65);float contact_glow=exp(-dot(spot,spot))*contact.z*.09;body=lerp(body,1,saturate(contact_glow));
