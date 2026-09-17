@@ -1,7 +1,6 @@
 // Background-conditioned convergence, not a replay of Apple's private shader.
-// Bright flat scenes use a short risk-conditioned density crest before releasing
-// to high transmission. This follows the observed iPhone response shape without
-// replaying recorded pixels or scheduling a fixed gray flash.
+// Filter steady scene coefficients separately from the finite entrance envelope.
+// Otherwise a second low-pass delays both the density peak and its recovery.
 // Shared refraction, transfer functions, voice strokes and the tagged control
 // remain in liquid.hlsl / voice_content.hlsl. Scene pixels never leave the GPU.
 cbuffer AdaptiveSurface : register(b3) {
@@ -9,9 +8,13 @@ cbuffer AdaptiveSurface : register(b3) {
     float4 adaptive_time;
 };
 float white_density_crest(float age,float risk,float complexity) {
-    float attack=smoothstep(.055,.125,age);
-    float release=1-smoothstep(.145,.390,age);
-    return saturate(attack*release*risk*(1-.42*complexity));
+    // Engineering presentation-time envelope, not measured Apple parameters.
+    // Continuous attack and a single release: do not low-pass this result again.
+    // The finite tail prevents residual density from breathing on a held scene.
+    float attack=smoothstep(.090,.130,age);
+    float release=exp(-max(0,age-.130)/.140);
+    float tail=1-smoothstep(.50,.70,age);
+    return saturate(attack*release*tail*risk*(1-.42*complexity));
 }
 float4 adaptive_reduce_ps(float4 position:SV_POSITION):SV_TARGET {
     float3 mean=0;float detail=0,second=0;
@@ -36,9 +39,10 @@ float4 adaptive_reduce_ps(float4 position:SV_POSITION):SV_TARGET {
     float light_ink=light_y<.185?1:(light_y>.245?0:old.g);float dark_ink=dark_y<.185?1:(dark_y>.245?0:old.b);
     if(first){light_ink=light_y<.215?1:0;dark_ink=dark_y<.215?1:0;}
     if(position.x<1)return float4(y,light_ink,dark_ink,1+(first?complexity:lerp(max(0,old.a-1),complexity,tracking)));
-    float crest=reduced?0:white_density_crest(adaptive_time.x,white_risk,complexity);
-    float4 target=float4(light_target-.47*crest,dark_target-.08*crest,clamp(edge_risk+.20*crest,0,1),crest);
-    if(first)return reduced?float4(light_target,dark_target,edge_risk,0):float4(light_target,dark_target,edge_risk*.72,0);
+    // History contains only steady transmission, edge risk and neutral-white risk.
+    // Never store the time-shaped crest here: that would filter its timing twice.
+    float4 target=float4(light_target,dark_target,edge_risk,white_risk);
+    if(first)return reduced?target:float4(light_target,dark_target,edge_risk*.72,white_risk);
     return lerp(old_material,target,settling);
 }
 float adaptive_text(float2 p){
@@ -56,9 +60,18 @@ float3 adaptive_transmit(float3 scene,bool dark,float4 material){
 float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float2 p=pos.xy-canvas_space.xy,local,size;float3 field=liquid_field(p,local,size);float h=geometry.w,inset=max(0,-field.x);float coverage=saturate(.5-field.x);
     float4 adapt=adaptation.Load(int3(0,0,0));float complexity=saturate(adapt.a-1);float4 material=adaptation.Load(int3(1,0,0));float2 dummy,ds;
+    float white_risk=saturate(material.w);
+    float crest=adaptive_time.z>.5?0:white_density_crest(adaptive_time.x,white_risk,complexity);
+    // Apply the transient once, without feeding it back into steady history.
+    material.r-=.42*crest;material.g-=.08*crest;material.w=crest;
+    float white_relief=style.x>.5?0:white_risk;
     float broad_d=liquid_field(p-float2(0,h*.065),dummy,ds).x;float contact_d=liquid_field(p-float2(0,h*.025),dummy,ds).x;
     float broad=(.018+.102*material.b+.020*complexity+.035*material.w)*exp(-.5*pow(max(0,broad_d)/(h*.16),2));
-    float tight=(.020+.080*material.b+.025*material.w)*exp(-.5*pow(max(0,contact_d)/(h*.040),2));float shadow=1-(1-broad)*(1-tight);
+    float tight=(.020+.080*material.b+.025*material.w)*exp(-.5*pow(max(0,contact_d)/(h*.040),2));
+    // Keep the exterior reach, but avoid a heavy two-ring button on white.
+    // Black/chromatic scenes retain their previous shadow and rim treatment.
+    broad*=lerp(1,.65,white_relief);tight*=lerp(1,.52,white_relief);
+    float shadow=1-(1-broad)*(1-tight);
     float reveal=adaptive_time.z>.5?1:smoothstep(0,.10,adaptive_time.x);shadow*=reveal;
     if(coverage<=0){
 #ifdef LIQUID_VOICE_CONTENT
@@ -94,7 +107,7 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float rim_scale=scale*rim_fraction;
     float outer=exp(-pow((inset-.48*rim_scale)/(.33*rim_scale),2));float shoulder=exp(-pow((inset-1.32*rim_scale)/(.52*rim_scale),2));float fresnel=.035+.50*pow(1-normal.z,5);
     float3 ambient=(image0.SampleLevel(clamped,scene_uv(p-field.yz*h*.25),0).rgb+image0.SampleLevel(clamped,scene_uv(p+field.yz*h*.25),0).rgb)*.5;float arc=.40+.60*exp(-pow((p.x/geometry.z-contact.x)/.34,2));float reflection=outer*(.18+.50*pow(facing,3)*arc)+fresnel*edge*.10;
-    body=lerp(body,lerp(float3(1,1,1),ambient,.18),saturate(reflection));body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity+.025*material.w);body+=shoulder*pow(facing,4)*(.018+.032*contact.z);
+    body=lerp(body,lerp(float3(1,1,1),ambient,.18),saturate(reflection));body*=1-shoulder*pow(opposing,2)*(.16+.07*complexity+.025*material.w)*lerp(1,.65,white_relief);body+=shoulder*pow(facing,4)*(.018+.032*contact.z);
     float2 spot=(p/geometry.zw-contact.xy)/float2(.30,.65);float contact_glow=exp(-dot(spot,spot))*contact.z*.09;body=lerp(body,1,saturate(contact_glow));
     float white_ink=dark?adapt.b:adapt.g;float y=dot(body,LUMA);if(!dark&&material.w>.18)white_ink=0;
     if(white_ink>.5){float needed=y>.16?1-.16/max(y,.001):0;body*=1-support*needed;}else{float needed=y<.30?(.30-y)/max(.001,1-y):0;body=lerp(body,1,support*needed);}
