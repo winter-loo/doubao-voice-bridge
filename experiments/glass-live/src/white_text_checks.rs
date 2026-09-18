@@ -170,7 +170,8 @@ fn write_source_png(path: &Path, fixture: &[u8], width: u32, height: u32) -> App
     for pixel in rgba.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    crate::png::write(path, width, height, &rgba)
+    crate::png::write(path, width, height, &rgba)?;
+    Ok(())
 }
 
 pub(crate) unsafe fn verify(directory: Option<&Path>) -> AppResult<()> {
@@ -290,7 +291,14 @@ pub(crate) unsafe fn verify(directory: Option<&Path>) -> AppResult<()> {
             "  \"low_frequency_stddev\": {low_stddev:.6},\n",
             "  \"waveform_median_contextual_contrast\": {waveform_median:.6}\n",
             "}}\n"
-        )
+        ),
+        source_edges = source_edges,
+        output_edges = output_edges,
+        edge_ratio = edge_ratio,
+        dark_mean = dark_mean,
+        material_mean = material_mean,
+        low_stddev = low_stddev,
+        waveform_median = waveform_median,
     );
 
     if let Some(directory) = directory {
