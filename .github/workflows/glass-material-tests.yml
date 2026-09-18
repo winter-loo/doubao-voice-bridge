@@ -1,0 +1,36 @@
+name: Custom glass fixture tests
+on:
+  pull_request:
+    paths:
+      - 'experiments/glass-material/**'
+      - '.github/workflows/glass-material-tests.yml'
+permissions:
+  contents: read
+concurrency:
+  group: glass-material-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the real-pixel material reference
+        run: cargo test --locked --manifest-path experiments/glass-material/Cargo.toml
+      - name: Render deterministic fixtures
+        run: cargo run --release --locked --manifest-path experiments/glass-material/Cargo.toml -- --output-dir=${{ runner.temp }}/glass-fixtures
+  shaders:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile both HLSL passes without starting capture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $compiler) { throw 'Windows SDK fxc.exe not found' }
+          & $compiler.FullName /nologo /WX /T ps_5_0 /E blur_ps /Fo "$env:RUNNER_TEMP\glass-blur.cso" experiments/glass-material/shaders/blur.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Blur shader compilation failed' }
+          & $compiler.FullName /nologo /WX /T ps_5_0 /E material_ps /Fo "$env:RUNNER_TEMP\glass-material.cso" experiments/glass-material/shaders/material.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Material shader compilation failed' }

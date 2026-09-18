@@ -48,6 +48,8 @@ mod settings_gui;
 mod tray_icon;
 #[cfg(target_os = "windows")]
 mod windows_shell;
+#[cfg(target_os = "windows")]
+mod voice_glass;
 
 const CLIENT_APP_ID: &str = "local.doubao.voicebridge";
 const BOTTOM_MARGIN: f32 = 22.0;
@@ -308,6 +310,8 @@ fn overlay_phase() -> OverlayPhase {
 
 fn set_overlay_phase(phase: OverlayPhase) {
     OVERLAY_PHASE.store(phase as u8, Ordering::Release);
+    #[cfg(target_os = "windows")]
+    voice_glass::phase(phase, overlay_generation());
     #[cfg(target_os = "linux")]
     linux_tray::refresh();
 }
@@ -588,6 +592,20 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
         |_, _, _| {},
         move |bounds, _, window, _| {
             let radius = bounds.size.height / 2.0;
+            #[cfg(target_os = "windows")]
+            if voice_glass::enabled() {
+                // The optical surface is presented on its dedicated GPU thread.
+                // This GPUI HWND is only the explicitly named SOLID recovery path.
+                if !voice_glass::presenting() {
+                    window.paint_quad(fill(bounds, rgba(lerp_rgba(0xf6f7f9ff, 0x202730ff, glass_mix()))).corner_radii(radius));
+                }
+                if !show_waveform { return; }
+            }
+            #[cfg(target_os = "windows")]
+            let use_old_material = !voice_glass::enabled();
+            #[cfg(not(target_os = "windows"))]
+            let use_old_material = true;
+            if use_old_material {
             let scale = window.scale_factor();
             let width = (f32::from(bounds.size.width) * scale).round().max(1.0) as u32;
             let height = (f32::from(bounds.size.height) * scale).round().max(1.0) as u32;
@@ -605,6 +623,7 @@ fn glass_canvas(delta: f32, show_waveform: bool) -> impl IntoElement + Styled {
                 window.paint_quad(fill(bounds, rgba(flat)).corner_radii(radius));
             }
 
+            }
             if !show_waveform {
                 return;
             }
@@ -894,6 +913,8 @@ fn overlay_bounds(cx: &App) -> Bounds<gpui::Pixels> {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if voice_glass::self_test_requested() { return; }
     #[cfg(target_os = "linux")]
     if std::env::args().any(|arg| arg == "--settings") {
         settings_gui::run();
@@ -1117,6 +1138,7 @@ mod platform {
         suppress_native_frame(hwnd);
         clip_overlay_to_capsule(hwnd);
         hide_overlay(hwnd);
+        super::voice_glass::initialize(hwnd.0 as isize);
         start_hotkey_thread(hwnd.0 as isize);
         start_background_sampler_thread(hwnd.0 as isize);
         start_glass_transition_thread(hwnd.0 as isize);
@@ -1199,6 +1221,7 @@ mod platform {
 
     fn show_phase(hwnd: HWND, phase: OverlayPhase) {
         set_overlay_phase(phase);
+        if super::voice_glass::owns_visibility() { return; }
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(
@@ -1224,6 +1247,7 @@ mod platform {
     fn begin_input(hwnd: HWND) {
         let generation = next_overlay_generation();
         clear_voice_activity();
+        if !super::voice_glass::enabled() {
         let reading = sample_background(hwnd, None);
         let dark = reading.dark;
         set_dark_background(dark);
@@ -1232,8 +1256,10 @@ mod platform {
         // Walking to it from wherever the previous session left off would show a wipe
         // across the glass every time the overlay opens.
         set_glass_mix_level(if dark { GLASS_MIX_STEPS } else { 0 });
+        }
         show_phase(hwnd, OverlayPhase::Activating);
         if let Err(error) = start_voice_client(generation, hwnd) {
+            super::voice_glass::failed(generation);
             append_voice_client_log(&format!("[gpui] failed to start voice client: {error}\n"));
             hide_overlay(hwnd);
         }
@@ -1270,9 +1296,11 @@ mod platform {
             match apply_native_voice_event(event) {
                 NativeVoiceEventOutcome::Continue => {}
                 NativeVoiceEventOutcome::Error(error) => {
+                    super::voice_glass::failed(generation);
                     append_voice_client_log(&format!("[native-client] {error}\n"));
                 }
                 NativeVoiceEventOutcome::Finished => {
+                    super::voice_glass::finished(generation);
                     hide_overlay(HWND(hwnd_value as *mut c_void));
                 }
             }
@@ -1439,7 +1467,7 @@ mod platform {
             let hwnd = HWND(hwnd_value as *mut c_void);
             let mut tint_settler = super::glass_background::TintSettler::default();
             loop {
-                if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                if !super::voice_glass::enabled() && unsafe { IsWindowVisible(hwnd) }.as_bool() {
                     let generation = overlay_generation();
                     let reading = sample_background(hwnd, Some(dark_background()));
                     // Reject a capture that finished after a hide or a new session.
@@ -1472,7 +1500,7 @@ mod platform {
         thread::spawn(move || {
             let hwnd = HWND(hwnd_value as *mut c_void);
             loop {
-                if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                if super::voice_glass::enabled() || !unsafe { IsWindowVisible(hwnd) }.as_bool() {
                     thread::sleep(BACKGROUND_IDLE_INTERVAL);
                     continue;
                 }
@@ -1512,7 +1540,7 @@ mod platform {
         })
     }
 
-    fn finish_input_hwnd(hwnd: HWND) {
+    pub(crate) fn finish_input_hwnd(hwnd: HWND) {
         match overlay_phase() {
             OverlayPhase::Hidden => return,
             OverlayPhase::Optimizing => {
@@ -1573,7 +1601,7 @@ mod platform {
                     && message.wParam == WPARAM(HOTKEY_ID as usize)
                     && message.lParam != LPARAM(0)
                 {
-                    if IsWindowVisible(hwnd).as_bool() {
+                    if overlay_phase() != OverlayPhase::Hidden {
                         finish_input_hwnd(hwnd);
                     } else {
                         begin_input(hwnd);

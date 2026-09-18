@@ -1,0 +1,41 @@
+[package]
+name = "doubao-glass-live"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "doubao_glass_live"
+path = "src/lib.rs"
+
+[[bin]]
+name = "GlassLivePreview"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Same already-pinned crate; the build host compiles and embeds shipped HLSL.
+[target.'cfg(windows)'.build-dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+] }
+
+[profile.release]
+opt-level = 2

@@ -13,6 +13,8 @@ pub struct ClientSettings {
     pub voice_shortcut: String,
     pub start_with_windows: bool,
     pub setup_completed: bool,
+    /// Explicit opt-in: local GPU desktop capture while the voice glass is visible.
+    pub liquid_glass: bool,
 }
 
 impl Default for ClientSettings {
@@ -25,6 +27,7 @@ impl Default for ClientSettings {
             voice_shortcut: "F13".to_string(),
             start_with_windows: true,
             setup_completed: false,
+            liquid_glass: false,
         }
     }
 }
@@ -87,5 +90,6 @@ mod tests {
         assert_eq!(settings.voice_shortcut, "F13");
         assert!(settings.start_with_windows);
         assert!(!settings.setup_completed);
+        assert!(!settings.liquid_glass);
     }
 }

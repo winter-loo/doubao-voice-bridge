@@ -1,0 +1,53 @@
+name: Voice glass integration
+on:
+  push:
+    branches: ['feat/glass-custom-material']
+    paths: ['clients/desktop-client/**', 'experiments/glass-live/**', '.github/workflows/voice-glass-integration.yml']
+  pull_request:
+    paths: ['clients/desktop-client/**', 'experiments/glass-live/**', '.github/workflows/voice-glass-integration.yml']
+permissions:
+  contents: read
+concurrency:
+  group: voice-glass-integration-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive exact tracked integration sources (no git credentials or runtime data)
+        run: |
+          mkdir -p "$RUNNER_TEMP/voice-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/voice-source/commit.txt"
+          git archive --format=tar HEAD clients/desktop-client experiments/glass-live .github/workflows > "$RUNNER_TEMP/voice-source/integration-source.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-integration-source
+          path: ${{ runner.temp }}/voice-source/*
+          retention-days: 3
+  windows-client:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: clients/desktop-client
+          key: voice-liquid-integration
+      - name: Test the actual desktop-client target (no live microphone or desktop capture)
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build the actual Windows voice executable
+        shell: pwsh
+        run: |
+          cargo build --release --locked --manifest-path clients/desktop-client/Cargo.toml --bin DoubaoVoiceClient
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DoubaoVoiceClient-windows-integration
+          path: clients/desktop-client/target/release/DoubaoVoiceClient.exe
+          if-no-files-found: error
+          retention-days: 7
