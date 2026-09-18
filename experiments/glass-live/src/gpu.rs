@@ -11,6 +11,8 @@ use windows::{core::{s, Interface, PCSTR}, Win32::{
 
 #[path = "material_config.rs"]
 mod material_config;
+#[path = "embedded_shaders.rs"]
+mod embedded_shaders;
 // One validated configuration drives the host filter support and shader constants.
 const CENTER_SIGMA_FRACTION: f32 = material_config::BLUR.center_fraction;
 const EDGE_SIGMA_FRACTION: f32 = material_config::BLUR.edge_fraction;
@@ -49,6 +51,14 @@ impl Texture {
 struct Constants { geometry: [f32; 4], filter: [f32; 4], style: [f32; 4] }
 
 unsafe fn compile_source(source: &str, entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
+    // All nine shaders traversed by the live voice constructor are compiled by
+    // build.rs. Source equality prevents a fixture/ablation from using stale code.
+    if let Some(code) = embedded_shaders::load(source, entry, target)? { return Ok(code); }
+    compile_source_runtime(source, entry, target)
+}
+unsafe fn compile_source_runtime(source: &str, entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
+    #[cfg(test)]
+    embedded_shaders::runtime_compile();
     let mut code = None; let mut errors: Option<ID3DBlob> = None;
     let result = D3DCompile(source.as_ptr().cast(), source.len(), s!("glass-live.hlsl"), None, None,
         entry, target, 1 << 15, 0, &mut code, Some(&mut errors));

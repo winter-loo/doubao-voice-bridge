@@ -127,8 +127,10 @@ struct Session {
 }
 impl Session {
     unsafe fn new(view:View,context:&ThreadContext,previous:Option<POINT>,shared:&Shared)->AppResult<Self>{
+        let setup=Instant::now();
         ensure(shared.allows(view.generation),"Session superseded before graphics initialization")?;
         let (factory,adapter,output,_desc,monitor)=desktop::choose_output()?;
+        let enumeration_ms=setup.elapsed().as_secs_f64()*1000.;
         INPUT.with(|s|*s.borrow_mut()=Input::default());
         let work=monitor.rcWork;
         let (window,canvas_window)=create_pair(context,POINT{x:(work.left+work.right)/2,y:(work.top+work.bottom)/2})?;
@@ -136,8 +138,12 @@ impl Session {
         let dpi=GetDpiForWindow(hwnd);ensure((96..=288).contains(&dpi),"Unsupported overlay DPI; use solid fallback")?;
         let scale=dpi as f32/96.;let width=(108.*scale).round() as u32;let height=(26.*scale).round() as u32;
         let mask=content_mask(width,height,scale,view.phase)?;
+        let stage=Instant::now();
         let (device,device_context)=gpu::create_device(Some(&adapter))?;
+        let device_ms=stage.elapsed().as_secs_f64()*1000.;
+        let stage=Instant::now();
         let pipe=Pipeline::new_voice(device,device_context,width,height,&mask)?;
+        let pipeline_ms=stage.elapsed().as_secs_f64()*1000.;
         let pad=pipe.layout.capture_safe_margin(pipe.padding) as i32;
         ensure(work.right-work.left>width as i32+pad*2&&work.bottom-work.top>height as i32+pad*2,"Work area too small")?;
         let proposed=previous.unwrap_or(POINT{x:(work.left+work.right-width as i32)/2,y:work.bottom-height as i32-pad-20});
@@ -147,7 +153,10 @@ impl Session {
         presenter.bind_input(&pipe);
         // Only after explicit consent, current generation checks and exclusion.
         ensure(shared.allows(view.generation),"Session superseded before desktop capture")?;
+        let stage=Instant::now();
         let capture=Capture{duplication:output.DuplicateOutput(&pipe.device)?,cache:None,rect:_desc.DesktopCoordinates,frames:0};
+        let duplication_ms=stage.elapsed().as_secs_f64()*1000.;
+        eprintln!("[voice-glass-setup] generation={}; enumeration_ms={enumeration_ms:.3}; device_ms={device_ms:.3}; pipeline_ms={pipeline_ms:.3}; duplication_ms={duplication_ms:.3}; constructor_ms={:.3}; first-captured-frame-and-display-not-included",view.generation,setup.elapsed().as_secs_f64()*1000.);
         Ok(Self{presenter,capture,pipe,window,canvas_window,generation:view.generation,position,work,scale,start:Instant::now(),visual_clock:PresentationClock::default(),phase:view.phase,shown:false,have_frame:false})
     }
     unsafe fn frame(&mut self,view:View,shared:&Shared,callbacks:Callbacks)->AppResult<bool>{
@@ -190,7 +199,7 @@ impl Session {
             let _=ShowWindow(self.canvas_window.0,SW_SHOWNOACTIVATE);
             let _=ShowWindow(self.window.0,SW_SHOWNOACTIVATE);
             SetWindowPos(self.window.0,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)?;
-            self.shown=true;shared.active(true,callbacks);
+            self.shown=true;shared.note_presented(self.generation);shared.active(true,callbacks);
             eprintln!("[voice-glass] LIVE generation={}; material=LENS_ADAPTIVE_2; in-process; actual voice state; visual clock starts with valid source; no microphone/save API",self.generation);
         }
         Ok(true)

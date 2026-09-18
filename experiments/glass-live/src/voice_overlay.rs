@@ -22,6 +22,9 @@ pub(crate) struct Desired {
     pub timeline: Timeline,
     pub shutdown: bool,
     pub revision: u64,
+    // First accepted visible request of a generation, before waking the worker.
+    // This does not claim to timestamp the physical shortcut key press.
+    activation: Option<(u64, Instant)>,
 }
 pub(crate) struct Shared {
     pub desired: Mutex<Desired>,
@@ -47,6 +50,16 @@ impl Shared {
     pub fn active(&self, value:bool, callbacks:Callbacks) {
         if self.presenting.swap(value,Ordering::AcqRel)!=value { (callbacks.event)(Event::Presenting(value)); }
     }
+    pub fn note_presented(&self, generation:u64) {
+        let shown=Instant::now();
+        let request={
+            let d=self.desired.lock().unwrap_or_else(|e|e.into_inner());
+            d.activation.filter(|(g,_)| *g==generation && d.timeline.generation==generation && !d.shutdown)
+        };
+        if let Some((_,at))=request {
+            eprintln!("[voice-glass-activation] generation={generation}; request_to_show_call_ms={:.3}; endpoint=first-Present-and-ShowWindow-return; not physical-key-to-photon latency",shown.saturating_duration_since(at).as_secs_f64()*1000.);
+        }
+    }
 }
 
 pub struct Controller {
@@ -59,7 +72,7 @@ impl Controller {
     /// hotkey, network, capture, image saving or settings mutation in this call.
     pub fn new(fallback_hwnd:isize,enabled:bool,dark:bool,callbacks:Callbacks)->Result<Self,String> {
         if fallback_hwnd==0 { return Err("Missing application overlay handle".into()); }
-        let shared=Arc::new(Shared{desired:Mutex::new(Desired{timeline:Timeline::new(enabled,dark),shutdown:false,revision:0}),
+        let shared=Arc::new(Shared{desired:Mutex::new(Desired{timeline:Timeline::new(enabled,dark),shutdown:false,revision:0,activation:None}),
             wake:Condvar::new(),start:Instant::now(),running:AtomicBool::new(true),presenting:AtomicBool::new(false)});
         let (tx,rx)=mpsc::channel();let state=shared.clone();
         let join=thread::Builder::new().name("voice-liquid-renderer".into()).spawn(move||{
@@ -77,10 +90,16 @@ impl Controller {
         Ok(Self{shared,join:Mutex::new(Some(join)),done:Mutex::new(rx)})
     }
     fn change(&self, f:impl FnOnce(&mut Timeline,u64)) {
+        let requested=Instant::now();
         let now=self.shared.now();
         let mut d=self.shared.desired.lock().unwrap_or_else(|e|e.into_inner());
         if d.shutdown {return;}
-        f(&mut d.timeline,now); d.revision=d.revision.wrapping_add(1);
+        f(&mut d.timeline,now);
+        let view=d.timeline.view(now);
+        if view.capture_allowed() && d.activation.map(|(g,_)|g)!=Some(view.generation) {
+            d.activation=Some((view.generation,requested));
+        }
+        d.revision=d.revision.wrapping_add(1);
         drop(d);self.shared.wake.notify_one();
     }
     pub fn phase(&self,generation:u64,phase:Phase) { self.change(|t,now|t.phase(generation,phase,now)); }
