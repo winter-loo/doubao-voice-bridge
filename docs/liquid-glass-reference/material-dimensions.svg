@@ -1,0 +1,11 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700">
+<rect width="100%" height="100%" fill="white"/>
+<text x="60" y="70" font-size="36" font-family="Segoe UI">Liquid Glass Material Dimensions</text>
+<text x="80" y="150" font-size="26">① Milkiness</text>
+<text x="80" y="220" font-size="26">② Background glyph suppression</text>
+<text x="80" y="290" font-size="26">③ Retained low-frequency environment</text>
+<text x="80" y="360" font-size="26">④ Rim optics</text>
+<text x="80" y="430" font-size="26">⑤ Shadow softness</text>
+<text x="80" y="500" font-size="26">⑥ Foreground dominance</text>
+<text x="80" y="610" font-size="22" fill="#666">Discuss material using these dimensions instead of subjective wording.</text>
+</svg>
