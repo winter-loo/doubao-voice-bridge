@@ -105,8 +105,32 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
 #endif
         support=max(support,1-smoothstep(-h*.012,h*.055,bar_distance(local,i)));
     }
-    if(style.z<.5)support=0;float frost=lerp(.62,1,support)*(1-edge*.91);float3 narrow=image1.SampleLevel(clamped,uv,0).rgb;float3 wide=image0.SampleLevel(clamped,uv,0).rgb;float3 scene=lerp(narrow,wide,saturate(frost));
+        if(style.z<.5)support=0;
+    float3 narrow=image1.SampleLevel(clamped,uv,0).rgb;
+    float3 wide=image0.SampleLevel(clamped,uv,0).rgb;
+    // Apple-style readability behavior, inferred from observable output rather
+    // than private parameters: retain the low-frequency environment, but stop
+    // dark glyph strokes on a bright neutral scene from remaining readable.
+    // Empty white, dark and chromatic scenes produce zero or negligible risk.
+    float narrow_y=dot(narrow,LUMA),wide_y=dot(wide,LUMA);
+    float wide_chroma=max(wide.r,max(wide.g,wide.b))-min(wide.r,min(wide.g,wide.b));
+    float bright_neutral=smoothstep(.48,.78,wide_y)*(1-smoothstep(.035,.18,wide_chroma));
+    float dark_detail=smoothstep(.025,.18,max(0,wide_y-narrow_y));
+    // Keep the optical rim and refraction alive: protection ramps up only after
+    // entering the body and never changes coverage/window alpha.
+    float protected_interior=smoothstep(h*.045,h*.22,inset);
+    float scene_text_risk=dark?0:white_risk*smoothstep(.045,.22,complexity);
+    float local_text_risk=dark?0:bright_neutral*dark_detail;
+    float readability_guard=saturate((.92*scene_text_risk+.35*local_text_risk)*protected_interior);
+    float frost=lerp(.62,1,support)*(1-edge*.91);
+    frost=max(frost,readability_guard);
+    float3 scene=lerp(narrow,wide,saturate(frost));
     float2 dispersion=field.yz*(h*.004*edge)/geometry.xy;scene.r=lerp(scene.r,image1.SampleLevel(clamped,uv+dispersion,0).r,edge*.24);scene.b=lerp(scene.b,image1.SampleLevel(clamped,uv-dispersion,0).b,edge*.24);float3 body=adaptive_transmit(scene,dark,material);
+    // A restrained neutral veil lifts the protected interior without becoming an
+    // opaque card. Local dark strokes get more lift than the surrounding field;
+    // low-frequency environment and all edge optics continue through the glass.
+    float readability_veil=saturate((.15*scene_text_risk+.283*local_text_risk)*protected_interior);
+    body=lerp(body,float3(1,1,1),readability_veil);
     float2 direction=normalize(float2(-.32,-.94)+(contact.xy-float2(.3,.18))*.95);float facing=max(0,dot(field.yz,direction));float opposing=max(0,dot(field.yz,-direction));float scale=h/26;
     // Keep scale unchanged for the original 20-bar content below.
     float rim_scale=scale*rim_fraction;
