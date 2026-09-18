@@ -16,6 +16,8 @@ mod voice_window;
 mod gpu;
 #[cfg(windows)]
 mod desktop;
+#[cfg(windows)]
+mod white_text_checks;
 
 pub type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub fn ensure(condition: bool, message: &str) -> AppResult<()> {
@@ -114,4 +116,8 @@ mod tests {
 #[cfg(windows)]
 mod voice_render_checks;
 #[cfg(windows)]
-pub fn voice_self_test() -> AppResult<()> { unsafe { voice_render_checks::verify(None)?; gpu::adaptive_self_test(None) } }
+pub fn voice_self_test() -> AppResult<()> { unsafe {
+    voice_render_checks::verify(None)?;
+    gpu::adaptive_self_test(None)?;
+    white_text_checks::verify(None)
+} }
