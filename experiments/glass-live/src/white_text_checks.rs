@@ -17,11 +17,11 @@ const STEADY_TIME: f32 = 0.8;
 // Engineering bounds derived from the observed failure mode:
 // preserve low-frequency environment, suppress readable dark glyph structure,
 // and keep the original colored waveform distinguishable.
-const MAX_TEXT_EDGE_RATIO: f64 = 0.30;
-const MIN_DARK_GLYPH_MEAN: f64 = 175.0;
-const MIN_MATERIAL_MEAN: f64 = 178.0;
-const MAX_MATERIAL_MEAN: f64 = 245.0;
-const MIN_LOW_FREQUENCY_STDDEV: f64 = 5.0;
+const MAX_TEXT_EDGE_RATIO: f64 = 0.20;
+const MIN_DARK_GLYPH_MEAN: f64 = 205.0;
+const MIN_MATERIAL_MEAN: f64 = 205.0;
+const MAX_MATERIAL_MEAN: f64 = 238.0;
+const MIN_LOW_FREQUENCY_STDDEV: f64 = 8.0;
 const MIN_WAVEFORM_MEDIAN_CONTRAST: f64 = 1.40;
 
 fn rgba_pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> &[u8] {
