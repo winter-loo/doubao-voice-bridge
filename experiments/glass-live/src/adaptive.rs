@@ -128,3 +128,7 @@ pub unsafe fn self_test(directory:Option<&Path>)->AppResult<()> {
     checks::verify(directory)?;
     review_evidence::verify(directory)
 }
+
+#[cfg(test)]
+#[path="manual_replay_reset.rs"]
+mod manual_replay_reset;

@@ -6,7 +6,7 @@ use std::{io::Write, path::PathBuf, sync::{Mutex, OnceLock, mpsc,
 use windows::Win32::UI::Input::KeyboardAndMouse::GetCapture;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Settings { kind: usize, listening: bool, dark: bool, revision: usize }
+struct Settings { kind: usize, listening: bool, dark: bool, revision: usize, requested_at: Instant }
 struct ReviewState {
     settings: Mutex<Settings>,
     rect: Mutex<Option<(i32, i32, i32, i32, i32)>>,
@@ -19,15 +19,22 @@ struct ReviewState {
     moved_margin_clicks: AtomicUsize,
     core_leaks: AtomicUsize,
     paired_moves: AtomicUsize,
+    applied_revision: AtomicUsize,
+    pipeline_creations: AtomicUsize,
+    control_updates: AtomicUsize,
+    max_response_us: AtomicUsize,
+    controls_over_100ms: AtomicUsize,
 }
 impl ReviewState {
     fn new() -> Self { Self {
-        settings: Mutex::new(Settings { kind: 0, listening: false, dark: false, revision: 1 }),
+        settings: Mutex::new(Settings { kind: 0, listening: false, dark: false, revision: 1, requested_at: Instant::now() }),
         rect: Mutex::new(None), stop: AtomicBool::new(false), failed: AtomicBool::new(false),
         painted: AtomicUsize::new(0), paper_down: AtomicBool::new(false),
         body_clicks: AtomicUsize::new(0), margin_clicks: AtomicUsize::new(0),
         moved_margin_clicks: AtomicUsize::new(0), core_leaks: AtomicUsize::new(0),
-        paired_moves: AtomicUsize::new(0),
+        paired_moves: AtomicUsize::new(0), applied_revision: AtomicUsize::new(0),
+        pipeline_creations: AtomicUsize::new(0), control_updates: AtomicUsize::new(0),
+        max_response_us: AtomicUsize::new(0), controls_over_100ms: AtomicUsize::new(0),
     } }
     fn config(&self) -> Settings { *self.settings.lock().unwrap_or_else(|e| e.into_inner()) }
 }
@@ -57,6 +64,8 @@ unsafe extern "system" fn paper_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) ->
         },
         WM_LBUTTONDOWN => { s.paper_down.store(true, Ordering::Release); LRESULT(0) },
         WM_LBUTTONUP => {
+            // Timestamp message receipt, NOT the physical mouse event or scanout.
+            let received_at = Instant::now();
             if !s.paper_down.swap(false, Ordering::AcqRel) { return LRESULT(0); }
             let x = lp.0 as u16 as i16 as i32;
             let y = (lp.0 as u32 >> 16) as u16 as i16 as i32;
@@ -74,6 +83,7 @@ unsafe extern "system" fn paper_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) ->
                     _ => s.stop.store(true, Ordering::Release),
                 }
                 config.revision += 1;
+                config.requested_at = received_at;
             } else {
                 let mut p = POINT { x, y };
                 if ClientToScreen(h, &mut p).as_bool() {
@@ -108,8 +118,9 @@ unsafe extern "system" fn paper_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) ->
             for (i, text) in ["白底", "浅灰", "黑底", "绿底", "重播", "波形", "文字", "浅/深", "退出"].iter().enumerate() {
                 label(dc, RECT { left:i as i32*r.right/9, top:0, right:(i as i32+1)*r.right/9, bottom:44 }, text);
             }
-            label(dc, RECT { left:0,top:44,right:r.right,bottom:84 },
-                "人工审阅：点击胶囊、点击阴影外缘、拖动后再次点击阴影；波形为模拟音量");
+            let instructions = format!("人工审阅：点胶囊、点阴影、拖动后再点阴影；模拟波形。请求 {} / 已提交 {}",
+                config.revision, s.applied_revision.load(Ordering::Acquire));
+            label(dc, RECT { left:0,top:44,right:r.right,bottom:84 }, &instructions);
             let status = format!("主体点击 {}  阴影穿透 {}  成对移动 {}  移动后穿透 {}  中心漏点 {}",
                 s.body_clicks.load(Ordering::Acquire),s.margin_clicks.load(Ordering::Acquire),
                 s.paired_moves.load(Ordering::Acquire),s.moved_margin_clicks.load(Ordering::Acquire),
@@ -177,6 +188,8 @@ impl Drop for Paper { fn drop(&mut self) {
 } }
 
 unsafe fn native_session(state: Arc<ReviewState>, log: &mut std::fs::File) -> AppResult<(usize,usize,bool)> {
+    let initialization = Instant::now();
+    eprintln!("[manual-native] initializing the renderer once; controls appear after preparation");
     let context = ThreadContext::new()?;
     // Output/adapter enumeration only. Do NOT construct Session or Capture.
     let (factory,adapter,_output,_desc,monitor) = desktop::choose_output()?;
@@ -186,8 +199,6 @@ unsafe fn native_session(state: Arc<ReviewState>, log: &mut std::fs::File) -> Ap
     ensure(pw >= 540 && ph >= 260, "Work area too small for bounded manual review")?;
     let left = work.left+(work.right-work.left-pw)/2;
     let top = work.top+(work.bottom-work.top-ph)/2;
-    let paper = Paper::start(RECT { left,top,right:left+pw,bottom:top+ph },state.clone())?;
-    let paper_hwnd = HWND(paper.handle as *mut _);
     let area = RECT { left:left+8,top:top+96,right:left+pw-8,bottom:top+ph-48 };
     let (body,canvas) = create_pair(&context,POINT { x:left+pw/2,y:top+ph/2 })?;
     let dpi = GetDpiForWindow(body.0); ensure((96..=288).contains(&dpi), "Unsupported review DPI")?;
@@ -195,20 +206,29 @@ unsafe fn native_session(state: Arc<ReviewState>, log: &mut std::fs::File) -> Ap
     let (device,dc) = gpu::create_device(Some(&adapter))?;
     let mut config = state.config();
     let mut phase = Phase::Optimizing;
-    let mask = content_mask(w,h,scale,phase)?;
-    let mut pipe = Pipeline::new_voice(device.clone(),dc.clone(),w,h,&mask)?;
+    let text_mask = content_mask(w,h,scale,Phase::Optimizing)?;
+    let wave_mask = content_mask(w,h,scale,Phase::Listening)?;
+    // The ONLY pipeline construction in this session. Buttons must not compile
+    // shaders or allocate a new set of render targets on the presentation thread.
+    let pipe = Pipeline::new_voice(device,dc,w,h,&text_mask)?;
+    state.pipeline_creations.fetch_add(1,Ordering::AcqRel);
+    let sources: Vec<Vec<u8>> = (0..4).map(|kind| color(kind).repeat((pipe.raw.width*pipe.raw.height) as usize)).collect();
+    crate::voice_render_checks::upload_fixture_checked(&pipe,&sources[config.kind])?;
     let margin = pipe.layout.margin as i32;
     ensure(area.right-area.left > w as i32+2*margin && area.bottom-area.top > h as i32+2*margin,
         "Review area cannot contain the complete visual canvas")?;
     let mut at = clamp_position(POINT { x:left+(pw-w as i32)/2,y:top+(ph-h as i32)/2 },area,w,h,margin);
+    // Do the one-time compilation before making interactive controls visible.
+    let paper = Paper::start(RECT { left,top,right:left+pw,bottom:top+ph },state.clone())?;
+    let paper_hwnd = HWND(paper.handle as *mut _);
     configure_pair(body.0,canvas.0,at,pipe.layout,true)?;
     *state.rect.lock().unwrap_or_else(|e|e.into_inner()) = Some((at.x,at.y,w as i32,h as i32,margin));
-    crate::voice_render_checks::upload_fixture_checked(&pipe,&color(config.kind).repeat((pipe.raw.width*pipe.raw.height) as usize))?;
     let presenter = Presenter::new(canvas.0,body.0,&factory,&pipe)?; presenter.bind_input(&pipe);
     INPUT.with(|s|*s.borrow_mut()=Input::default());
     let mut start = Instant::now(); let session_start = Instant::now();
     let mut shown = false; let mut submissions = 0; let mut checks = 0;
-    writeln!(log,"begin source={BASE} dpi={dpi} body={w}x{h} canvas={}x{} hardware-adapter=true capture=false",pipe.canvas.width,pipe.canvas.height)?; log.flush()?;
+    writeln!(log,"begin source={BASE} dpi={dpi} body={w}x{h} canvas={}x{} hardware-adapter=true capture=false initialization_ms={:.3} pipeline_creations=1",
+        pipe.canvas.width,pipe.canvas.height,initialization.elapsed().as_secs_f64()*1000.0)?; log.flush()?;
     eprintln!("[manual-native] visible review starts; use the paper buttons; auto-close after 180 seconds");
     while !state.stop.load(Ordering::Acquire) && session_start.elapsed() < Duration::from_secs(180) {
         let tick = Instant::now();
@@ -221,7 +241,7 @@ unsafe fn native_session(state: Arc<ReviewState>, log: &mut std::fs::File) -> Ap
             let mut s=s.borrow_mut(); let v=(s.position.take(),s.click,s.close,s.display_changed); s.click=false; v
         });
         ensure(!changed && !state.failed.load(Ordering::Acquire), "Display, DPI or paper changed; review stopped")?;
-        if close { break; }
+        if close || state.stop.load(Ordering::Acquire) { break; }
         if click { state.body_clicks.fetch_add(1,Ordering::AcqRel); writeln!(log,"body_click")?; }
         if let Some(p) = position {
             let p = clamp_position(p,area,w,h,margin);
@@ -232,20 +252,55 @@ unsafe fn native_session(state: Arc<ReviewState>, log: &mut std::fs::File) -> Ap
             }
         }
         let requested=state.config();
-        if requested != config {
+        let mut response = None;
+        if requested.revision != config.revision {
             if state.painted.load(Ordering::Acquire) < requested.revision {
                 std::thread::sleep(Duration::from_millis(4)); continue;
             }
+            let apply_begin = Instant::now();
+            let mask_changed = requested.listening != config.listening;
+            let source_changed = requested.kind != config.kind;
+            let skipped = requested.revision.saturating_sub(config.revision).saturating_sub(1);
+            if mask_changed {
+                pipe.set_voice_mask(if requested.listening { &wave_mask } else { &text_mask })?;
+            }
+            let mask_done = Instant::now();
+            if source_changed {
+                crate::voice_render_checks::upload_fixture_checked(&pipe,&sources[requested.kind])?;
+            }
+            let source_done = Instant::now();
+            // Replay only resets temporal history/springs. Keep compiled shaders,
+            // GPU resources, HWNDs, presenter and the approved material unchanged.
+            pipe.reset_manual_replay();
             config=requested; phase=if config.listening { Phase::Listening } else { Phase::Optimizing };
-            // Replay prepares fresh generated inputs BEFORE restarting visual time.
-            pipe=Pipeline::new_voice(device.clone(),dc.clone(),w,h,&content_mask(w,h,scale,phase)?)?;
-            crate::voice_render_checks::upload_fixture_checked(&pipe,&color(config.kind).repeat((pipe.raw.width*pipe.raw.height) as usize))?;
-            presenter.bind_input(&pipe); start=Instant::now();
-            writeln!(log,"selection kind={} listening={} dark={} revision={}",config.kind,config.listening,config.dark,config.revision)?;
+            start=Instant::now();
+            response=Some((apply_begin,mask_done,source_done,skipped,mask_changed,source_changed));
         }
+        let render_begin = Instant::now();
         let age=start.elapsed().as_secs_f32();
         let level=if config.listening { 0.5+0.45*(age*2.5).sin() } else { 0. };
-        pipe.render_voice(config.dark,age,phase,level,1.); presenter.present(&pipe)?; submissions+=1;
+        pipe.render_voice(config.dark,age,phase,level,1.);
+        let present_begin = Instant::now();
+        presenter.present(&pipe)?; submissions+=1;
+        let present_done = Instant::now();
+        state.applied_revision.store(config.revision,Ordering::Release);
+        if let Some((apply_begin,mask_done,source_done,skipped,mask_changed,source_changed)) = response {
+            let response_us=present_done.duration_since(config.requested_at).as_micros().min(usize::MAX as u128) as usize;
+            state.control_updates.fetch_add(1,Ordering::AcqRel);
+            state.max_response_us.fetch_max(response_us,Ordering::AcqRel);
+            if response_us>100_000 { state.controls_over_100ms.fetch_add(1,Ordering::AcqRel); }
+            // These stages end at Present RETURN, not physical display scanout.
+            writeln!(log,"control revision={} kind={} listening={} dark={} superseded={} mask_changed={} source_changed={} queue_and_paper_ms={:.3} mask_ms={:.3} source_ms={:.3} reset_ms={:.3} render_ms={:.3} present_call_ms={:.3} request_to_submit_ms={:.3}",
+                config.revision,config.kind,config.listening,config.dark,skipped,mask_changed,source_changed,
+                apply_begin.duration_since(config.requested_at).as_secs_f64()*1000.0,
+                mask_done.duration_since(apply_begin).as_secs_f64()*1000.0,
+                source_done.duration_since(mask_done).as_secs_f64()*1000.0,
+                render_begin.duration_since(source_done).as_secs_f64()*1000.0,
+                present_begin.duration_since(render_begin).as_secs_f64()*1000.0,
+                present_done.duration_since(present_begin).as_secs_f64()*1000.0,response_us as f64/1000.0)?;
+            eprintln!("[manual-native-control] revision={} request_to_submit_ms={:.3}; pipeline reused; not scanout latency",config.revision,response_us as f64/1000.0);
+            let _=InvalidateRect(Some(paper_hwnd),None,false); log.flush()?;
+        }
         if !shown {
             let _=ShowWindow(canvas.0,SW_SHOWNOACTIVATE); let _=ShowWindow(body.0,SW_SHOWNOACTIVATE);
             SetWindowPos(body.0,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)?; shown=true;
@@ -287,10 +342,14 @@ fn local_manual_native_review() {
         let moved=state.paired_moves.load(Ordering::Acquire); let after=state.moved_margin_clicks.load(Ordering::Acquire);
         let leaks=state.core_leaks.load(Ordering::Acquire);
         let input_pass=body>0 && margin>0 && moved>0 && after>0 && leaks==0;
-        let json=format!("{{\n  \"production_source_commit\":\"{BASE}\",\n  \"session_completed\":true,\n  \"presentation_submissions\":{submissions},\n  \"paired_geometry_checks\":{checks},\n  \"body_clicks\":{body},\n  \"margin_clicks\":{margin},\n  \"paired_move_updates\":{moved},\n  \"margin_clicks_after_move\":{after},\n  \"core_click_leaks\":{leaks},\n  \"manual_input_passed\":{input_pass},\n  \"capture_exclusion_checked\":true,\n  \"owned_windows_destroyed\":{gone},\n  \"visual_acceptance\":null,\n  \"desktop_capture\":false,\n  \"audio\":false,\n  \"input_injection\":false,\n  \"scope\":\"Generated owned background, production HWND/presenter path, manual input only. Not an automatic DWM pixel comparison, hardware FPS, voice test or deployment.\"\n}}\n");
+        let updates=state.control_updates.load(Ordering::Acquire);
+        let creations=state.pipeline_creations.load(Ordering::Acquire);
+        let over=state.controls_over_100ms.load(Ordering::Acquire);
+        let max_ms=if updates==0 { "null".to_owned() } else { format!("{:.3}",state.max_response_us.load(Ordering::Acquire) as f64/1000.0) };
+        let json=format!("{{\n  \"production_source_commit\":\"{BASE}\",\n  \"session_completed\":true,\n  \"presentation_submissions\":{submissions},\n  \"paired_geometry_checks\":{checks},\n  \"body_clicks\":{body},\n  \"margin_clicks\":{margin},\n  \"paired_move_updates\":{moved},\n  \"margin_clicks_after_move\":{after},\n  \"core_click_leaks\":{leaks},\n  \"manual_input_passed\":{input_pass},\n  \"pipeline_creations\":{creations},\n  \"control_update_samples\":{updates},\n  \"max_button_request_to_submit_ms\":{max_ms},\n  \"controls_over_100ms\":{over},\n  \"response_scope\":\"WM_LBUTTONUP receipt to Present return, not physical click-to-display latency. 100ms is a diagnostic flag, not an acceptance threshold.\",\n  \"capture_exclusion_checked\":true,\n  \"owned_windows_destroyed\":{gone},\n  \"visual_acceptance\":null,\n  \"desktop_capture\":false,\n  \"audio\":false,\n  \"input_injection\":false,\n  \"scope\":\"Generated owned background, production HWND/presenter path, manual input only. Not an automatic DWM pixel comparison, hardware FPS, voice test or deployment.\"\n}}\n");
         std::fs::write(dir.join("native-session.json"),json)?;
-        writeln!(log,"end submissions={submissions} geometry_checks={checks} input_complete={input_pass} windows_destroyed={gone}")?; log.flush()?;
-        eprintln!("[manual-native] SESSION COMPLETE; input_complete={input_pass}; visual acceptance requires a separate human report");
+        writeln!(log,"end submissions={submissions} geometry_checks={checks} input_complete={input_pass} windows_destroyed={gone} pipeline_creations={creations} control_samples={updates} max_request_to_submit_ms={max_ms}")?; log.flush()?;
+        eprintln!("[manual-native] SESSION COMPLETE; input_complete={input_pass}; visual/responsiveness acceptance requires a separate human report");
         Ok(())
     })();
     if let Err(e)=result { panic!("Manual native review failed: {e}"); }
