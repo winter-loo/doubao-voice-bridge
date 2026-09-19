@@ -135,6 +135,20 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     frost=saturate(frost*tuning_body.x);
     frost=max(frost,readability_guard);
     float3 scene=lerp(narrow,wide,saturate(frost));
+    // Issue #15: frost_strength above 1 drives extra protected-interior
+    // diffusion instead of merely saturating at the existing wide blur.
+    // Re-sample image0 at a compact cross so high-frequency glyph strokes
+    // collapse into lower-frequency environmental structure without touching
+    // rim/refraction/dispersion/shadow behavior.
+    float diffusion_risk=saturate((.22*scene_text_risk+1.18*local_text_risk)*protected_interior);
+    float extra_diffusion=saturate((tuning_body.x-1)*1.70)*diffusion_risk;
+    float2 diffusion_step=float2(h*.34/geometry.x,h*.22/geometry.y);
+    float3 diffuse=wide*.28;
+    diffuse+=image0.SampleLevel(clamped,uv+float2(diffusion_step.x,0),0).rgb*.18;
+    diffuse+=image0.SampleLevel(clamped,uv-float2(diffusion_step.x,0),0).rgb*.18;
+    diffuse+=image0.SampleLevel(clamped,uv+float2(0,diffusion_step.y),0).rgb*.18;
+    diffuse+=image0.SampleLevel(clamped,uv-float2(0,diffusion_step.y),0).rgb*.18;
+    scene=lerp(scene,diffuse,extra_diffusion);
     float2 dispersion=field.yz*(h*.004*edge)/geometry.xy;scene.r=lerp(scene.r,image1.SampleLevel(clamped,uv+dispersion,0).r,edge*.24);scene.b=lerp(scene.b,image1.SampleLevel(clamped,uv-dispersion,0).b,edge*.24);float3 body=adaptive_transmit(scene,dark,material);
     // A restrained neutral veil lifts the protected interior without becoming an
     // opaque card. Local dark strokes get more lift than the surrounding field;
