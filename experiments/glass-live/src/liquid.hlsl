@@ -1,3 +1,6 @@
+#ifndef LIQUID_UNROLL
+#define LIQUID_UNROLL [unroll]
+#endif
 // Independent optical model informed by Apple's WWDC25/219, not Apple's shader.
 // The retained glass.hlsl provides resource b0/t0..2 and filter helpers only.
 // This material transmits the captured scene; it does NOT use the V2.x affine paint.
@@ -21,7 +24,7 @@ float2 scene_uv(float2 p) { return (p+filter.xx)/geometry.xy; }
 // r=smoothed scene luminance; g/b=light/dark white-ink selection; a=1+detail.
 float4 liquid_adapt_ps(float4 pos:SV_POSITION):SV_TARGET {
     float mean=0, detail=0;
-    [unroll] for(int j=0;j<3;j++) { [unroll] for(int i=0;i<5;i++) {
+    LIQUID_UNROLL for(int j=0;j<3;j++) { LIQUID_UNROLL for(int i=0;i<5;i++) {
         float2 uv=scene_uv(geometry.zw*float2(.12+.19*i,.26+.24*j));
         float3 wide=image0.SampleLevel(clamped,uv,0).rgb;
         float3 fine=original_linear.SampleLevel(clamped,uv,0).rgb;
@@ -68,7 +71,7 @@ float bar_distance(float2 p,int i) {
 }
 float wave_mask(float2 p) {
     float fg=text_mask.SampleLevel(clamped,p/geometry.zw,0);
-    [unroll] for(int i=0;i<5;i++) { fg=max(fg,saturate(.5-bar_distance(p,i))); }
+    LIQUID_UNROLL for(int i=0;i<5;i++) { fg=max(fg,saturate(.5-bar_distance(p,i))); }
     return fg;
 }
 #endif
@@ -111,9 +114,9 @@ float4 liquid_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     // Waveform support follows its five animated strokes, not their bounding box.
     // A rectangular white patch around the icon would contradict transmission.
     #ifdef LIQUID_VOICE_CONTENT
-    [unroll] for(int i=0;i<20;i++) {
+    LIQUID_UNROLL for(int i=0;i<20;i++) {
 #else
-    [unroll] for(int i=0;i<5;i++) {
+    LIQUID_UNROLL for(int i=0;i<5;i++) {
 #endif
         support=max(support,1-smoothstep(-h*.012,h*.055,bar_distance(local,i)));
     }

@@ -1,8 +1,10 @@
 .DS_Store
 .build/
+.target/
 dist/
 recordings/
 *.log
 *.tmp
 __pycache__/
 *.pyc
+experiments/glass-playground/out/

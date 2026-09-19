@@ -1,5 +1,7 @@
 # Windows live custom-glass preview
 
+> For ordinary material iteration, use `../glass-playground/README.md` instead. The playground uses generated fixtures, runtime production-HLSL reload and persistent build caches; this live-capture preview remains a later validation tool.
+
 This is an independent executable in the **custom** worktree, not a deployment of
 DoubaoVoiceClient. Its development no longer waits for native PR #9 acceptance.
 The existing GPUI voice client, native worktree, global transparency settings,

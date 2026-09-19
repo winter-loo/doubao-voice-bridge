@@ -1,3 +1,6 @@
+#ifndef LIQUID_UNROLL
+#define LIQUID_UNROLL [unroll]
+#endif
 // Foreground/state adapter only. The optical material below remains shared.
 cbuffer VoiceContent : register(b2) {
     float4 voice_state; // phase; actual gated audio level; lifecycle opacity; reserved
@@ -30,6 +33,6 @@ float bar_distance(float2 p,int i) {
 }
 float wave_mask(float2 p) {
     float fg=text_mask.SampleLevel(clamped,p/geometry.zw,0);
-    [unroll] for(int i=0;i<20;i++) { fg=max(fg,saturate(.5-bar_distance(p,i))); }
+    LIQUID_UNROLL for(int i=0;i<20;i++) { fg=max(fg,saturate(.5-bar_distance(p,i))); }
     return fg;
 }
