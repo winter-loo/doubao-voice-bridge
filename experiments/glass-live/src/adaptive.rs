@@ -28,8 +28,8 @@ impl Default for MaterialTuning {
         Self {
             scene_guard: 0.98,
             local_guard: 0.52,
-            scene_veil: 0.16,
-            local_veil: 0.29,
+            scene_veil: 0.18,
+            local_veil: 0.32,
             neutral_low: 0.48,
             neutral_high: 0.78,
             neutral_chroma_low: 0.035,
@@ -39,9 +39,9 @@ impl Default for MaterialTuning {
             complexity_low: 0.045,
             complexity_high: 0.22,
             frost_strength: 1.60,
-            milkiness: 0.075,
-            interior_start: 0.060,
-            interior_full: 0.260,
+            milkiness: 0.11,
+            interior_start: 0.055,
+            interior_full: 0.245,
         }
     }
 }
