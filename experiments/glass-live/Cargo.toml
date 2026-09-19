@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = []
+playground = []
+
 [lib]
 name = "doubao_glass_live"
 path = "src/lib.rs"

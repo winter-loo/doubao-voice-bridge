@@ -12,5 +12,5 @@ mod retained {
 pub use retained::create_device;
 pub use retained::optical::{Pipeline, Presenter, self_test};
 
-pub use retained::optical::adaptive::{AdaptivePipeline, AdaptivePresenter};
+pub use retained::optical::adaptive::{AdaptivePipeline, AdaptivePresenter, MaterialTuning};
 pub use retained::optical::adaptive::self_test as adaptive_self_test;

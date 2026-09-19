@@ -4,7 +4,7 @@ use windows::{core::{s, Interface, PCSTR}, Win32::{
     Foundation::{HMODULE, HWND},
     Graphics::{
         Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, Fxc::D3DCompile},
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, Fxc::{D3DCompile, D3DCOMPILE_SKIP_OPTIMIZATION}},
         Direct3D11::*, DirectComposition::*, Dxgi::{Common::*, *},
     },
 }};
@@ -62,6 +62,17 @@ unsafe fn compile_source_runtime(source: &str, entry: PCSTR, target: PCSTR) -> A
     let mut code = None; let mut errors: Option<ID3DBlob> = None;
     let result = D3DCompile(source.as_ptr().cast(), source.len(), s!("glass-live.hlsl"), None, None,
         entry, target, 1 << 15, 0, &mut code, Some(&mut errors));
+    if result.is_err() {
+        let detail = errors.map(|b| String::from_utf8_lossy(slice::from_raw_parts(b.GetBufferPointer().cast(), b.GetBufferSize())).into_owned()).unwrap_or_default();
+        return Err(format!("HLSL compilation failed: {detail}").into());
+    }
+    Ok(code.ok_or("Compiler returned no bytecode")?)
+}
+#[cfg(feature="playground")]
+unsafe fn compile_source_playground(source: &str, entry: PCSTR, target: PCSTR) -> AppResult<ID3DBlob> {
+    let mut code = None; let mut errors: Option<ID3DBlob> = None;
+    let result = D3DCompile(source.as_ptr().cast(), source.len(), s!("glass-live.hlsl"), None, None,
+        entry, target, D3DCOMPILE_SKIP_OPTIMIZATION, 0, &mut code, Some(&mut errors));
     if result.is_err() {
         let detail = errors.map(|b| String::from_utf8_lossy(slice::from_raw_parts(b.GetBufferPointer().cast(), b.GetBufferSize())).into_owned()).unwrap_or_default();
         return Err(format!("HLSL compilation failed: {detail}").into());

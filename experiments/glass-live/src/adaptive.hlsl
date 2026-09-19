@@ -1,3 +1,6 @@
+#ifndef LIQUID_UNROLL
+#define LIQUID_UNROLL [unroll]
+#endif
 // Background-conditioned convergence, not a replay of Apple's private shader.
 // Filter steady scene coefficients separately from the finite entrance envelope.
 // Otherwise a second low-pass delays both the density peak and its recovery.
@@ -6,6 +9,12 @@
 cbuffer AdaptiveSurface : register(b3) {
     float4 canvas_space;
     float4 adaptive_time;
+};
+cbuffer MaterialTuning : register(b4) {
+    float4 tuning_guards;  // scene guard, local guard, scene veil, local veil
+    float4 tuning_neutral; // luminance low/high, chroma low/high
+    float4 tuning_detail;  // detail low/high, scene complexity low/high
+    float4 tuning_body;    // frost strength, milkiness, interior start/full
 };
 float white_density_crest(float age,float risk,float complexity) {
     // Engineering presentation-time envelope, not measured Apple parameters.
@@ -18,7 +27,7 @@ float white_density_crest(float age,float risk,float complexity) {
 }
 float4 adaptive_reduce_ps(float4 position:SV_POSITION):SV_TARGET {
     float3 mean=0;float detail=0,second=0;
-    [unroll] for(int j=0;j<3;j++){[unroll] for(int i=0;i<5;i++){
+    LIQUID_UNROLL for(int j=0;j<3;j++){LIQUID_UNROLL for(int i=0;i<5;i++){
         float2 uv=scene_uv(geometry.zw*float2(.12+.19*i,.26+.24*j));
         float3 wide=image0.SampleLevel(clamped,uv,0).rgb;
         float3 fine=original_linear.SampleLevel(clamped,uv,0).rgb;
@@ -99,9 +108,9 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float rim_height=h*rim_fraction;
     float2 uv=scene_uv(local+bend);float edge=1-smoothstep(rim_height*.075,rim_height*.28,inset);float support=glyph_support.SampleLevel(clamped,local/geometry.zw,0);
 #ifdef LIQUID_VOICE_CONTENT
-    [unroll] for(int i=0;i<20;i++){
+    LIQUID_UNROLL for(int i=0;i<20;i++){
 #else
-    [unroll] for(int i=0;i<5;i++){
+    LIQUID_UNROLL for(int i=0;i<5;i++){
 #endif
         support=max(support,1-smoothstep(-h*.012,h*.055,bar_distance(local,i)));
     }
@@ -114,23 +123,25 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     // Empty white, dark and chromatic scenes produce zero or negligible risk.
     float narrow_y=dot(narrow,LUMA),wide_y=dot(wide,LUMA);
     float wide_chroma=max(wide.r,max(wide.g,wide.b))-min(wide.r,min(wide.g,wide.b));
-    float bright_neutral=smoothstep(.48,.78,wide_y)*(1-smoothstep(.035,.18,wide_chroma));
-    float dark_detail=smoothstep(.025,.18,max(0,wide_y-narrow_y));
+    float bright_neutral=smoothstep(tuning_neutral.x,tuning_neutral.y,wide_y)*(1-smoothstep(tuning_neutral.z,tuning_neutral.w,wide_chroma));
+    float dark_detail=smoothstep(tuning_detail.x,tuning_detail.y,max(0,wide_y-narrow_y));
     // Keep the optical rim and refraction alive: protection ramps up only after
     // entering the body and never changes coverage/window alpha.
-    float protected_interior=smoothstep(h*.045,h*.22,inset);
-    float scene_text_risk=dark?0:white_risk*smoothstep(.045,.22,complexity);
+    float protected_interior=smoothstep(h*tuning_body.z,h*tuning_body.w,inset);
+    float scene_text_risk=dark?0:white_risk*smoothstep(tuning_detail.z,tuning_detail.w,complexity);
     float local_text_risk=dark?0:bright_neutral*dark_detail;
-    float readability_guard=saturate((.92*scene_text_risk+.35*local_text_risk)*protected_interior);
+    float readability_guard=saturate((tuning_guards.x*scene_text_risk+tuning_guards.y*local_text_risk)*protected_interior);
     float frost=lerp(.62,1,support)*(1-edge*.91);
+    frost=saturate(frost*tuning_body.x);
     frost=max(frost,readability_guard);
     float3 scene=lerp(narrow,wide,saturate(frost));
     float2 dispersion=field.yz*(h*.004*edge)/geometry.xy;scene.r=lerp(scene.r,image1.SampleLevel(clamped,uv+dispersion,0).r,edge*.24);scene.b=lerp(scene.b,image1.SampleLevel(clamped,uv-dispersion,0).b,edge*.24);float3 body=adaptive_transmit(scene,dark,material);
     // A restrained neutral veil lifts the protected interior without becoming an
     // opaque card. Local dark strokes get more lift than the surrounding field;
     // low-frequency environment and all edge optics continue through the glass.
-    float readability_veil=saturate((.15*scene_text_risk+.283*local_text_risk)*protected_interior);
-    body=lerp(body,float3(1,1,1),readability_veil);
+    float readability_veil=saturate((tuning_guards.z*scene_text_risk+tuning_guards.w*local_text_risk)*protected_interior);
+    float milkiness=saturate(tuning_body.y*bright_neutral*protected_interior);
+    body=lerp(body,float3(1,1,1),saturate(readability_veil+milkiness));
     float2 direction=normalize(float2(-.32,-.94)+(contact.xy-float2(.3,.18))*.95);float facing=max(0,dot(field.yz,direction));float opposing=max(0,dot(field.yz,-direction));float scale=h/26;
     // Keep scale unchanged for the original 20-bar content below.
     float rim_scale=scale*rim_fraction;
@@ -141,7 +152,7 @@ float4 adaptive_material_ps(float4 pos:SV_POSITION):SV_TARGET {
     float white_ink=dark?adapt.b:adapt.g;float y=dot(body,LUMA);if(!dark&&material.w>.18)white_ink=0;
     if(white_ink>.5){float needed=y>.16?1-.16/max(y,.001):0;body*=1-support*needed;}else{float needed=y<.30?(.30-y)/max(.001,1-y):0;body=lerp(body,1,support*needed);}
 #ifndef LIQUID_TEST_INK_OFF
-    if(style.z>.5){float foreground=adaptive_time.z>.5?1:lerp(.65,1,smoothstep(0,.09,adaptive_time.y));float fg=adaptive_text(local);if(voice_state.x!=2){[unroll] for(int k=0;k<20;k++){fg=max(fg,saturate(.5-bar_distance(local,k)));}}fg*=foreground;float3 ink=white_ink>.5?float3(.95,.97,1):float3(.010,.016,.023);
+    if(style.z>.5){float foreground=adaptive_time.z>.5?1:lerp(.65,1,smoothstep(0,.09,adaptive_time.y));float fg=adaptive_text(local);if(voice_state.x!=2){LIQUID_UNROLL for(int k=0;k<20;k++){fg=max(fg,saturate(.5-bar_distance(local,k)));}}fg*=foreground;float3 ink=white_ink>.5?float3(.95,.97,1):float3(.010,.016,.023);
 #ifdef LIQUID_VOICE_CONTENT
         if(voice_state.x==2){float first=(geometry.z-78*scale)*.5+scale;int i=(int)clamp(floor((local.x-first)/(4*scale)+.5),0,19);float3 srgb=floor(lerp(float3(67,222,210),float3(100,141,255),i/19.0)+.5)/255.0;float wave=saturate(.5-bar_distance(local,i));body=lerp(body,linearize(srgb),wave);fg=adaptive_text(local)*foreground;}
 #endif

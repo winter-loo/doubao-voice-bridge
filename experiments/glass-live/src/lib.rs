@@ -18,6 +18,8 @@ mod gpu;
 mod desktop;
 #[cfg(windows)]
 mod white_text_checks;
+#[cfg(all(windows, feature = "playground"))]
+mod playground;
 
 pub type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub fn ensure(condition: bool, message: &str) -> AppResult<()> {
@@ -89,6 +91,23 @@ pub fn run_preview() -> AppResult<()> {
         let _ = options;
         Err("Live and GPU self-test modes require Windows; portable unit tests are available via cargo test".into())
     }
+}
+
+#[cfg(all(windows, feature = "playground"))]
+pub struct PlaygroundReferenceImage {
+    pub bgra: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(all(windows, feature = "playground"))]
+pub fn run_playground(reference: Result<PlaygroundReferenceImage, String>) -> AppResult<()> {
+    unsafe { playground::run(reference) }
+}
+
+#[cfg(all(windows, feature = "playground"))]
+pub fn run_playground_check(directory: &std::path::Path) -> AppResult<()> {
+    unsafe { playground::check(directory) }
 }
 
 #[cfg(test)]

@@ -106,7 +106,7 @@ fn low_frequency_stddev(values: &[f64]) -> f64 {
         .sqrt()
 }
 
-unsafe fn generated_white_text_fixture(raw_width: u32, raw_height: u32) -> AppResult<Vec<u8>> {
+pub(crate) unsafe fn generated_white_text_fixture(raw_width: u32, raw_height: u32) -> AppResult<Vec<u8>> {
     // GDI rasterizes our own deterministic Chinese label; it never reads the desktop.
     let coverage = crate::desktop::text_mask_for_label(
         raw_width,
