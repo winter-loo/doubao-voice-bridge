@@ -49,7 +49,11 @@ fn make_support(mask:&[u8],w:usize,h:usize)->Vec<u8> {
 }
 impl Pipeline {
     pub unsafe fn new(device:ID3D11Device,context:ID3D11DeviceContext,w:u32,h:u32,mask:&[u8])->AppResult<Self> {
-        let mut base=super::Pipeline::new(device,context,w,h,mask)?;
+        let padding=(h as f32*material_config::BLUR.padding_fraction).ceil() as u32;
+        Self::new_with_padding(device,context,w,h,mask,padding)
+    }
+    pub(crate) unsafe fn new_with_padding(device:ID3D11Device,context:ID3D11DeviceContext,w:u32,h:u32,mask:&[u8],padding:u32)->AppResult<Self> {
+        let mut base=super::Pipeline::new_with_padding(device,context,w,h,mask,padding)?;
         let source=format!("{}\n{}",include_str!("glass.hlsl"),include_str!("liquid.hlsl"));
         let mut material=None; let b=compile_source(&source,s!("liquid_material_ps"),s!("ps_5_0"))?;
         base.device.CreatePixelShader(blob_bytes(&b),None,Some(&mut material))?;
@@ -69,7 +73,11 @@ impl Pipeline {
     }
     /// Production content uses the same optical body and adaptation shader.
     pub unsafe fn new_voice(device:ID3D11Device,context:ID3D11DeviceContext,w:u32,h:u32,mask:&[u8])->AppResult<Self> {
-        let mut p=Self::new(device,context,w,h,mask)?;
+        let padding=(h as f32*material_config::BLUR.padding_fraction).ceil() as u32;
+        Self::new_voice_with_padding(device,context,w,h,mask,padding)
+    }
+    pub(crate) unsafe fn new_voice_with_padding(device:ID3D11Device,context:ID3D11DeviceContext,w:u32,h:u32,mask:&[u8],padding:u32)->AppResult<Self> {
+        let mut p=Self::new_with_padding(device,context,w,h,mask,padding)?;
         let source=format!("#define LIQUID_VOICE_CONTENT 1\n{}\n{}\n{}",include_str!("glass.hlsl"),include_str!("voice_content.hlsl"),include_str!("liquid.hlsl"));
         let b=compile_source(&source,s!("liquid_material_ps"),s!("ps_5_0"))?;
         let mut material=None;p.device.CreatePixelShader(blob_bytes(&b),None,Some(&mut material))?;
