@@ -89,7 +89,8 @@ pub(super) unsafe fn verify(directory:Option<&Path>)->AppResult<()> {
                 let kind=if frame<60{0}else if frame<102{2}else if frame<144{0}else if frame<186{1}else{0};
                 if previous!=Some(kind) {
                     let source=input(p.raw.width,p.raw.height,kind);
-                    upload_fixture_checked(&p,&source)?;upload_fixture_checked(&baseline,&source)?;previous=Some(kind);
+                    let baseline_source=input(baseline.raw.width,baseline.raw.height,kind);
+                    upload_fixture_checked(&p,&source)?;upload_fixture_checked(&baseline,&baseline_source)?;previous=Some(kind);
                 }
                 p.render_voice(dark,time,Phase::Optimizing,0.,1.);baseline.render_voice(dark,time,Phase::Optimizing,0.,1.);
                 let current=p.composite_fixture()?;

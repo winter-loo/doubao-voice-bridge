@@ -98,10 +98,13 @@ pub struct Pipeline {
 }
 impl Pipeline {
     pub unsafe fn new(device: ID3D11Device, context: ID3D11DeviceContext, width: u32, height: u32, mask: &[u8]) -> AppResult<Self> {
+        let padding = (height as f32 * material_config::BLUR.padding_fraction).ceil() as u32;
+        Self::new_with_padding(device, context, width, height, mask, padding)
+    }
+    pub(crate) unsafe fn new_with_padding(device: ID3D11Device, context: ID3D11DeviceContext, width: u32, height: u32, mask: &[u8], padding: u32) -> AppResult<Self> {
         material_config::validate()?;
         ensure(width >= height && height >= 20 && height <= 120 && width <= 1024, "Invalid pipeline geometry")?;
         ensure(mask.len() == width as usize * height as usize, "Invalid foreground mask")?;
-        let padding = (height as f32 * material_config::BLUR.padding_fraction).ceil() as u32;
         ensure(padding >= (3.0 * (height as f32 * CENTER_SIGMA_FRACTION).min(material_config::BLUR.max_sigma_pixels)).ceil() as u32,
             "Center blur support exceeds captured padding")?;
         let rw = width + padding * 2; let rh = height + padding * 2;

@@ -51,7 +51,8 @@ pub(super) unsafe fn verify(directory:Option<&Path>)->AppResult<()> {
         let mut p=AdaptivePipeline::new_voice(device.clone(),context.clone(),w,h,&mask)?;
         let control=Pipeline::new_voice(device.clone(),context.clone(),w,h,&mask)?;
         let input=fixture(p.raw.width,p.raw.height,kind);
-        upload_fixture_checked(&p,&input)?;upload_fixture_checked(&control,&input)?;
+        let control_input=fixture(control.raw.width,control.raw.height,kind);
+        upload_fixture_checked(&p,&input)?;upload_fixture_checked(&control,&control_input)?;
         let mut last=0f32;
         let child=directory.filter(|_|w==162).map(|d|d.join(format!("k{kind}-{}",if dark{"dark"}else{"light"})));
         if let Some(d)=&child {std::fs::create_dir_all(d)?;}

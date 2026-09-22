@@ -26,10 +26,10 @@ pub struct MaterialTuning {
 impl Default for MaterialTuning {
     fn default() -> Self {
         Self {
-            scene_guard: 0.98,
-            local_guard: 0.52,
-            scene_veil: 0.18,
-            local_veil: 0.32,
+            scene_guard: 0.30,
+            local_guard: 0.20,
+            scene_veil: 0.035,
+            local_veil: 0.075,
             neutral_low: 0.48,
             neutral_high: 0.78,
             neutral_chroma_low: 0.035,
@@ -38,8 +38,8 @@ impl Default for MaterialTuning {
             detail_high: 0.145,
             complexity_low: 0.045,
             complexity_high: 0.22,
-            frost_strength: 1.60,
-            milkiness: 0.11,
+            frost_strength: 0.78,
+            milkiness: 0.01,
             interior_start: 0.055,
             interior_full: 0.245,
         }
@@ -99,8 +99,8 @@ pub struct AdaptivePipeline {
 impl Deref for AdaptivePipeline { type Target=Pipeline; fn deref(&self)->&Pipeline { &self.inner } }
 impl AdaptivePipeline {
     pub unsafe fn new_voice(device:ID3D11Device,context:ID3D11DeviceContext,w:u32,h:u32,mask:&[u8])->AppResult<Self> {
-        let inner=Pipeline::new_voice(device,context,w,h,mask)?;
         let layout=CanvasGeometry::new(w,h);
+        let inner=Pipeline::new_voice_with_padding(device,context,w,h,mask,layout.margin)?;
         let source=format!("#define LIQUID_VOICE_CONTENT 1\n{}\n{}\n{}\n{}",include_str!("glass.hlsl"),include_str!("voice_content.hlsl"),include_str!("liquid.hlsl"),include_str!("adaptive.hlsl"));
         let make=|entry|->AppResult<ID3D11PixelShader>{
             let b=compile_source(&source,entry,s!("ps_5_0"))?;let mut shader=None;

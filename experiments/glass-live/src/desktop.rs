@@ -174,13 +174,16 @@ unsafe fn text_mask(width:u32,height:u32,scale:f32,compact:bool)->AppResult<Vec<
     text_mask_for_label(width,height,scale,compact,"优化识别中",true)
 }
 pub(crate) unsafe fn text_mask_for_label(width:u32,height:u32,scale:f32,compact:bool,label:&str,icon:bool)->AppResult<Vec<u8>> {
+    text_mask_for_label_weight(width,height,scale,compact,label,icon,500)
+}
+pub(crate) unsafe fn text_mask_for_label_weight(width:u32,height:u32,scale:f32,compact:bool,label:&str,icon:bool,weight:i32)->AppResult<Vec<u8>> {
     let dc=CreateCompatibleDC(None);ensure(!dc.0.is_null(),"Text mask DC creation failed")?;
     let result=(||->AppResult<Vec<u8>>{
         let mut info=BITMAPINFO::default();info.bmiHeader=BITMAPINFOHEADER{biSize:size_of::<BITMAPINFOHEADER>()as u32,
             biWidth:width as i32,biHeight:-(height as i32),biPlanes:1,biBitCount:32,biCompression:BI_RGB.0,..Default::default()};
         let mut bits=std::ptr::null_mut();let bitmap=CreateDIBSection(Some(dc),&info,DIB_RGB_COLORS,&mut bits,None,0)?;
         let old=SelectObject(dc,HGDIOBJ(bitmap.0));
-        let font=CreateFontW(-((if compact {11.}else{14.})*scale).round()as i32,0,0,0,500,0,0,0,
+        let font=CreateFontW(-((if compact {11.}else{14.})*scale).round()as i32,0,0,0,weight,0,0,0,
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
             ANTIALIASED_QUALITY,(DEFAULT_PITCH.0|FF_DONTCARE.0)as u32,w!("Microsoft YaHei UI"));
         if font.0.is_null(){SelectObject(dc,old);let _=DeleteObject(HGDIOBJ(bitmap.0));return Err("Text font creation failed".into());}

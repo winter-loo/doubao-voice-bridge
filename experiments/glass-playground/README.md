@@ -77,6 +77,7 @@ values back to that same dev file.
 | `3` | dark |
 | `4` | green |
 | `5` | colorful/high-chroma |
+| `6` | Apple-optics stress fixture: oversized black text crosses both caps |
 | `S` | steady material, no foreground |
 | `Space` | deterministic listening waveform |
 | `A` | activating |

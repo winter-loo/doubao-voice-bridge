@@ -39,6 +39,11 @@ pub fn write(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(&bytes)
 }
+pub fn write_replace(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
+    let bytes = encode(width, height, rgba)?;
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    file.write_all(&bytes)
+}
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn crc_known_vector() { assert_eq!(crc32(b"123456789"), 0xcbf43926); }
@@ -46,5 +51,16 @@ pub fn write(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()
         assert!(encode(0, 1, &[]).is_err()); assert!(encode(u32::MAX, u32::MAX, &[]).is_err());
         assert!(encode(1, 1, &[1, 2, 3]).is_err());
         let p = encode(1, 1, &[1, 2, 3, 255]).unwrap(); assert_eq!(&p[..8], b"\x89PNG\r\n\x1a\n");
+    }
+    #[test] fn replace_is_explicit() {
+        let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path=std::env::temp_dir().join(format!("glass-png-replace-{}-{stamp}.png",std::process::id()));
+        write(&path,1,1,&[1,2,3,255]).unwrap();
+        assert_eq!(write(&path,1,1,&[4,5,6,255]).unwrap_err().kind(),io::ErrorKind::AlreadyExists);
+        let before=std::fs::read(&path).unwrap();
+        write_replace(&path,1,1,&[4,5,6,255]).unwrap();
+        let after=std::fs::read(&path).unwrap();
+        assert_ne!(before,after);
+        std::fs::remove_file(path).unwrap();
     }
 }

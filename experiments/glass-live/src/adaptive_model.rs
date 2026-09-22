@@ -10,9 +10,9 @@ pub(crate) struct CanvasGeometry {
 }
 impl CanvasGeometry {
     pub fn new(width: u32, height: u32) -> Self {
-        // 0.16h broad shadow sigma + 0.065h vertical offset has >3.5 sigma
-        // clearance at every canvas edge. Independent of the capture ROI pad.
-        Self { width, height, margin: (height as f32 * 0.65).ceil() as u32 }
+        // 0.225h broad shadow sigma + 0.098h vertical offset needs 0.8855h
+        // for 3.5 sigma clearance; round up to 0.90h. This visual margin does not enlarge the logical hit shape.
+        Self { width, height, margin: (height as f32 * 0.90).ceil() as u32 }
     }
     pub fn canvas_width(self) -> u32 { self.width + 2 * self.margin }
     pub fn canvas_height(self) -> u32 { self.height + 2 * self.margin }
