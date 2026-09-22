@@ -12,7 +12,7 @@ pub struct BlurConfig {
 }
 pub const BLUR: BlurConfig = BlurConfig {
     center_fraction: 0.20, edge_fraction: 0.045,
-    max_sigma_pixels: 20.0, padding_fraction: 0.65,
+    max_sigma_pixels: 20.0, padding_fraction: 0.90,
 };
 #[derive(Clone, Copy, Debug)]
 pub struct OpticalConfig {
